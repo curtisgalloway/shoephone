@@ -24,3 +24,4 @@ name = "shoephoned"
 path = "src/bin/shoephoned.rs"
 
 [dependencies]
+ssh-key = { version = "0.6.7", features = ["ed25519", "std", "rand_core", "getrandom"], default-features = false }

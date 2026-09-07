@@ -49,8 +49,11 @@ pub struct Policy {
     /// Requests accepted per rolling hour, for this approver, across every
     /// requester.
     pub max_requests_per_hour: usize,
-    /// The first cooldown after a decline; see [`Grants::cooldown_after`].
+    /// The first cooldown after a decline or timeout; it doubles on each
+    /// consecutive strike. See [`Grants::cooldown_after`].
     pub base_cooldown: Duration,
+    /// Where the doubling stops.
+    pub max_cooldown: Duration,
 }
 
 impl Default for Policy {
@@ -62,6 +65,7 @@ impl Default for Policy {
             pending_ttl: Duration::from_secs(5 * 60),
             max_requests_per_hour: 6,
             base_cooldown: Duration::from_secs(5 * 60),
+            max_cooldown: Duration::from_secs(60 * 60),
         }
     }
 }
@@ -462,30 +466,25 @@ impl Grants {
 
     /// How long requests are refused after a request ends without approval.
     /// `self.strikes` has already been incremented for this outcome and is
-    /// reset to zero by an approval.
+    /// reset to zero by an approval, and only by an approval.
     ///
-    /// TODO(curtisg): this is the policy decision left open on 2026-09-06.
-    /// The chosen shape is "5 minutes, doubling on repeat, reset by an
-    /// approval". Still to decide, and this function is where it goes:
-    ///
-    /// - the doubling cap (unbounded doubling locks the agent out for the
-    ///   day after a handful of declines, which may be exactly right);
-    /// - whether a timeout counts like a decline (the person did not say
-    ///   no; but an agent that files requests nobody answers is the fatigue
-    ///   pattern this cap exists to break);
-    /// - whether strikes decay with time or only on approval.
-    ///
-    /// The placeholder below is the base cooldown for both outcomes, with no
-    /// growth. The ignored test `cooldown_grows_on_repeat` describes the
-    /// doubling behavior; un-ignore it once this is real.
-    fn cooldown_after(&self, outcome: Outcome) -> Option<Duration> {
+    /// The rule: the base cooldown, doubling with each consecutive strike,
+    /// capped at [`Policy::max_cooldown`]. A timeout counts exactly like a
+    /// decline. The person did not say no, but an agent that files requests
+    /// nobody answers is the habituation pattern this cap exists to break,
+    /// and `SKILL.md` already tells the agent both cost a cooldown. With the
+    /// defaults, strikes cost 5, 10, 20, 40, then 60 minutes each; the cap
+    /// keeps a bad afternoon from becoming a locked-out week, while five
+    /// unanswered requests still cost over two hours.
+    fn cooldown_after(&self, outcome: Outcome) -> Duration {
         let _ = outcome;
-        Some(self.policy.base_cooldown)
+        let doublings = self.strikes.saturating_sub(1).min(16);
+        (self.policy.base_cooldown * 2u32.pow(doublings)).min(self.policy.max_cooldown)
     }
 
     fn strike(&mut self, now: SystemTime, outcome: Outcome) {
         self.strikes = self.strikes.saturating_add(1);
-        self.cooldown_until = self.cooldown_after(outcome).map(|d| now + d);
+        self.cooldown_until = Some(now + self.cooldown_after(outcome));
     }
 
     /// Advance time: expire the pending request, drop closed windows, and
@@ -783,25 +782,28 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "waiting on the cooldown rule in Grants::cooldown_after"]
-    fn cooldown_grows_on_repeat() {
+    fn cooldown_doubles_per_strike_up_to_the_cap_and_timeouts_count() {
         let mut g = grants();
         let mut now = t(0);
-        let mut last = Duration::ZERO;
-        for _ in 0..3 {
+        let mut seen = Vec::new();
+        for strike in 0..6u32 {
             let p = g
                 .request(now, &mut Counter(0), "web01", KEY, "laptop", None)
                 .unwrap();
-            g.decline(now, p.id).unwrap();
+            if strike % 2 == 0 {
+                g.decline(now, p.id).unwrap();
+            } else {
+                assert!(g.pending(now + 5 * MIN).is_none(), "timed out");
+                now += 5 * MIN;
+            }
             let until = g.cooldown_until.unwrap();
-            let this = until.duration_since(now).unwrap();
-            assert!(
-                this >= last * 2 || last == Duration::ZERO,
-                "{this:?} after {last:?}"
-            );
-            last = this;
+            seen.push(until.duration_since(now).unwrap());
             now = until;
         }
+        assert_eq!(
+            seen,
+            [5 * MIN, 10 * MIN, 20 * MIN, 40 * MIN, 60 * MIN, 60 * MIN]
+        );
     }
 
     #[test]
