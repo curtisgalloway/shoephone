@@ -27,8 +27,11 @@ The name is from Get Smart. The approver is a phone; the agency is CONTROL.
 ## Status
 
 Scaffold. The daemon, the CLI verbs, and the approve page do not exist yet.
-The design they will implement is written; the pieces will land in this
-order:
+The design they will implement is written: [docs/DESIGN.md](docs/DESIGN.md),
+which also covers the three things to close *before* deploying any of this
+(an unattended secrets token that can read admin credentials, the
+infrastructure repository as the trusted computing base, and backup servers
+that accept deletes with no credential). The pieces will land in this order:
 
 1. `shoephoned` with a web approve page: enforced scope, nonce, window,
    per-host principals, global rate cap, kill switch, notification ledger.
