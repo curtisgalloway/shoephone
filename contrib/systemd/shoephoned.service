@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: 2026 Curtis Galloway
+# SPDX-License-Identifier: Apache-2.0
+#
+# shoephoned as a systemd service on the failsafe host.
+#
+# Install:  cp contrib/systemd/shoephoned.service /etc/systemd/system/
+#           install -m 0600 shoephoned.toml /etc/shoephone/shoephoned.toml
+#           systemctl enable --now shoephoned
+#
+# The daemon runs as root because the CA key and the state directory are
+# root-only and `init-ca` and `enroll` assume that. Everything root could
+# otherwise do is taken away below: no capabilities, no new privileges, a
+# read-only view of the system, and the state directory as the only
+# writable path. A restart fails closed by design (open windows are gone),
+# so Restart= only covers a crash, never a clean stop.
+
+[Unit]
+Description=shoephone grant daemon
+Documentation=https://github.com/curtisgalloway/shoephone
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/shoephoned --config /etc/shoephone/shoephoned.toml serve
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=10s
+UMask=0077
+
+# /var/lib/shoephone, created 0700 if missing and the one writable path.
+StateDirectory=shoephone
+StateDirectoryMode=0700
+
+# Hardening. The daemon binds one loopback TCP port, reads two files, and
+# makes outbound HTTPS pushes; nothing here should need loosening.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target

@@ -33,7 +33,7 @@ use crate::ca::{self, UserCa};
 use crate::config::Config;
 use crate::exit::VERSION;
 use crate::grant::{Approval, Event, Grants, Pending, Refusal, Scope};
-use crate::notify::Notifier;
+use crate::notify::{Notifier, Push};
 use crate::store::{self, Device, EnrollCode, LedgerEntry, Store};
 
 pub const PAGE: &str = include_str!("../assets/approve.html");
@@ -179,13 +179,27 @@ impl Daemon {
             if let Err(e) = self.store.append_ledger(&entries) {
                 eprintln!("shoephoned: ledger: {e}");
             }
+            // Only these three reach the phone. Declined and TimedOut are
+            // either the approver's own doing or nothing happening, and
+            // Issued is the agent collecting what was already approved.
+            let pushes: Vec<Push> = events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Requested { .. } => Some(Push::RequestWaiting),
+                    Event::Approved { .. } => Some(Push::WindowOpened),
+                    Event::Killed { .. } => Some(Push::WindowKilled),
+                    _ => None,
+                })
+                .collect();
             if let Some(n) = &self.notifier
-                && events.iter().any(|e| matches!(e, Event::Requested { .. }))
+                && !pushes.is_empty()
             {
                 let n = n.clone();
                 let push = move || {
-                    if let Err(e) = n.request_waiting() {
-                        eprintln!("shoephoned: {e}");
+                    for p in pushes {
+                        if let Err(e) = n.send(p) {
+                            eprintln!("shoephoned: {e}");
+                        }
                     }
                 };
                 match tokio::runtime::Handle::try_current() {

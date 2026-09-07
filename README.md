@@ -38,24 +38,43 @@ itself has not been tried from a phone yet. The design is in
 close *before* deploying any of this (an unattended secrets token that can
 read admin credentials, the infrastructure repository as the trusted
 computing base, and backup servers that accept deletes with no
-credential). A content-free push to an ntfy-style topic tells the phone a request is
-waiting. What remains is deployment: the failsafe host behind TLS, a key
-enrolled at its console, the loop run on cellular, and then the decision
-whether the web ceremony holds up or a native app is needed.
+credential). A content-free push to an ntfy-style topic tells the phone that a request
+is waiting, a window opened, or a window was killed. What remains is
+deployment: the failsafe host behind TLS, a key enrolled at its console,
+the loop run on cellular, and then the decision whether the web ceremony
+holds up or a native app is needed.
 
-## Running the daemon
+## Deploying the daemon
+
+`shoephoned` belongs on the failsafe host described in the design: a small
+machine outside the hypervisor's failure domain, with no agent account of
+any tier, where admin is human-only. Four things are invariants; the rest
+is ordinary service setup.
+
+- The state directory and the CA key are root-only. `init-ca` creates the
+  key at mode 0600 and refuses to overwrite one that exists.
+- The config file holds the push token, so it is root-only too.
+- The daemon speaks plain HTTP on loopback. A TLS reverse proxy in front
+  serves the approve page to the phone; WebAuthn refuses anything else.
+- `rp_origin` is the exact https origin the phone loads, and `rp_id` is
+  its hostname. A mismatch fails every enrollment and approval.
+
+### 1. Build and install
 
 ```bash
-shoephoned --config shoephoned.toml init-ca      # once; prints the TrustedUserCAKeys line
-shoephoned --config shoephoned.toml enroll --name phone   # at the console; prints a code
-shoephoned --config shoephoned.toml serve
+cargo build --release           # never with --features test-hooks for a deployed daemon
+install -m 0755 target/release/shoephoned /usr/local/bin/
+install -d -m 0700 /etc/shoephone
+install -m 0600 shoephoned.toml /etc/shoephone/shoephoned.toml
 ```
 
-A minimal config:
+`webauthn-rs` links the `openssl` crate, so the host needs libssl.
+
+### 2. Configure
 
 ```toml
-listen = "127.0.0.1:7391"          # put a TLS reverse proxy in front
-state_dir = "/var/lib/shoephone"   # root-only
+listen = "127.0.0.1:7391"          # the reverse proxy is the only client
+state_dir = "/var/lib/shoephone"   # root-only; the systemd unit creates it 0700
 ca_key = "/var/lib/shoephone/user_ca"
 rp_id = "approve.example.internal"
 rp_origin = "https://approve.example.internal"
@@ -63,10 +82,77 @@ rp_origin = "https://approve.example.internal"
 [principals]
 web01 = "agent-admin:web01"
 
-[notify]                            # optional: content-free push on each request
+[notify]                            # optional: content-free push to the phone
 url = "https://ntfy.example.internal/shoephone"
+token = "..."                       # if the topic is protected
 click = "https://approve.example.internal"
 ```
+
+`[policy]` overrides the window, certificate and cooldown durations in
+minutes; the defaults are a 60 minute window (4 hours at most), 15 minute
+certificates, a 5 minute pending timeout, 6 requests an hour, and a 5
+minute cooldown after a decline that doubles to a 60 minute cap.
+
+### 3. Create the CA and run the service
+
+```bash
+shoephoned --config /etc/shoephone/shoephoned.toml init-ca > user_ca.pub
+cp contrib/systemd/shoephoned.service /etc/systemd/system/
+systemctl enable --now shoephoned
+journalctl -u shoephoned -f
+```
+
+The unit in [contrib/systemd/shoephoned.service](contrib/systemd/shoephoned.service)
+runs the daemon as root, because the key and state directory are
+root-only, and then removes every capability, makes the filesystem
+read-only except for the state directory, and filters system calls.
+It restarts on a crash only. A restart fails closed: enrolled devices
+survive, open windows and pending requests do not.
+
+### 4. Put TLS in front
+
+Any reverse proxy works; with Caddy the whole configuration is:
+
+```
+approve.example.internal {
+    reverse_proxy 127.0.0.1:7391
+}
+```
+
+Reach it from a certificate the phone trusts. A private CA in the phone's
+trust store is fine; the CLI uses the machine's trust store through the
+platform verifier, so the same private CA works there.
+
+### 5. Enroll the phone's security key
+
+At the host's console, never over a session the agent could see:
+
+```bash
+shoephoned --config /etc/shoephone/shoephoned.toml enroll --name phone
+```
+
+It prints a one-time code that is good for ten minutes or five wrong
+guesses. Open `rp_origin` on the phone, enter the code, and tap the key.
+Enrolling a second device is the same again with a different name; every
+enrolled device is pushed when a window opens or is killed, so an
+approval from one is visible on the others.
+
+### 6. Trust the CA on each host
+
+For every host in `[principals]`, in `sshd_config`, scoped to the one
+user so no other account ever consults the CA:
+
+```
+Match User agent-admin
+    TrustedUserCAKeys /etc/ssh/shoephone_user_ca.pub
+    AuthorizedPrincipalsFile /etc/ssh/principals/%u
+    AuthorizedKeysFile none
+```
+
+with `/etc/ssh/principals/agent-admin` containing exactly that host's
+principal from the table, for example `agent-admin:web01`. A certificate
+for any other host carries a different principal and is refused, and
+`AuthorizedKeysFile none` means no static key can drift in beside it.
 
 ## Using the CLI
 
