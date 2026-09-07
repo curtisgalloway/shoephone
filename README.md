@@ -38,12 +38,10 @@ itself has not been tried from a phone yet. The design is in
 close *before* deploying any of this (an unattended secrets token that can
 read admin credentials, the infrastructure repository as the trusted
 computing base, and backup servers that accept deletes with no
-credential). Remaining, in order:
-
-1. A content-free push to the phone when a request arrives.
-2. Deploy on the failsafe host behind TLS, enroll a key, run the loop on
-   cellular, then decide whether the web ceremony holds up or a native app
-   is needed.
+credential). A content-free push to an ntfy-style topic tells the phone a request is
+waiting. What remains is deployment: the failsafe host behind TLS, a key
+enrolled at its console, the loop run on cellular, and then the decision
+whether the web ceremony holds up or a native app is needed.
 
 ## Running the daemon
 
@@ -64,6 +62,10 @@ rp_origin = "https://approve.example.internal"
 
 [principals]
 web01 = "agent-admin:web01"
+
+[notify]                            # optional: content-free push on each request
+url = "https://ntfy.example.internal/shoephone"
+click = "https://approve.example.internal"
 ```
 
 ## Using the CLI

@@ -13,6 +13,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::grant::Policy;
+use crate::notify::NotifyConfig;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +43,10 @@ pub struct Config {
     pub principals: BTreeMap<String, String>,
     #[serde(default)]
     pub policy: PolicyConfig,
+    /// Content-free push when a request arrives. Without it the person has
+    /// to open the page on their own.
+    #[serde(default)]
+    pub notify: Option<NotifyConfig>,
 }
 
 /// Overrides for [`Policy`], in minutes. Anything omitted keeps the default.

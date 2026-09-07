@@ -31,7 +31,8 @@ use crate::api::*;
 use crate::ca::{self, UserCa};
 use crate::config::Config;
 use crate::exit::VERSION;
-use crate::grant::{Approval, Grants, Pending, Refusal, Scope};
+use crate::grant::{Approval, Event, Grants, Pending, Refusal, Scope};
+use crate::notify::Notifier;
 use crate::store::{self, Device, EnrollCode, LedgerEntry, Store};
 
 pub const PAGE: &str = include_str!("../assets/approve.html");
@@ -44,6 +45,7 @@ pub struct Daemon {
     ca: UserCa,
     webauthn: Webauthn,
     store: Store,
+    notifier: Option<Arc<Notifier>>,
     inner: Mutex<Inner>,
 }
 
@@ -135,11 +137,13 @@ impl Daemon {
         let store = Store::new(&config.state_dir);
         let devices = store.load_devices()?;
         let grants = Grants::new(config.policy(), config.principals.clone());
+        let notifier = config.notify.clone().map(|n| Arc::new(Notifier::new(n)));
         Ok(Self {
             config,
             ca,
             webauthn,
             store,
+            notifier,
             inner: Mutex::new(Inner {
                 grants,
                 devices,
@@ -168,10 +172,27 @@ impl Daemon {
         let mut inner = self.inner.lock().expect("daemon lock");
         let out = f(&mut inner);
         let events = inner.grants.take_events();
+        drop(inner);
         if !events.is_empty() {
             let entries: Vec<LedgerEntry> = events.iter().map(LedgerEntry::from).collect();
             if let Err(e) = self.store.append_ledger(&entries) {
                 eprintln!("shoephoned: ledger: {e}");
+            }
+            if let Some(n) = &self.notifier
+                && events.iter().any(|e| matches!(e, Event::Requested { .. }))
+            {
+                let n = n.clone();
+                let push = move || {
+                    if let Err(e) = n.request_waiting() {
+                        eprintln!("shoephoned: {e}");
+                    }
+                };
+                match tokio::runtime::Handle::try_current() {
+                    Ok(h) => {
+                        h.spawn_blocking(push);
+                    }
+                    Err(_) => push(),
+                }
             }
         }
         out

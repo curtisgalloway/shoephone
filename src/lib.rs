@@ -16,6 +16,7 @@ pub mod client;
 pub mod config;
 pub mod exit;
 pub mod grant;
+pub mod notify;
 pub mod server;
 pub mod session;
 pub mod store;
