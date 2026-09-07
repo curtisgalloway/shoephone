@@ -11,3 +11,4 @@
 //! and treats every byte the CLI sends as untrusted.
 
 pub mod exit;
+pub mod grant;

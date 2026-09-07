@@ -49,6 +49,23 @@ Three pieces live here:
   operator's private infrastructure repo, which points here.
 - **American spellings** throughout.
 
+## Decisions (2026-09-06)
+
+Settled with the operator before the first line of daemon code. Change them
+here first, then in the code.
+
+| Question | Decision |
+|---|---|
+| Approver binding, first ceremony | WebAuthn with a hardware security key on the web page. The assertion signs a challenge derived from `Scope::bytes_to_sign(nonce)`. No synced passkeys, no client-certificate-only binding. |
+| Windows and certificates | 60 min default window, 4 h maximum, 15 min certificates, 5 min pending timeout. Defaults live in `grant::Policy`. |
+| Certificate signing | The `ssh-key` crate, ed25519, CA key from a root-only file. No `ssh-keygen` subprocess. |
+| Rate cap | One pending request at a time; 6 accepted requests per rolling hour, keyed per approver across every requester. |
+| Decline cooldown | 5 min base, doubling on repeat, reset by an approval. The exact growth rule (cap, whether timeout counts, decay) is the operator's to write in `Grants::cooldown_after`. |
+| HTTP stack | axum on tokio. |
+| Persistence | Enrolled approver devices on disk, root-only. Windows, nonces and counters in memory; a restart fails closed. |
+| Notifications and ledger | Content-free push to an ntfy-style topic the operator runs; the page fetches details from the daemon. Ledger is an append-only file on the daemon plus the page's history view until an app exists. |
+| Build order inside this repo | 1. `grant` state machine with tests (done). 2. Signing. 3. axum surface and approve page with WebAuthn. 4. CLI verbs. 5. Push and ledger. |
+
 ## Security invariants (do not relax these in code)
 
 - The daemon treats every byte from the CLI as untrusted. The scope shown to
