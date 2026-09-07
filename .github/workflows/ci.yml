@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2026 Curtis Galloway
+# SPDX-License-Identifier: Apache-2.0
+#
+# Every push and pull request: format, lint, test, build, then run the
+# binaries the way an agent runs them (stdout piped, stdin closed, NO_COLOR)
+# and assert on the exit codes the SKILL.md promises.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1 (stable)
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - name: Exit-code contract, as an agent sees it
+        env:
+          NO_COLOR: "1"
+        run: |
+          set -u
+          bin=target/release/shoephone
+          out=$($bin --skill < /dev/null | head -1); test "$out" = "---"
+          $bin doctor < /dev/null | cat; test "${PIPESTATUS[0]}" -eq 0
+          $bin bogus < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 2
+          $bin < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 2
+          target/release/shoephoned < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 3

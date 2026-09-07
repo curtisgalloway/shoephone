@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Curtis Galloway
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "shoephone"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Phone-approved, short-lived SSH certificates for coding agents: a grant daemon, a grant CLI, and the approver's side of the ceremony"
+repository = "https://github.com/curtisgalloway/shoephone"
+readme = "README.md"
+keywords = ["ssh", "certificate", "approval", "agent", "security"]
+categories = ["command-line-utilities", "authentication"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "shoephone"
+path = "src/bin/shoephone.rs"
+
+[[bin]]
+name = "shoephoned"
+path = "src/bin/shoephoned.rs"
+
+[dependencies]
