@@ -40,7 +40,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Io(e) => write!(f, "reading CA key: {e}"),
+            Error::Io(e) => write!(f, "key file: {e}"),
             Error::Unsupported(why) => write!(f, "unsupported key: {why}"),
             Error::Key(e) => write!(f, "ssh key: {e}"),
         }
@@ -126,7 +126,8 @@ impl UserCa {
     /// Write the private key, unencrypted, for the enrollment command. The
     /// caller is responsible for the file's mode and owner.
     pub fn write_openssh_file(&self, path: &Path) -> Result<(), Error> {
-        Ok(self.key.write_openssh_file(path, LineEnding::LF)?)
+        let pem = self.key.to_openssh(LineEnding::LF)?;
+        write_new_private(path, pem.as_bytes())
     }
 
     /// The line that goes in every host's `TrustedUserCAKeys` file.
@@ -167,6 +168,24 @@ impl UserCa {
     }
 }
 
+/// Create a private key file that did not exist before, mode 0600, never
+/// following a symlink and never truncating. A check-then-write with a
+/// truncating open has a window in which a planted symlink or a racing
+/// second run replaces the key; `create_new` closes it.
+pub fn write_new_private(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut f = options.open(path).map_err(Error::Io)?;
+    f.write_all(bytes).map_err(Error::Io)?;
+    f.sync_all().map_err(Error::Io)
+}
+
 fn unix(t: std::time::SystemTime) -> u64 {
     t.duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -192,6 +211,7 @@ mod tests {
             public_key: subject_line.to_owned(),
             valid_after: after,
             valid_before: after + Duration::from_secs(15 * 60),
+            window_ends_at: after + Duration::from_secs(60 * 60),
         }
     }
 
@@ -263,6 +283,18 @@ mod tests {
         ca.write_openssh_file(&path).unwrap();
         let again = UserCa::from_openssh_file(&path).unwrap();
         assert_eq!(again.fingerprint(), ca.fingerprint());
+        assert!(
+            matches!(ca.write_openssh_file(&path), Err(Error::Io(ref e)) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "never overwrites an existing key"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert_eq!(
             again.public_key_line().unwrap(),
             ca.public_key_line().unwrap()

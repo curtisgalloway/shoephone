@@ -150,9 +150,15 @@ impl Store {
         write_atomic(&self.enroll_path(), &json)
     }
 
+    /// Remove the enrollment code. Only "already gone" is not an error: a
+    /// code that cannot be removed would keep accepting guesses, so that
+    /// failure has to reach the caller.
     pub fn clear_enroll_code(&self) -> Result<(), String> {
-        match fs::remove_file(self.enroll_path()) {
-            Ok(()) | Err(_) => Ok(()),
+        let path = self.enroll_path();
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("removing {}: {e}", path.display())),
         }
     }
 
@@ -192,8 +198,12 @@ impl Store {
     }
 }
 
+/// Write through a per-process temp name and rename into place. Callers
+/// serialize writes to one path under the daemon lock; the pid in the temp
+/// name keeps two daemons on one state dir from clobbering each other's
+/// half-written file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     fs::write(&tmp, bytes).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| format!("renaming into {}: {e}", path.display()))
 }

@@ -147,6 +147,8 @@ pub struct Certificate {
     pub public_key: String,
     pub valid_after: SystemTime,
     pub valid_before: SystemTime,
+    /// When the window this certificate was issued from closes.
+    pub window_ends_at: SystemTime,
 }
 
 /// Why a call did nothing. None of these leak anything the requester does
@@ -407,15 +409,22 @@ impl Grants {
     ) -> Result<Certificate, Refusal> {
         self.tick(now);
         let public_key = public_key.trim();
-        let window = self
+        // Select on host and key together. Two windows can be open for one
+        // host (a second request is allowed while a window is open, and a
+        // new window is a new approval), and picking by host alone would
+        // refuse a key that was legitimately approved for the other one.
+        let mut for_host = self
             .windows
             .iter()
             .filter(|w| w.scope.host == host)
-            .max_by_key(|w| w.scope.ends_at)
-            .ok_or(Refusal::NoWindow)?;
-        if window.scope.public_key != public_key {
-            return Err(Refusal::KeyMismatch);
+            .peekable();
+        if for_host.peek().is_none() {
+            return Err(Refusal::NoWindow);
         }
+        let window = for_host
+            .filter(|w| w.scope.public_key == public_key)
+            .max_by_key(|w| w.scope.ends_at)
+            .ok_or(Refusal::KeyMismatch)?;
         let valid_before = (now + self.policy.cert_ttl).min(window.scope.ends_at);
         let cert = Certificate {
             serial: 0,
@@ -423,6 +432,7 @@ impl Grants {
             public_key: window.scope.public_key.clone(),
             valid_after: now,
             valid_before,
+            window_ends_at: window.scope.ends_at,
         };
         let cert = Certificate {
             serial: self.take_id(),
@@ -439,12 +449,25 @@ impl Grants {
 
     /// The kill switch: close every window for a host. Certificates already
     /// issued run out within one TTL.
+    ///
+    /// A request still pending for that host is declined too, with the
+    /// usual cooldown: kill means "stop", and a tap on the phone a moment
+    /// later must not reopen what was just closed.
     pub fn kill(&mut self, now: SystemTime, host: &str) -> Result<(), Refusal> {
         self.tick(now);
         let before = self.windows.len();
         self.windows.retain(|w| w.scope.host != host);
-        if self.windows.len() == before {
+        let pending = self.pending.take_if(|p| p.scope.host == host);
+        if self.windows.len() == before && pending.is_none() {
             return Err(Refusal::NoWindow);
+        }
+        if let Some(p) = pending {
+            self.events.push(Event::Declined {
+                id: p.id,
+                host: p.scope.host,
+                at: now,
+            });
+            self.strike(now, Outcome::Declined);
         }
         self.events.push(Event::Killed {
             host: host.to_owned(),
@@ -728,6 +751,68 @@ mod tests {
             Err(Refusal::NoWindow),
             "the window is closed at its end, inclusive"
         );
+    }
+
+    #[test]
+    fn two_windows_on_one_host_each_serve_their_own_key() {
+        let mut g = grants();
+        let w1 = approved(&mut g, t(0));
+        let later = t(600);
+        let p = g
+            .request(later, &mut Counter(0), "web01", OTHER_KEY, "rogue", None)
+            .unwrap();
+        let w2 = g.approve(later, &approval_for(&p)).unwrap();
+        assert!(w2.scope.ends_at > w1.scope.ends_at);
+
+        let c1 = g.issue(t(1200), "web01", KEY).unwrap();
+        assert_eq!(
+            c1.window_ends_at, w1.scope.ends_at,
+            "the first key's own window"
+        );
+        let c2 = g.issue(t(1200), "web01", OTHER_KEY).unwrap();
+        assert_eq!(c2.window_ends_at, w2.scope.ends_at);
+        let third =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIThirdThirdThirdThirdThirdThirdThirdThirdThi x";
+        assert_eq!(g.issue(t(1200), "web01", third), Err(Refusal::KeyMismatch));
+        assert_eq!(g.issue(t(1200), "db01", KEY), Err(Refusal::NoWindow));
+    }
+
+    #[test]
+    fn kill_also_declines_a_pending_request_for_that_host() {
+        let mut g = grants();
+        approved(&mut g, t(0));
+        let p = g
+            .request(t(10), &mut Counter(0), "web01", OTHER_KEY, "rogue", None)
+            .unwrap();
+        g.kill(t(20), "web01").unwrap();
+        assert!(
+            g.pending(t(21)).is_none(),
+            "the pending request went with the window"
+        );
+        assert_eq!(
+            g.approve(t(21), &approval_for(&p)),
+            Err(Refusal::NoSuchRequest)
+        );
+        assert!(
+            g.cooldown_until.is_some(),
+            "a kill costs the requester a cooldown"
+        );
+        let kinds: Vec<bool> = g
+            .take_events()
+            .iter()
+            .map(|e| matches!(e, Event::Declined { .. } | Event::Killed { .. }))
+            .collect();
+        assert_eq!(&kinds[kinds.len() - 2..], [true, true]);
+
+        let mut g = grants();
+        g.request(t(0), &mut Counter(0), "web01", KEY, "laptop", None)
+            .unwrap();
+        g.kill(t(1), "web01").unwrap();
+        assert!(
+            g.pending(t(2)).is_none(),
+            "kill with no window still cancels the request"
+        );
+        assert_eq!(g.kill(t(3), "web01"), Err(Refusal::NoWindow));
     }
 
     #[test]

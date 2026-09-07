@@ -22,7 +22,11 @@ fn main() -> ExitCode {
         return Status::Ok.into();
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("shoephone {VERSION}");
+        if args.iter().any(|a| a == "--json") {
+            println!("{}", json!({ "version": VERSION }));
+        } else {
+            println!("shoephone {VERSION}");
+        }
         return Status::Ok.into();
     }
     run(&args).into()

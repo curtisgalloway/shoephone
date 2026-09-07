@@ -74,7 +74,9 @@ loaded expires within one certificate lifetime.
 ## Output
 
 `--json` emits a single JSON document on stdout and nothing else. Diagnostics
-always go to stderr, including the match code while waiting. An empty result
+always go to stderr, including the match code while waiting. `--version`
+honors it (`{"version": "..."}`); `--skill` does not, because this document
+is the output. An empty result
 is typed in the payload (`{"result": null, "empty": true, "reason": "..."}`),
 so a structured caller never has to read the exit status to learn the answer
 was empty. `request` and `renew` return

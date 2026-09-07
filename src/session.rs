@@ -65,9 +65,11 @@ impl Session {
             let mut key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519)
                 .map_err(|e| format!("generating session key: {e}"))?;
             key.set_comment("shoephone session");
-            key.write_openssh_file(&key_path, LineEnding::LF)
+            let pem = key
+                .to_openssh(LineEnding::LF)
+                .map_err(|e| format!("encoding session key: {e}"))?;
+            crate::ca::write_new_private(&key_path, pem.as_bytes())
                 .map_err(|e| format!("writing {}: {e}", key_path.display()))?;
-            restrict(&key_path, 0o600)?;
             let pub_path = self.public_key_path();
             key.public_key()
                 .write_openssh_file(&pub_path)

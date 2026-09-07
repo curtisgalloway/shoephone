@@ -7,7 +7,8 @@
 //! (request, poll, issue, kill) and the approver's phone (pending, approve,
 //! decline, enroll, ledger). Nothing on the agent side is authenticated,
 //! by design: requests are rate-capped, certificates are only ever issued
-//! to the approved public key, and a kill from a stranger fails closed.
+//! to the approved public key, and a kill or a decline from a stranger
+//! fails closed (it costs the requester a cooldown and opens nothing).
 //! Everything that opens a window goes through a WebAuthn assertion from
 //! an enrolled security key.
 //!
@@ -281,7 +282,9 @@ async fn status(State(d): App) -> Reply<StatusReply> {
 async fn request(State(d): App, Json(body): Json<RequestBody>) -> Reply<RequestReply> {
     let key = ca::canonical_public_key(&body.public_key)
         .map_err(|e| Fail::new(StatusCode::BAD_REQUEST, "bad_key", e.to_string()))?;
-    let wanted = body.window_minutes.map(|m| Duration::from_secs(m * 60));
+    let wanted = body
+        .window_minutes
+        .map(|m| Duration::from_secs(m.saturating_mul(60)));
     let now = now();
     let ttl = d.config.policy().pending_ttl;
     let p = d.with(|inner| {
@@ -320,18 +323,7 @@ async fn issue(State(d): App, Json(body): Json<IssueBody>) -> Reply<IssueReply> 
     let key = ca::canonical_public_key(&body.public_key)
         .map_err(|e| Fail::new(StatusCode::BAD_REQUEST, "bad_key", e.to_string()))?;
     let now = now();
-    let (cert, ends_at) = d.with(|inner| -> Result<_, Refusal> {
-        let cert = inner.grants.issue(now, &body.host, &key)?;
-        let ends_at = inner
-            .grants
-            .windows(now)
-            .iter()
-            .filter(|w| w.scope.host == body.host)
-            .map(|w| w.scope.ends_at)
-            .max()
-            .unwrap_or(cert.valid_before);
-        Ok((cert, ends_at))
-    })?;
+    let cert = d.with(|inner| inner.grants.issue(now, &body.host, &key))?;
     let signed =
         d.ca.sign(&cert, &body.host)
             .and_then(|c| c.to_openssh().map_err(ca::Error::from))
@@ -340,13 +332,20 @@ async fn issue(State(d): App, Json(body): Json<IssueBody>) -> Reply<IssueReply> 
         certificate: signed,
         serial: cert.serial,
         valid_before: store::unix(cert.valid_before),
-        ends_at: store::unix(ends_at),
+        ends_at: store::unix(cert.window_ends_at),
     }))
 }
 
 async fn kill(State(d): App, Json(body): Json<KillBody>) -> Reply<serde_json::Value> {
     let now = now();
-    d.with(|inner| inner.grants.kill(now, &body.host))?;
+    d.with(|inner| {
+        inner.grants.kill(now, &body.host)?;
+        // A ceremony for the request that kill just declined is stale.
+        if inner.grants.pending(now).is_none() {
+            inner.approve = None;
+        }
+        Ok::<_, Refusal>(())
+    })?;
     Ok(Json(serde_json::json!({ "killed": body.host })))
 }
 
@@ -502,8 +501,10 @@ async fn enroll_start(
     Json(body): Json<EnrollStart>,
 ) -> Reply<CreationChallengeResponse> {
     let now = now();
-    let code = check_code(&d, &body.code, now)?;
     d.with(|inner| {
+        // Under the lock: the failure counter is read-modify-write on disk,
+        // and concurrent guesses must each cost a strike.
+        let code = check_code(&d, &body.code, now)?;
         let exclude: Vec<CredentialID> = inner
             .devices
             .iter()
@@ -534,8 +535,8 @@ async fn enroll_finish(
     Json(body): Json<EnrollFinish<RegisterPublicKeyCredential>>,
 ) -> Reply<serde_json::Value> {
     let now = now();
-    check_code(&d, &body.code, now)?;
     d.with(|inner| {
+        check_code(&d, &body.code, now)?;
         let ceremony = inner
             .enroll
             .take()

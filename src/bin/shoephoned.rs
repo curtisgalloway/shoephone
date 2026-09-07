@@ -38,47 +38,74 @@ fn usage() -> Status {
     Status::Usage
 }
 
-fn flag(args: &[String], name: &str) -> Option<String> {
-    args.iter()
-        .position(|a| a == name)
-        .and_then(|i| args.get(i + 1).cloned())
+/// The parsed command line. Flags take the next token as their value only
+/// when it is not itself a flag, so `--name --config x` is a usage error
+/// rather than a device named `--config`.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Args {
+    config: Option<String>,
+    name: Option<String>,
+    verb: Option<String>,
+}
+
+fn parse(args: &[String]) -> Result<Args, String> {
+    let mut out = Args::default();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--config" | "--name" => {
+                let value = it
+                    .next()
+                    .filter(|v| !v.starts_with("--"))
+                    .ok_or_else(|| format!("{a} needs a value"))?;
+                let slot = if a == "--config" {
+                    &mut out.config
+                } else {
+                    &mut out.name
+                };
+                if slot.is_some() {
+                    return Err(format!("{a} given twice"));
+                }
+                *slot = Some(value.clone());
+            }
+            flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
+            verb if out.verb.is_none() => out.verb = Some(verb.to_owned()),
+            extra => return Err(format!("unexpected argument {extra:?}")),
+        }
+    }
+    Ok(out)
 }
 
 fn run(args: &[String]) -> Status {
-    let Some(config_path) = flag(args, "--config") else {
+    let parsed = match parse(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("shoephoned: {e}");
+            return usage();
+        }
+    };
+    let Some(config_path) = parsed.config else {
         return usage();
     };
-    let verb = args
-        .iter()
-        .find(|a| !a.starts_with("--") && Some(a.as_str()) != Some(config_path.as_str()))
-        .map(String::as_str);
-    let config_path = PathBuf::from(config_path);
-    let config = match Config::from_file(&config_path) {
+    let config = match Config::from_file(&PathBuf::from(config_path)) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("shoephoned: {e}");
             return Status::Precondition;
         }
     };
-    match verb {
-        Some("serve") => serve(config),
-        Some("init-ca") => init_ca(&config.ca_key),
-        Some("enroll") => match flag(args, "--name") {
-            Some(name) => enroll(&config, &name),
-            None => usage(),
-        },
+    match (parsed.verb.as_deref(), parsed.name) {
+        (Some("serve"), None) => serve(config),
+        (Some("init-ca"), None) => init_ca(&config.ca_key),
+        (Some("enroll"), Some(name)) => enroll(&config, &name),
         _ => usage(),
     }
 }
 
 fn init_ca(path: &Path) -> Status {
-    if path.exists() {
-        eprintln!(
-            "shoephoned: {} already exists; refusing to overwrite a CA",
-            path.display()
-        );
-        return Status::Precondition;
-    }
+    // No exists() check: write_openssh_file creates the file with
+    // create_new, so an existing file or a planted symlink fails the open
+    // instead of being truncated.
     let ca = match UserCa::generate("shoephone user CA") {
         Ok(ca) => ca,
         Err(e) => {
@@ -87,13 +114,13 @@ fn init_ca(path: &Path) -> Status {
         }
     };
     if let Err(e) = ca.write_openssh_file(path) {
-        eprintln!("shoephoned: {e}");
+        eprintln!("shoephoned: {e}; refusing to overwrite an existing CA");
         return Status::Precondition;
     }
     match ca.public_key_line() {
         Ok(line) => {
             eprintln!(
-                "shoephoned: wrote {}; make it mode 0600, owner root",
+                "shoephoned: wrote {} (mode 0600); it must be owned by root",
                 path.display()
             );
             eprintln!("shoephoned: TrustedUserCAKeys line for every host follows on stdout");
@@ -201,4 +228,40 @@ fn serve(config: Config) -> Status {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(s: &str) -> Vec<String> {
+        s.split_whitespace().map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn flags_take_values_that_are_not_flags() {
+        let p = parse(&argv("--config /etc/x.toml enroll --name phone")).unwrap();
+        assert_eq!(p.config.as_deref(), Some("/etc/x.toml"));
+        assert_eq!(p.verb.as_deref(), Some("enroll"));
+        assert_eq!(p.name.as_deref(), Some("phone"));
+
+        let p = parse(&argv("--config x --name laptop enroll")).unwrap();
+        assert_eq!(
+            p.verb.as_deref(),
+            Some("enroll"),
+            "a flag value is not the verb"
+        );
+
+        let p = parse(&argv("--config enroll enroll")).unwrap();
+        assert_eq!(p.config.as_deref(), Some("enroll"));
+        assert_eq!(p.verb.as_deref(), Some("enroll"));
+
+        assert!(
+            parse(&argv("enroll --name --config x")).is_err(),
+            "a flag is not a value"
+        );
+        assert!(parse(&argv("--config x serve extra")).is_err());
+        assert!(parse(&argv("--config x --bogus serve")).is_err());
+        assert!(parse(&argv("--config x --config y serve")).is_err());
+    }
 }

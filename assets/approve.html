@@ -112,7 +112,8 @@ async function refresh() {
   $('windows').classList.toggle('hidden', s.windows.length === 0);
   $('windowlist').replaceChildren(...s.windows.map(w => {
     const li = document.createElement('li');
-    li.innerHTML = `<span>admin on <b>${w.host}</b> until ${when(w.ends_at)}</span>`;
+    const span = document.createElement('span'); const b = document.createElement('b');
+    b.textContent = w.host; span.append('admin on ', b, ` until ${when(w.ends_at)}`); li.append(span);
     const b = document.createElement('button'); b.className = 'no'; b.textContent = 'End'; b.style.flex = '0 0 auto'; b.style.padding = '.3rem .8rem';
     b.onclick = () => api('/api/kill', {host: w.host}).then(refresh, e => alert(e.message));
     li.append(b); return li;
