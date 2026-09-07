@@ -34,8 +34,11 @@ jobs:
           set -u
           bin=target/release/shoephone
           out=$($bin --skill < /dev/null | head -1); test "$out" = "---"
-          $bin doctor < /dev/null | cat; test "${PIPESTATUS[0]}" -eq 0
+          $bin doctor < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 3
+          $bin doctor --json < /dev/null 2>/dev/null | head -c 1 | grep -q '{'
           $bin bogus < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 2
+          $bin request < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 2
+          $bin --daemon http://127.0.0.1:9 status < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 4
           $bin < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 2
           target/release/shoephoned < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 2
           target/release/shoephoned --config /nonexistent.toml serve < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 3

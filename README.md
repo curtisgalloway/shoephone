@@ -26,21 +26,24 @@ The name is from Get Smart. The approver is a phone; the agency is CONTROL.
 
 ## Status
 
-The daemon exists and has not yet been deployed. `shoephoned` holds the
-user CA, enforces the window, per-host principals, rate cap, cooldown and
-single-use nonce, serves the approve page, enrolls a hardware security key
-through WebAuthn, and appends every outcome to a ledger. The CLI still has
-only `doctor`. The design is in [docs/DESIGN.md](docs/DESIGN.md), which also
-covers the three things to close *before* deploying any of this (an
-unattended secrets token that can read admin credentials, the
-infrastructure repository as the trusted computing base, and backup servers
-that accept deletes with no credential). Remaining, in order:
+Built, not yet deployed. `shoephoned` holds the user CA, enforces the
+window, per-host principals, rate cap, cooldown and single-use nonce,
+serves the approve page, enrolls a hardware security key through WebAuthn,
+and appends every outcome to a ledger. `shoephone` requests, waits, loads
+the certificate into ssh-agent, renews inside the window, disavows, and
+has a `doctor` that says why a request cannot succeed before you make it.
+The full loop runs against a live daemon in tests; the security-key tap
+itself has not been tried from a phone yet. The design is in
+[docs/DESIGN.md](docs/DESIGN.md), which also covers the three things to
+close *before* deploying any of this (an unattended secrets token that can
+read admin credentials, the infrastructure repository as the trusted
+computing base, and backup servers that accept deletes with no
+credential). Remaining, in order:
 
-1. `shoephone` verbs: request, renew, disavow, and a `doctor` that says why a
-   request cannot succeed before you make it.
-2. A content-free push to the phone when a request arrives.
-3. The full loop on cellular, then decide whether the web ceremony holds up
-   or a native app is needed.
+1. A content-free push to the phone when a request arrives.
+2. Deploy on the failsafe host behind TLS, enroll a key, run the loop on
+   cellular, then decide whether the web ceremony holds up or a native app
+   is needed.
 
 ## Running the daemon
 
@@ -63,11 +66,25 @@ rp_origin = "https://approve.example.internal"
 web01 = "agent-admin:web01"
 ```
 
+## Using the CLI
+
+```bash
+export SHOEPHONE_DAEMON=https://approve.example.internal   # or ~/.config/shoephone/config.toml
+shoephone doctor                # what is missing, before guessing
+shoephone request web01         # prints a match code, waits for the phone, loads the cert
+ssh agent-admin@web01 sudo systemctl restart something
+shoephone renew web01           # next 15 minutes, no second tap, inside the window
+shoephone disavow web01         # close the window early
+```
+
+`shoephone --skill` prints the agent-facing document with the full exit
+code table.
+
 ## Building
 
 ```bash
-cargo build --release
-target/release/shoephone --skill    # the agent-facing document
+cargo build --release           # never with --features test-hooks for a deployed daemon
+target/release/shoephone --skill
 ```
 
 ## License

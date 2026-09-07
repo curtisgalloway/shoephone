@@ -23,6 +23,11 @@ path = "src/bin/shoephone.rs"
 name = "shoephoned"
 path = "src/bin/shoephoned.rs"
 
+[features]
+# Adds POST /api/test/approve, which opens a window with no security key.
+# For integration tests only; never enable it in a build that gets deployed.
+test-hooks = []
+
 [dependencies]
 axum = "0.8.9"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -30,4 +35,8 @@ serde_json = "1.0.151"
 ssh-key = { version = "0.6.7", features = ["ed25519", "std", "rand_core", "getrandom"], default-features = false }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 toml = "1.1.5"
+ureq = { version = "3.4.1", default-features = false, features = ["rustls", "platform-verifier", "json"] }
 webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
+
+[dev-dependencies]
+shoephone = { path = ".", features = ["test-hooks"] }

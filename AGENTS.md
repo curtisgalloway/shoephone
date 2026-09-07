@@ -42,8 +42,9 @@ Three pieces live here:
   in with `include_str!` so it cannot drift from the binary. `--json` is a
   single document on stdout, diagnostics on stderr. Never prompt when stdin
   is not a TTY.
-- **Tool-specific exit codes (100-124):** none yet. Record each one here as
-  it is invented so the next session extends the list instead of renumbering.
+- **Tool-specific exit codes (100-124):** none. Every outcome so far fits
+  the portable bands; see `SKILL.md` for the mapping. Record any new one
+  here so the next session extends the list instead of renumbering.
 - **Generic by construction.** No real hostnames, vault names, addresses, or
   secrets in this repo, ever. The estate-specific deployment lives in the
   operator's private infrastructure repo, which points here.
@@ -64,7 +65,10 @@ here first, then in the code.
 | HTTP stack | axum on tokio, plain HTTP on a loopback or private address. TLS comes from a reverse proxy in front; `rp_origin` must be what the phone actually loads, over https. |
 | Persistence | Enrolled approver devices on disk, root-only. Windows, nonces and counters in memory; a restart fails closed. |
 | Notifications and ledger | Content-free push to an ntfy-style topic the operator runs; the page fetches details from the daemon. Ledger is an append-only file on the daemon plus the page's history view until an app exists. |
-| Build order inside this repo | 1. `grant` state machine with tests (done). 2. `ca` signing (done, verified with `ssh-keygen -L`). 3. axum surface, approve page, WebAuthn enroll and approve, ledger file (done; the key tap itself is untested until a phone reaches a deployed daemon). 4. CLI verbs. 5. Content-free push. |
+| Build order inside this repo | 1. `grant` state machine with tests (done). 2. `ca` signing (done, verified with `ssh-keygen -L`). 3. axum surface, approve page, WebAuthn enroll and approve, ledger file (done; the key tap itself is untested until a phone reaches a deployed daemon). 4. CLI verbs `request`, `renew`, `disavow`, `status`, `doctor` (done, exercised end to end against a live daemon and ssh-agent). 5. Content-free push. |
+| CLI HTTP client | `ureq` with rustls and the platform verifier, so a private CA in the machine's trust store works. Blocking; the CLI has no async. |
+| Session key | One ed25519 keypair per user, unencrypted, mode 0600, in `$XDG_STATE_HOME/shoephone` (default `~/.local/state/shoephone`). Certificates land beside it as `-cert.pub` and both go into ssh-agent via `ssh-add -t` for the certificate's remaining life. |
+| Test hook | Cargo feature `test-hooks` adds `POST /api/test/approve`, enabled only through the dev-dependency on the crate itself. A deployed build must be built without it. |
 | Agent-side endpoints are unauthenticated | `request`, poll, `issue` and `kill` take no credential. Requests are rate-capped; a certificate is only ever issued to the approved public key, which is public anyway; a stranger's kill or decline fails closed. Everything that opens a window needs the security key. |
 | Enrollment channel | `shoephoned enroll --name <device>` at the console writes the SHA-256 of a one-time code into the root-only state dir; the page's enroll form consumes it within 10 minutes or 5 wrong guesses. The agent never sees the code. |
 

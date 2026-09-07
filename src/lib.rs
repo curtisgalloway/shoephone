@@ -12,8 +12,10 @@
 
 pub mod api;
 pub mod ca;
+pub mod client;
 pub mod config;
 pub mod exit;
 pub mod grant;
 pub mod server;
+pub mod session;
 pub mod store;

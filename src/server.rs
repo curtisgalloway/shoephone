@@ -178,7 +178,7 @@ impl Daemon {
     }
 
     pub fn router(self: Arc<Self>) -> Router {
-        Router::new()
+        let router = Router::new()
             .route("/", get(page))
             .route("/api/status", get(status))
             .route("/api/request", post(request))
@@ -191,8 +191,10 @@ impl Daemon {
             .route("/api/decline", post(decline))
             .route("/api/enroll/start", post(enroll_start))
             .route("/api/enroll/finish", post(enroll_finish))
-            .route("/api/ledger", get(ledger))
-            .with_state(self)
+            .route("/api/ledger", get(ledger));
+        #[cfg(feature = "test-hooks")]
+        let router = router.route("/api/test/approve", post(test_approve));
+        router.with_state(self)
     }
 }
 
@@ -552,4 +554,29 @@ async fn enroll_finish(
 
 async fn ledger(State(d): App) -> Reply<Vec<LedgerEntry>> {
     d.store.read_ledger(50).map(Json).map_err(Fail::internal)
+}
+
+/// Test hook: approve the pending request with no ceremony at all. Only
+/// compiled with the `test-hooks` feature, which integration tests enable
+/// and deployed builds must not.
+#[cfg(feature = "test-hooks")]
+async fn test_approve(State(d): App, Json(body): Json<ById>) -> Reply<serde_json::Value> {
+    let now = now();
+    d.with(|inner| {
+        let p = inner
+            .grants
+            .pending(now)
+            .filter(|p| p.id == body.id)
+            .cloned()
+            .ok_or(Refusal::NoSuchRequest)?;
+        let window = inner.grants.approve(
+            now,
+            &Approval {
+                id: p.id,
+                nonce: p.nonce,
+                scope: p.scope,
+            },
+        )?;
+        Ok(Json(serde_json::json!({ "approved": window.id })))
+    })
 }
