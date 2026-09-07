@@ -1,0 +1,190 @@
+<!doctype html>
+<!--
+  SPDX-FileCopyrightText: 2026 Curtis Galloway
+  SPDX-License-Identifier: Apache-2.0
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shoephone</title>
+<style>
+  :root { color-scheme: light dark; --ok: #1a7f37; --no: #b42318; --muted: #6b7280; --card: rgba(127,127,127,.08); }
+  body { font: 17px/1.45 -apple-system, system-ui, sans-serif; margin: 0; padding: 1rem; max-width: 34rem; margin-inline: auto; }
+  h1 { font-size: 1.1rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 1rem; }
+  .card { background: var(--card); border-radius: 12px; padding: 1rem 1.2rem; margin-bottom: 1rem; }
+  .scope { font-size: 1.5rem; font-weight: 650; margin: 0 0 .3rem; }
+  .code { font: 700 2.4rem/1 ui-monospace, Menlo, monospace; letter-spacing: .12em; text-align: center; margin: 1rem 0; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: .15rem .8rem; font-size: .92rem; }
+  .kv dt { color: var(--muted); } .kv dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, Menlo, monospace; font-size: .85rem; }
+  .row { display: flex; gap: .8rem; margin-top: 1rem; }
+  button { flex: 1; font: inherit; font-weight: 650; padding: .9rem; border: 0; border-radius: 10px; color: white; }
+  button.ok { background: var(--ok); } button.no { background: var(--no); } button.plain { background: var(--muted); }
+  button:disabled { opacity: .5; }
+  .muted { color: var(--muted); font-size: .92rem; }
+  .status { min-height: 1.4em; font-size: .95rem; }
+  ul { list-style: none; padding: 0; margin: 0; } li { padding: .35rem 0; border-top: 1px solid rgba(127,127,127,.2); font-size: .9rem; display: flex; gap: .6rem; }
+  li time { color: var(--muted); white-space: nowrap; }
+  input { font: inherit; padding: .7rem; border-radius: 10px; border: 1px solid rgba(127,127,127,.4); width: 100%; box-sizing: border-box; text-transform: uppercase; letter-spacing: .1em; }
+  .hidden { display: none; }
+  summary { cursor: pointer; color: var(--muted); }
+</style>
+</head>
+<body>
+<h1>shoephone</h1>
+
+<div id="pending" class="card hidden">
+  <p class="scope" id="scope"></p>
+  <p class="muted">Compare this code with the terminal:</p>
+  <p class="code" id="match"></p>
+  <dl class="kv">
+    <dt>from</dt><dd id="requester"></dd>
+    <dt>key</dt><dd id="fingerprint"></dd>
+    <dt>principal</dt><dd id="principal"></dd>
+    <dt>expires</dt><dd id="expires"></dd>
+  </dl>
+  <div class="row">
+    <button class="no" id="decline">Decline</button>
+    <button class="ok" id="approve">Approve</button>
+  </div>
+  <p class="status" id="status"></p>
+</div>
+
+<div id="idle" class="card">
+  <p class="muted" id="idletext">No request is waiting.</p>
+</div>
+
+<div id="windows" class="card hidden">
+  <p class="muted">Open windows</p>
+  <ul id="windowlist"></ul>
+</div>
+
+<details class="card">
+  <summary>History</summary>
+  <ul id="ledger"></ul>
+</details>
+
+<details class="card" id="enroll">
+  <summary>Enroll this security key</summary>
+  <p class="muted">Run <code>shoephoned enroll --name &lt;device&gt;</code> at the failsafe host's console and enter the code it prints.</p>
+  <input id="code" placeholder="XXXX-XXXX" autocomplete="off" autocapitalize="characters">
+  <div class="row"><button class="plain" id="enrollbtn">Register key</button></div>
+  <p class="status" id="enrollstatus"></p>
+</details>
+
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const b64u = {
+  enc: buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''),
+  dec: s => { s = s.replace(/-/g,'+').replace(/_/g,'/'); s += '='.repeat((4 - s.length % 4) % 4); return Uint8Array.from(atob(s), c => c.charCodeAt(0)); },
+};
+const when = t => new Date(t * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `${r.status}`);
+  return j;
+}
+
+let current = null;
+let busy = false;
+
+async function refresh() {
+  if (busy) return;
+  let s;
+  try { s = await api('/api/pending'); } catch (e) { $('idletext').textContent = 'Daemon unreachable: ' + e.message; return; }
+  current = s.pending;
+  $('pending').classList.toggle('hidden', !s.pending);
+  $('idle').classList.toggle('hidden', !!s.pending);
+  if (s.pending) {
+    const p = s.pending;
+    $('scope').textContent = `admin on ${p.host} until ${when(p.ends_at)}`;
+    $('match').textContent = p.match_code;
+    $('requester').textContent = p.requester || '(unnamed)';
+    $('fingerprint').textContent = p.fingerprint;
+    $('principal').textContent = p.principal;
+    $('expires').textContent = `request expires ${when(p.expires)}`;
+    if (navigator.vibrate) navigator.vibrate(60);
+  } else {
+    $('idletext').textContent = s.enrolled ? 'No request is waiting.' : 'No approver device is enrolled yet.';
+  }
+  $('windows').classList.toggle('hidden', s.windows.length === 0);
+  $('windowlist').replaceChildren(...s.windows.map(w => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span>admin on <b>${w.host}</b> until ${when(w.ends_at)}</span>`;
+    const b = document.createElement('button'); b.className = 'no'; b.textContent = 'End'; b.style.flex = '0 0 auto'; b.style.padding = '.3rem .8rem';
+    b.onclick = () => api('/api/kill', {host: w.host}).then(refresh, e => alert(e.message));
+    li.append(b); return li;
+  }));
+  try {
+    const l = await api('/api/ledger');
+    $('ledger').replaceChildren(...l.reverse().map(e => {
+      const li = document.createElement('li');
+      const t = document.createElement('time'); t.textContent = when(e.at);
+      const s = document.createElement('span');
+      s.textContent = `${e.kind.replace('_', ' ')} ${e.host}` + (e.until ? ` until ${when(e.until)}` : '') + (e.serial ? ` #${e.serial}` : '');
+      li.append(t, s); return li;
+    }));
+  } catch (e) {}
+}
+
+function toCredentialJSON(cred) {
+  const r = cred.response;
+  const out = {id: cred.id, rawId: b64u.enc(cred.rawId), type: cred.type, extensions: cred.getClientExtensionResults ? cred.getClientExtensionResults() : {}, response: {clientDataJSON: b64u.enc(r.clientDataJSON)}};
+  if (r.attestationObject) { out.response.attestationObject = b64u.enc(r.attestationObject); if (r.getTransports) out.response.transports = r.getTransports(); }
+  if (r.authenticatorData) { out.response.authenticatorData = b64u.enc(r.authenticatorData); out.response.signature = b64u.enc(r.signature); out.response.userHandle = r.userHandle ? b64u.enc(r.userHandle) : null; }
+  return out;
+}
+
+$('approve').onclick = async () => {
+  if (!current) return;
+  busy = true; $('approve').disabled = $('decline').disabled = true; $('status').textContent = 'Touch your security key…';
+  try {
+    const opts = await api('/api/approve/start', {id: current.id});
+    const pk = opts.publicKey;
+    pk.challenge = b64u.dec(pk.challenge);
+    (pk.allowCredentials || []).forEach(c => c.id = b64u.dec(c.id));
+    const cred = await navigator.credentials.get({publicKey: pk});
+    const r = await api('/api/approve/finish', {id: current.id, credential: toCredentialJSON(cred)});
+    $('status').textContent = `Approved: admin on ${r.host} until ${when(r.ends_at)}.`;
+  } catch (e) {
+    $('status').textContent = 'Not approved: ' + e.message;
+  } finally {
+    busy = false; $('approve').disabled = $('decline').disabled = false; setTimeout(refresh, 800);
+  }
+};
+
+$('decline').onclick = async () => {
+  if (!current) return;
+  busy = true;
+  try { await api('/api/decline', {id: current.id}); $('status').textContent = 'Declined.'; }
+  catch (e) { $('status').textContent = e.message; }
+  finally { busy = false; setTimeout(refresh, 300); }
+};
+
+$('enrollbtn').onclick = async () => {
+  const code = $('code').value;
+  $('enrollstatus').textContent = 'Touch your security key…';
+  try {
+    const opts = await api('/api/enroll/start', {code});
+    const pk = opts.publicKey;
+    pk.challenge = b64u.dec(pk.challenge);
+    pk.user.id = b64u.dec(pk.user.id);
+    (pk.excludeCredentials || []).forEach(c => c.id = b64u.dec(c.id));
+    const cred = await navigator.credentials.create({publicKey: pk});
+    const r = await api('/api/enroll/finish', {code, credential: toCredentialJSON(cred)});
+    $('enrollstatus').textContent = `Enrolled ${r.enrolled}.`;
+    $('code').value = '';
+  } catch (e) {
+    $('enrollstatus').textContent = 'Enrollment failed: ' + e.message;
+  }
+  refresh();
+};
+
+refresh();
+setInterval(refresh, 3000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
+</script>
+</body>
+</html>

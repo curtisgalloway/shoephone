@@ -37,4 +37,6 @@ jobs:
           $bin doctor < /dev/null | cat; test "${PIPESTATUS[0]}" -eq 0
           $bin bogus < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 2
           $bin < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 2
-          target/release/shoephoned < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 3
+          target/release/shoephoned < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 2
+          target/release/shoephoned --config /nonexistent.toml serve < /dev/null 2>/dev/null | cat; test "${PIPESTATUS[0]}" -eq 3
+          target/release/shoephoned --version < /dev/null | cat; test "${PIPESTATUS[0]}" -eq 0

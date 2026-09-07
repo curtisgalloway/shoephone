@@ -56,15 +56,17 @@ here first, then in the code.
 
 | Question | Decision |
 |---|---|
-| Approver binding, first ceremony | WebAuthn with a hardware security key on the web page. The assertion signs a challenge derived from `Scope::bytes_to_sign(nonce)`. No synced passkeys, no client-certificate-only binding. |
+| Approver binding, first ceremony | WebAuthn with a hardware security key on the web page, via `webauthn-rs` (scored 6.4, MPL-2.0, brings the `openssl` crate). The library generates its own random challenge, so the daemon binds it server-side: when the ceremony starts it snapshots the pending request's id, nonce and enforced scope, and only that snapshot reaches `Grants::approve` after the assertion verifies. `Scope::bytes_to_sign` stays for a future app that signs bytes it displayed. No synced passkeys. |
 | Windows and certificates | 60 min default window, 4 h maximum, 15 min certificates, 5 min pending timeout. Defaults live in `grant::Policy`. |
 | Certificate signing | The `ssh-key` crate (default features off; ed25519, std, getrandom), CA key unencrypted in a root-only file. No `ssh-keygen` subprocess. Certificates carry one principal, the grant's serial, key id `shoephone:<host>:<serial>`, and only the `permit-pty` extension. |
 | Rate cap | One pending request at a time; 6 accepted requests per rolling hour, keyed per approver across every requester. |
 | Decline cooldown | 5 min base, doubling per consecutive strike, capped at 60 min. A timeout counts like a decline. Strikes reset only on approval. Rule lives in `Grants::cooldown_after`. |
-| HTTP stack | axum on tokio. |
+| HTTP stack | axum on tokio, plain HTTP on a loopback or private address. TLS comes from a reverse proxy in front; `rp_origin` must be what the phone actually loads, over https. |
 | Persistence | Enrolled approver devices on disk, root-only. Windows, nonces and counters in memory; a restart fails closed. |
 | Notifications and ledger | Content-free push to an ntfy-style topic the operator runs; the page fetches details from the daemon. Ledger is an append-only file on the daemon plus the page's history view until an app exists. |
-| Build order inside this repo | 1. `grant` state machine with tests (done). 2. `ca` signing (done, verified with `ssh-keygen -L`). 3. axum surface and approve page with WebAuthn. 4. CLI verbs. 5. Push and ledger. |
+| Build order inside this repo | 1. `grant` state machine with tests (done). 2. `ca` signing (done, verified with `ssh-keygen -L`). 3. axum surface, approve page, WebAuthn enroll and approve, ledger file (done; the key tap itself is untested until a phone reaches a deployed daemon). 4. CLI verbs. 5. Content-free push. |
+| Agent-side endpoints are unauthenticated | `request`, poll, `issue` and `kill` take no credential. Requests are rate-capped; a certificate is only ever issued to the approved public key, which is public anyway; a stranger's kill or decline fails closed. Everything that opens a window needs the security key. |
+| Enrollment channel | `shoephoned enroll --name <device>` at the console writes the SHA-256 of a one-time code into the root-only state dir; the page's enroll form consumes it within 10 minutes or 5 wrong guesses. The agent never sees the code. |
 
 ## Security invariants (do not relax these in code)
 

@@ -24,4 +24,10 @@ name = "shoephoned"
 path = "src/bin/shoephoned.rs"
 
 [dependencies]
+axum = "0.8.9"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 ssh-key = { version = "0.6.7", features = ["ed25519", "std", "rand_core", "getrandom"], default-features = false }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+toml = "1.1.5"
+webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
