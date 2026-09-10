@@ -42,7 +42,7 @@ impl Error {
             Error::Unreachable(_) => Status::Unreachable,
             Error::Protocol(_) => Status::RetryUnknown,
             Error::Daemon { http, reply } => match reply.code.as_str() {
-                "unknown_host" | "bad_key" => Status::Permanent,
+                "unknown_host" | "bad_key" | "reason_required" => Status::Permanent,
                 "busy" => Status::RetryClean,
                 "cooldown" | "rate_capped" => Status::RetryLater,
                 "no_window" | "no_such_request" => Status::AuthNeedsHuman,

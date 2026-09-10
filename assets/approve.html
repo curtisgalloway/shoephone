@@ -14,6 +14,7 @@
   h1 { font-size: 1.1rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 0 0 1rem; }
   .card { background: var(--card); border-radius: 12px; padding: 1rem 1.2rem; margin-bottom: 1rem; }
   .scope { font-size: 1.5rem; font-weight: 650; margin: 0 0 .3rem; }
+  .reason { margin: 0 0 .6rem; font-size: 1.05rem; }
   .code { font: 700 2.4rem/1 ui-monospace, Menlo, monospace; letter-spacing: .12em; text-align: center; margin: 1rem 0; }
   .kv { display: grid; grid-template-columns: auto 1fr; gap: .15rem .8rem; font-size: .92rem; }
   .kv dt { color: var(--muted); } .kv dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, Menlo, monospace; font-size: .85rem; }
@@ -35,6 +36,7 @@
 
 <div id="pending" class="card hidden">
   <p class="scope" id="scope"></p>
+  <p class="reason" id="reason"></p>
   <p class="muted">Compare this code with the terminal:</p>
   <p class="code" id="match"></p>
   <dl class="kv">
@@ -101,6 +103,7 @@ async function refresh() {
     const p = s.pending;
     $('scope').textContent = `admin on ${p.host} until ${when(p.ends_at)}`;
     $('match').textContent = p.match_code;
+    $('reason').textContent = p.reason;
     $('requester').textContent = p.requester || '(unnamed)';
     $('fingerprint').textContent = p.fingerprint;
     $('principal').textContent = p.principal;

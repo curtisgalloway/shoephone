@@ -74,6 +74,7 @@ async fn request_decline_cooldown_and_gone() {
         host: "web01".into(),
         public_key: key.clone(),
         requester: "test".into(),
+        reason: "loop test: decline path".into(),
         window_minutes: Some(30),
     };
     let c = client.clone();
@@ -145,6 +146,7 @@ async fn approved_window_issues_certificates_bound_to_the_key() {
             host: "web01".into(),
             public_key: k,
             requester: "test".into(),
+            reason: "loop test: approve path".into(),
             window_minutes: None,
         })
     })

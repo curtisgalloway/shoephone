@@ -22,7 +22,7 @@ expect the request to be declined without that being an error in the tool.
 ```bash
 shoephone [--json] [--daemon URL] <command>
 shoephone doctor                     # check preconditions before guessing
-shoephone request <host> [--window MINUTES]
+shoephone request <host> --reason "..." [--window MINUTES]
 shoephone renew <host>               # a fresh certificate inside the open window
 shoephone disavow <host>             # end the window early; unload the key
 shoephone status                     # open windows
@@ -34,9 +34,16 @@ The daemon address comes from `--daemon`, else `$SHOEPHONE_DAEMON`, else
 `daemon = "https://..."` in `~/.config/shoephone/config.toml`. `doctor`
 says which one is in effect and whether it answers.
 
+`--reason` is required. Write it for the person who will read it on
+their phone before deciding: what the task is, why it needs admin on
+that host, and roughly what you will run, in one or two sentences. It is
+shown beside the match code and kept in the history. A request with no
+reason is refused before anyone is asked.
+
 ## What a request does
 
-1. Sends the host and this machine's session public key to the daemon.
+1. Sends the host, the reason, and this machine's session public key to
+   the daemon.
    The session key is generated once, unencrypted, in
    `~/.local/state/shoephone/`; it is useless without a certificate.
 2. Prints a **match code** on stdout. The person compares it with the one on

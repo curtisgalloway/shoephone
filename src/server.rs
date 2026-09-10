@@ -105,6 +105,7 @@ impl From<Refusal> for Fail {
         let (status, code, until) = match &r {
             Refusal::UnknownHost => (S::NOT_FOUND, "unknown_host", None),
             Refusal::BadKey => (S::BAD_REQUEST, "bad_key", None),
+            Refusal::NoReason => (S::BAD_REQUEST, "reason_required", None),
             Refusal::Busy => (S::CONFLICT, "busy", None),
             Refusal::Cooldown { until } => (S::TOO_MANY_REQUESTS, "cooldown", Some(*until)),
             Refusal::RateCapped { until } => (S::TOO_MANY_REQUESTS, "rate_capped", Some(*until)),
@@ -321,6 +322,7 @@ fn pending_view(p: &Pending, ttl: Duration) -> PendingView {
         ends_at: store::unix(p.scope.ends_at),
         match_code: p.match_code.clone(),
         requester: p.requester.clone(),
+        reason: p.reason.clone(),
         fingerprint: ca::fingerprint(&p.scope.public_key)
             .map(|f| f.to_string())
             .unwrap_or_default(),
@@ -360,9 +362,15 @@ async fn request(State(d): App, Json(body): Json<RequestBody>) -> Reply<RequestR
     let ttl = d.config.policy().pending_ttl;
     let p = d.with(|inner| {
         let mut entropy = ca::OsEntropy;
-        inner
-            .grants
-            .request(now, &mut entropy, &body.host, &key, &body.requester, wanted)
+        inner.grants.request(
+            now,
+            &mut entropy,
+            &body.host,
+            &key,
+            &body.requester,
+            &body.reason,
+            wanted,
+        )
     })?;
     Ok(Json(RequestReply {
         id: p.id,

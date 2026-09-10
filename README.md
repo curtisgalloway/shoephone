@@ -193,7 +193,8 @@ for any other host carries a different principal and is refused, and
 ```bash
 export SHOEPHONE_DAEMON=https://approve.example.internal   # or ~/.config/shoephone/config.toml
 shoephone doctor                # what is missing, before guessing
-shoephone request web01         # prints a match code, waits for the phone, loads the cert
+shoephone request web01 --reason "rotate the TLS cert; needs a service restart"
+                                # prints a match code, waits for the phone, loads the cert
 ssh agent-admin@web01 sudo systemctl restart something
 shoephone renew web01           # next 15 minutes, no second tap, inside the window
 shoephone disavow web01         # close the window early

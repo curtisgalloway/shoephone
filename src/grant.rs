@@ -118,6 +118,8 @@ pub struct Pending {
     pub created: SystemTime,
     /// The requesting machine's self-reported name. Display only; untrusted.
     pub requester: String,
+    /// The requester's stated purpose. Display only; untrusted; never empty.
+    pub reason: String,
 }
 
 /// What the approver's verified signature covered. The daemon builds this
@@ -159,6 +161,8 @@ pub enum Refusal {
     UnknownHost,
     /// The key is empty or carries control characters.
     BadKey,
+    /// The request gave no reason.
+    NoReason,
     /// Another request is already waiting for a verdict.
     Busy,
     /// A recent decline or timeout; try again at `until`.
@@ -182,6 +186,7 @@ impl fmt::Display for Refusal {
         match self {
             Refusal::UnknownHost => write!(f, "host is not one this daemon signs for"),
             Refusal::BadKey => write!(f, "public key is empty or malformed"),
+            Refusal::NoReason => write!(f, "a request must say why admin is needed"),
             Refusal::Busy => write!(f, "another request is awaiting a verdict"),
             Refusal::Cooldown { until } => {
                 write!(f, "cooling down after a decline until {}", unix(*until))
@@ -207,6 +212,7 @@ pub enum Event {
     Requested {
         id: u64,
         host: String,
+        reason: String,
         at: SystemTime,
     },
     Approved {
@@ -283,6 +289,9 @@ impl Grants {
     /// File a request. On success the returned [`Pending`] carries the
     /// enforced scope, the nonce and the match code; the CLI shows the match
     /// code and polls.
+    // Seven inputs is the whole request, each one a distinct decision the
+    // caller makes; a struct would only rename the problem.
+    #[allow(clippy::too_many_arguments)]
     pub fn request(
         &mut self,
         now: SystemTime,
@@ -290,9 +299,14 @@ impl Grants {
         host: &str,
         public_key: &str,
         requester: &str,
+        reason: &str,
         wanted: Option<Duration>,
     ) -> Result<Pending, Refusal> {
         self.tick(now);
+        let reason = printable(reason.trim(), 200);
+        if reason.is_empty() {
+            return Err(Refusal::NoReason);
+        }
         let principal = self
             .principals
             .get(host)
@@ -331,11 +345,13 @@ impl Grants {
             match_code: match_code(entropy),
             created: now,
             requester: printable(requester, 64),
+            reason: reason.clone(),
         };
         self.accepted.push_back(now);
         self.events.push(Event::Requested {
             id,
             host: host.to_owned(),
+            reason,
             at: now,
         });
         self.pending = Some(pending.clone());
@@ -620,7 +636,7 @@ mod tests {
 
     fn approved(g: &mut Grants, now: SystemTime) -> Window {
         let p = g
-            .request(now, &mut Counter(0), "web01", KEY, "laptop", None)
+            .request(now, &mut Counter(0), "web01", KEY, "laptop", "deploy", None)
             .unwrap();
         g.approve(now, &approval_for(&p)).unwrap()
     }
@@ -629,7 +645,15 @@ mod tests {
     fn request_builds_the_enforced_scope_from_policy_not_prose() {
         let mut g = grants();
         let p = g
-            .request(t(0), &mut Counter(0), "web01", KEY, "laptop", None)
+            .request(
+                t(0),
+                &mut Counter(0),
+                "web01",
+                KEY,
+                "laptop",
+                "deploy",
+                None,
+            )
             .unwrap();
         assert_eq!(p.scope.principal, "agent-admin:web01");
         assert_eq!(p.scope.ends_at, t(3600));
@@ -645,6 +669,7 @@ mod tests {
                 "web01",
                 KEY,
                 "laptop",
+                "deploy",
                 Some(9 * HOUR),
             )
             .unwrap();
@@ -658,7 +683,7 @@ mod tests {
     #[test]
     fn unknown_hosts_and_bad_keys_are_refused_before_anything_counts() {
         let mut g = grants();
-        let r = g.request(t(0), &mut Counter(0), "nope", KEY, "laptop", None);
+        let r = g.request(t(0), &mut Counter(0), "nope", KEY, "laptop", "deploy", None);
         assert_eq!(r, Err(Refusal::UnknownHost));
         let r = g.request(
             t(0),
@@ -666,10 +691,11 @@ mod tests {
             "web01",
             "ssh-ed25519 AAA\nevil",
             "x",
+            "deploy",
             None,
         );
         assert_eq!(r, Err(Refusal::BadKey));
-        let r = g.request(t(0), &mut Counter(0), "web01", "   ", "x", None);
+        let r = g.request(t(0), &mut Counter(0), "web01", "   ", "x", "deploy", None);
         assert_eq!(r, Err(Refusal::BadKey));
         assert!(g.accepted.is_empty(), "refusals do not spend the rate cap");
         assert!(g.take_events().is_empty());
@@ -678,9 +704,17 @@ mod tests {
     #[test]
     fn one_pending_request_at_a_time() {
         let mut g = grants();
-        g.request(t(0), &mut Counter(0), "web01", KEY, "laptop", None)
-            .unwrap();
-        let r = g.request(t(1), &mut Counter(0), "db01", KEY, "laptop", None);
+        g.request(
+            t(0),
+            &mut Counter(0),
+            "web01",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+        )
+        .unwrap();
+        let r = g.request(t(1), &mut Counter(0), "db01", KEY, "laptop", "deploy", None);
         assert_eq!(r, Err(Refusal::Busy));
     }
 
@@ -688,7 +722,15 @@ mod tests {
     fn approval_must_cover_this_nonce_and_this_scope() {
         let mut g = grants();
         let p = g
-            .request(t(0), &mut Counter(0), "web01", KEY, "laptop", None)
+            .request(
+                t(0),
+                &mut Counter(0),
+                "web01",
+                KEY,
+                "laptop",
+                "deploy",
+                None,
+            )
             .unwrap();
 
         let mut wrong_nonce = approval_for(&p);
@@ -719,7 +761,15 @@ mod tests {
     fn an_approval_cannot_be_replayed() {
         let mut g = grants();
         let p = g
-            .request(t(0), &mut Counter(0), "web01", KEY, "laptop", None)
+            .request(
+                t(0),
+                &mut Counter(0),
+                "web01",
+                KEY,
+                "laptop",
+                "deploy",
+                None,
+            )
             .unwrap();
         let a = approval_for(&p);
         g.approve(t(1), &a).unwrap();
@@ -759,7 +809,15 @@ mod tests {
         let w1 = approved(&mut g, t(0));
         let later = t(600);
         let p = g
-            .request(later, &mut Counter(0), "web01", OTHER_KEY, "rogue", None)
+            .request(
+                later,
+                &mut Counter(0),
+                "web01",
+                OTHER_KEY,
+                "rogue",
+                "deploy",
+                None,
+            )
             .unwrap();
         let w2 = g.approve(later, &approval_for(&p)).unwrap();
         assert!(w2.scope.ends_at > w1.scope.ends_at);
@@ -782,7 +840,15 @@ mod tests {
         let mut g = grants();
         approved(&mut g, t(0));
         let p = g
-            .request(t(10), &mut Counter(0), "web01", OTHER_KEY, "rogue", None)
+            .request(
+                t(10),
+                &mut Counter(0),
+                "web01",
+                OTHER_KEY,
+                "rogue",
+                "deploy",
+                None,
+            )
             .unwrap();
         g.kill(t(20), "web01").unwrap();
         assert!(
@@ -805,8 +871,16 @@ mod tests {
         assert_eq!(&kinds[kinds.len() - 2..], [true, true]);
 
         let mut g = grants();
-        g.request(t(0), &mut Counter(0), "web01", KEY, "laptop", None)
-            .unwrap();
+        g.request(
+            t(0),
+            &mut Counter(0),
+            "web01",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+        )
+        .unwrap();
         g.kill(t(1), "web01").unwrap();
         assert!(
             g.pending(t(2)).is_none(),
@@ -829,7 +903,15 @@ mod tests {
     fn a_pending_request_times_out_and_is_recorded() {
         let mut g = grants();
         let p = g
-            .request(t(0), &mut Counter(0), "web01", KEY, "laptop", None)
+            .request(
+                t(0),
+                &mut Counter(0),
+                "web01",
+                KEY,
+                "laptop",
+                "deploy",
+                None,
+            )
             .unwrap();
         assert!(g.pending(t(299)).is_some());
         assert!(g.pending(t(300)).is_none());
@@ -846,10 +928,26 @@ mod tests {
     fn a_decline_costs_at_least_the_base_cooldown() {
         let mut g = grants();
         let p = g
-            .request(t(0), &mut Counter(0), "web01", KEY, "laptop", None)
+            .request(
+                t(0),
+                &mut Counter(0),
+                "web01",
+                KEY,
+                "laptop",
+                "deploy",
+                None,
+            )
             .unwrap();
         g.decline(t(10), p.id).unwrap();
-        let r = g.request(t(11), &mut Counter(0), "web01", KEY, "laptop", None);
+        let r = g.request(
+            t(11),
+            &mut Counter(0),
+            "web01",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+        );
         assert!(matches!(r, Err(Refusal::Cooldown { until }) if until >= t(10) + 5 * MIN));
     }
 
@@ -857,7 +955,15 @@ mod tests {
     fn an_approval_resets_the_cooldown() {
         let mut g = grants();
         let p = g
-            .request(t(0), &mut Counter(0), "web01", KEY, "laptop", None)
+            .request(
+                t(0),
+                &mut Counter(0),
+                "web01",
+                KEY,
+                "laptop",
+                "deploy",
+                None,
+            )
             .unwrap();
         g.decline(t(10), p.id).unwrap();
         let after = t(10) + 5 * MIN;
@@ -873,7 +979,7 @@ mod tests {
         let mut seen = Vec::new();
         for strike in 0..6u32 {
             let p = g
-                .request(now, &mut Counter(0), "web01", KEY, "laptop", None)
+                .request(now, &mut Counter(0), "web01", KEY, "laptop", "deploy", None)
                 .unwrap();
             if strike % 2 == 0 {
                 g.decline(now, p.id).unwrap();
@@ -903,16 +1009,33 @@ mod tests {
                     "web01",
                     KEY,
                     &format!("laptop-{i}"),
+                    "deploy",
                     None,
                 )
                 .unwrap();
             g.approve(now, &approval_for(&p)).unwrap();
         }
-        let r = g.request(t(400), &mut Counter(0), "db01", OTHER_KEY, "rogue", None);
+        let r = g.request(
+            t(400),
+            &mut Counter(0),
+            "db01",
+            OTHER_KEY,
+            "rogue",
+            "deploy",
+            None,
+        );
         assert_eq!(r, Err(Refusal::RateCapped { until: t(3600) }));
         assert!(
-            g.request(t(3600), &mut Counter(0), "db01", OTHER_KEY, "rogue", None)
-                .is_ok()
+            g.request(
+                t(3600),
+                &mut Counter(0),
+                "db01",
+                OTHER_KEY,
+                "rogue",
+                "deploy",
+                None
+            )
+            .is_ok()
         );
     }
 
@@ -935,7 +1058,15 @@ mod tests {
     fn the_ledger_sees_every_outcome() {
         let mut g = grants();
         let p = g
-            .request(t(0), &mut Counter(0), "web01", KEY, "laptop", None)
+            .request(
+                t(0),
+                &mut Counter(0),
+                "web01",
+                KEY,
+                "laptop",
+                "deploy",
+                None,
+            )
             .unwrap();
         g.decline(t(1), p.id).unwrap();
         let w = approved(&mut g, t(600));
@@ -978,5 +1109,21 @@ mod tests {
         }
         let nonce = hex_nonce(&mut Counter(250));
         assert!(nonce.starts_with("fafbfcfdfeff0001"));
+    }
+
+    #[test]
+    fn a_request_needs_a_reason_and_it_is_kept_printable_and_short() {
+        let mut g = grants();
+        let r = g.request(t(0), &mut Counter(0), "web01", KEY, "laptop", "   ", None);
+        assert_eq!(r, Err(Refusal::NoReason));
+        let long = format!("rotate\x07 the {} key", "x".repeat(300));
+        let p = g
+            .request(t(0), &mut Counter(0), "web01", KEY, "laptop", &long, None)
+            .unwrap();
+        assert!(!p.reason.contains('\x07'));
+        assert_eq!(p.reason.chars().count(), 200);
+        assert!(
+            matches!(g.take_events().as_slice(), [Event::Requested { reason, .. }] if reason == &p.reason)
+        );
     }
 }

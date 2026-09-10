@@ -16,6 +16,10 @@ pub struct RequestBody {
     /// The requesting machine's name, display only.
     #[serde(default)]
     pub requester: String,
+    /// Why admin is needed: the task, in a sentence the person can judge.
+    /// Required; the daemon refuses an empty one. Display only, untrusted.
+    #[serde(default)]
+    pub reason: String,
     /// Wanted window; clamped to policy.
     #[serde(default)]
     pub window_minutes: Option<u64>,
@@ -106,6 +110,7 @@ pub struct PendingView {
     pub ends_at: u64,
     pub match_code: String,
     pub requester: String,
+    pub reason: String,
     pub fingerprint: String,
     pub created: u64,
     pub expires: u64,

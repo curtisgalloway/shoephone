@@ -59,12 +59,15 @@ pub struct LedgerEntry {
     pub serial: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub until: Option<u64>,
+    /// The stated purpose, on the `requested` line only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl From<&Event> for LedgerEntry {
     fn from(e: &Event) -> Self {
         let (kind, host, at, id, serial, until) = match e {
-            Event::Requested { id, host, at } => ("requested", host, at, Some(*id), None, None),
+            Event::Requested { id, host, at, .. } => ("requested", host, at, Some(*id), None, None),
             Event::Approved {
                 id,
                 host,
@@ -95,6 +98,10 @@ impl From<&Event> for LedgerEntry {
             id,
             serial,
             until,
+            reason: match e {
+                Event::Requested { reason, .. } => Some(reason.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -248,6 +255,7 @@ mod tests {
             Event::Requested {
                 id: 1,
                 host: "web01".into(),
+                reason: "deploy".into(),
                 at: t0,
             },
             Event::Approved {

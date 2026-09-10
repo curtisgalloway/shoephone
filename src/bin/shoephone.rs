@@ -36,6 +36,7 @@ struct Opts {
     json: bool,
     daemon: Option<String>,
     window: Option<u64>,
+    reason: Option<String>,
     positional: Vec<String>,
 }
 
@@ -44,6 +45,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         json: false,
         daemon: None,
         window: None,
+        reason: None,
         positional: Vec::new(),
     };
     let mut it = args.iter();
@@ -51,6 +53,10 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         match a.as_str() {
             "--json" => opts.json = true,
             "--daemon" => opts.daemon = Some(it.next().ok_or("--daemon needs a URL")?.clone()),
+            "--reason" => {
+                let v = it.next().ok_or("--reason needs text")?;
+                opts.reason = Some(v.clone());
+            }
             "--window" => {
                 let v = it.next().ok_or("--window needs minutes")?;
                 opts.window = Some(
@@ -300,6 +306,17 @@ fn request(opts: &Opts, host: &str) -> Status {
         eprintln!("shoephone: {host:?} is not a hostname");
         return Status::Usage;
     }
+    let Some(reason) = opts
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    else {
+        eprintln!(
+            "shoephone: --reason is required: say what the task is and why it needs admin; the person reads it before approving"
+        );
+        return Status::Usage;
+    };
     let client = match need_client(opts) {
         Ok(c) => c,
         Err(s) => return s,
@@ -319,6 +336,7 @@ fn request(opts: &Opts, host: &str) -> Status {
         host: host.to_owned(),
         public_key: public_key.clone(),
         requester: requester(),
+        reason: reason.to_owned(),
         window_minutes: opts.window,
     }) {
         Ok(r) => r,
