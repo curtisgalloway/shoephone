@@ -168,10 +168,13 @@ fn enroll(config: &Config, name: &str) -> Status {
         config.rp_origin, pretty
     );
     if let Some(access) = &config.access {
-        payload.push_str(&format!(
-            "&id={}&secret={}",
-            access.client_id, access.client_secret
-        ));
+        match access.secret() {
+            Ok(secret) => payload.push_str(&format!("&id={}&secret={secret}", access.client_id)),
+            Err(e) => {
+                eprintln!("shoephoned: {e}");
+                return Status::Precondition;
+            }
+        }
     }
     match qr_text(&payload) {
         Some(qr) => eprintln!("\n{qr}"),

@@ -97,7 +97,8 @@ sandbox = true                      # true for an app installed from Xcode
 
 [access]                            # optional: Cloudflare Access service token, when the
 client_id = "....access"            # daemon is reached through a Cloudflare Tunnel; the
-client_secret = "..."               # enrollment QR carries it to the app, nothing else uses it
+client_secret_file = "/etc/shoephone/access.secret"  # or client_secret = "..." inline; the
+                                    # enrollment QR carries it to the app, nothing else uses it
 ```
 
 With `[apns]`, the daemon pushes "a request is waiting", "a window was

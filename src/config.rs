@@ -72,7 +72,24 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct AccessConfig {
     pub client_id: String,
-    pub client_secret: String,
+    /// The secret inline, or in a root-only file so the config itself can
+    /// be kept in a repository. Exactly one of the two.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub client_secret_file: Option<PathBuf>,
+}
+
+impl AccessConfig {
+    pub fn secret(&self) -> Result<String, String> {
+        match (&self.client_secret, &self.client_secret_file) {
+            (Some(s), None) => Ok(s.clone()),
+            (None, Some(path)) => std::fs::read_to_string(path)
+                .map(|s| s.trim().to_owned())
+                .map_err(|e| format!("access client_secret_file {}: {e}", path.display())),
+            _ => Err("[access] needs exactly one of client_secret and client_secret_file".into()),
+        }
+    }
 }
 
 /// Overrides for [`Policy`], in minutes. Anything omitted keeps the default.
@@ -127,6 +144,13 @@ impl Config {
                 "rp_origin {:?} must be https (WebAuthn requires a secure context)",
                 self.rp_origin
             ));
+        }
+        if let Some(a) = &self.access
+            && a.client_secret.is_some() == a.client_secret_file.is_some()
+        {
+            return Err(
+                "[access] needs exactly one of client_secret and client_secret_file".into(),
+            );
         }
         let policy = self.policy();
         if policy.cert_ttl > policy.max_window || policy.default_window > policy.max_window {
