@@ -112,11 +112,11 @@ async function refresh() {
   $('windows').classList.toggle('hidden', s.windows.length === 0);
   $('windowlist').replaceChildren(...s.windows.map(w => {
     const li = document.createElement('li');
-    const span = document.createElement('span'); const b = document.createElement('b');
-    b.textContent = w.host; span.append('admin on ', b, ` until ${when(w.ends_at)}`); li.append(span);
-    const b = document.createElement('button'); b.className = 'no'; b.textContent = 'End'; b.style.flex = '0 0 auto'; b.style.padding = '.3rem .8rem';
-    b.onclick = () => api('/api/kill', {host: w.host}).then(refresh, e => alert(e.message));
-    li.append(b); return li;
+    const span = document.createElement('span'); const host = document.createElement('b');
+    host.textContent = w.host; span.append('admin on ', host, ` until ${when(w.ends_at)}`); li.append(span);
+    const end = document.createElement('button'); end.className = 'no'; end.textContent = 'End'; end.style.flex = '0 0 auto'; end.style.padding = '.3rem .8rem';
+    end.onclick = () => api('/api/kill', {host: w.host}).then(refresh, e => alert(e.message));
+    li.append(end); return li;
   }));
   try {
     const l = await api('/api/ledger');
