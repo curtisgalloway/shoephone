@@ -44,6 +44,18 @@ pub enum Push {
 }
 
 impl Push {
+    /// The name the app sees in the payload and sends back in its list of
+    /// wanted kinds. Stable; the app maps it to its own wording.
+    pub fn kind(self) -> &'static str {
+        match self {
+            Push::RequestWaiting => "request_waiting",
+            Push::WindowOpened => "window_opened",
+            Push::WindowKilled => "window_killed",
+        }
+    }
+
+    pub const ALL: [Push; 3] = [Push::RequestWaiting, Push::WindowOpened, Push::WindowKilled];
+
     fn body(self) -> &'static str {
         match self {
             Push::RequestWaiting => "A request is waiting for your approval.",
@@ -235,7 +247,8 @@ impl Apns {
                 "alert": { "title": "shoephone", "body": push.body() },
                 "sound": "default",
                 "interruption-level": level,
-            }
+            },
+            "shoephone": { "kind": push.kind() }
         })
     }
 
@@ -454,5 +467,10 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(keys, ["alert", "interruption-level", "sound"]);
+        assert_eq!(p["shoephone"]["kind"], "request_waiting");
+        assert_eq!(
+            Apns::payload(Push::WindowKilled)["shoephone"]["kind"],
+            "window_killed"
+        );
     }
 }

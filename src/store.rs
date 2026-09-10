@@ -26,6 +26,10 @@ pub struct Device {
     /// Absent for a device that has never registered (a hardware key).
     #[serde(default)]
     pub push_token: Option<String>,
+    /// Which pushes this device asked for, by [`Push::kind`] name. Absent
+    /// means all of them (a device registered before the choice existed).
+    #[serde(default)]
+    pub push_kinds: Option<Vec<String>>,
 }
 
 /// A one-time enrollment code minted at the console by `shoephoned enroll`.

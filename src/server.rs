@@ -202,10 +202,11 @@ impl Daemon {
         let mut inner = self.inner.lock().expect("daemon lock");
         let out = f(&mut inner);
         let events = inner.grants.take_events();
-        let tokens: Vec<String> = inner
+        // Each device's token with the kinds it asked for; None means all.
+        let targets: Vec<(String, Option<Vec<String>>)> = inner
             .devices
             .iter()
-            .filter_map(|d| d.push_token.clone())
+            .filter_map(|d| d.push_token.clone().map(|t| (t, d.push_kinds.clone())))
             .collect();
         drop(inner);
         if !events.is_empty() {
@@ -248,13 +249,18 @@ impl Daemon {
             // there is nothing to push to anyway.
             if let Some(a) = &self.apns
                 && !pushes.is_empty()
-                && !tokens.is_empty()
+                && !targets.is_empty()
                 && let Ok(h) = tokio::runtime::Handle::try_current()
             {
                 let a = a.clone();
                 h.spawn(async move {
                     for p in &pushes {
-                        for t in &tokens {
+                        for (t, kinds) in &targets {
+                            if let Some(kinds) = kinds
+                                && !kinds.iter().any(|k| k == p.kind())
+                            {
+                                continue;
+                            }
                             match a.send(*p, t).await {
                                 Delivery::Sent => {}
                                 Delivery::Unregistered => eprintln!(
@@ -658,6 +664,7 @@ async fn enroll_finish(
             enrolled_at: store::unix(now),
             key,
             push_token: None,
+            push_kinds: None,
         });
         d.store
             .save_devices(&inner.devices)
@@ -700,6 +707,20 @@ async fn push_register(State(d): App, Json(body): Json<PushRegister>) -> Reply<s
             "token must be the device token as hex",
         ));
     }
+    let kinds = match body.kinds {
+        None => None,
+        Some(list) => {
+            let known: Vec<&str> = Push::ALL.iter().map(|p| p.kind()).collect();
+            if let Some(bad) = list.iter().find(|k| !known.contains(&k.as_str())) {
+                return Err(Fail::new(
+                    StatusCode::BAD_REQUEST,
+                    "bad_kind",
+                    format!("unknown push kind {bad:?}; known: {}", known.join(", ")),
+                ));
+            }
+            Some(list)
+        }
+    };
     d.with(|inner| {
         let device = inner
             .devices
@@ -713,6 +734,7 @@ async fn push_register(State(d): App, Json(body): Json<PushRegister>) -> Reply<s
                 )
             })?;
         device.push_token = Some(token);
+        device.push_kinds = kinds;
         let name = device.name.clone();
         d.store
             .save_devices(&inner.devices)

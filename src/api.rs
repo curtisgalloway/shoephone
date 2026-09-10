@@ -159,4 +159,8 @@ pub struct PushRegister {
     pub credential_id: webauthn_rs::prelude::Base64UrlSafeData,
     /// The device token as hex.
     pub token: String,
+    /// Which pushes to send, by kind name (`request_waiting`,
+    /// `window_opened`, `window_killed`). Absent means all.
+    #[serde(default)]
+    pub kinds: Option<Vec<String>>,
 }
