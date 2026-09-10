@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `shoephoned` — the grant daemon on the failsafe host.
 //!
-//! Three verbs, all needing `--config <file>`:
+//! Three verbs, all reading `--config <file>` (default
+//! `/etc/shoephone/shoephoned.toml`):
 //!
 //! - `serve`: hold the user CA and answer the CLI and the approve page.
 //! - `init-ca`: create the CA key file named in the config and print the
@@ -31,9 +32,12 @@ fn main() -> ExitCode {
     run(&args).into()
 }
 
+/// Where the deployed daemon keeps its config; `--config` overrides it.
+const DEFAULT_CONFIG: &str = "/etc/shoephone/shoephoned.toml";
+
 fn usage() -> Status {
     eprintln!(
-        "usage: shoephoned --config <file> (serve | init-ca | enroll --name <device>)\n       shoephoned --version"
+        "usage: shoephoned [--config <file>] (serve | init-ca | enroll --name <device>)\n       shoephoned --version\n\n--config defaults to /etc/shoephone/shoephoned.toml"
     );
     Status::Usage
 }
@@ -84,9 +88,7 @@ fn run(args: &[String]) -> Status {
             return usage();
         }
     };
-    let Some(config_path) = parsed.config else {
-        return usage();
-    };
+    let config_path = parsed.config.unwrap_or_else(|| DEFAULT_CONFIG.to_owned());
     let config = match Config::from_file(&PathBuf::from(config_path)) {
         Ok(c) => c,
         Err(e) => {

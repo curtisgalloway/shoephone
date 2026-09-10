@@ -26,23 +26,22 @@ The name is from Get Smart. The approver is a phone; the agency is CONTROL.
 
 ## Status
 
-Built, not yet deployed. `shoephoned` holds the user CA, enforces the
-window, per-host principals, rate cap, cooldown and single-use nonce,
-serves the approve page, enrolls a hardware security key through WebAuthn,
-and appends every outcome to a ledger. `shoephone` requests, waits, loads
-the certificate into ssh-agent, renews inside the window, disavows, and
-has a `doctor` that says why a request cannot succeed before you make it.
-The full loop runs against a live daemon in tests; the security-key tap
-itself has not been tried from a phone yet. The design is in
+Deployed. `shoephoned` holds the user CA, enforces the window, per-host
+principals, rate cap, cooldown and single-use nonce, serves the approve
+page, enrolls approver devices through WebAuthn, refuses any credential
+that syncs, and appends every outcome to a ledger. `shoephone` requests,
+waits, loads the certificate into ssh-agent, renews inside the window,
+disavows, and has a `doctor` that says why a request cannot succeed before
+you make it. The approver is the companion iOS app,
+[shoephone-app](https://github.com/curtisgalloway/shoephone-app), whose
+key lives in the phone's Secure Enclave behind Face ID; the web approve
+page remains for a hardware security key. The design is in
 [docs/DESIGN.md](docs/DESIGN.md), which also covers the three things to
 close *before* deploying any of this (an unattended secrets token that can
 read admin credentials, the infrastructure repository as the trusted
 computing base, and backup servers that accept deletes with no
-credential). A content-free push to an ntfy-style topic tells the phone that a request
-is waiting, a window opened, or a window was killed. What remains is
-deployment: the failsafe host behind TLS, a key enrolled at its console,
-the loop run on cellular, and then the decision whether the web ceremony
-holds up or a native app is needed.
+credential). A content-free push to an ntfy-style topic can tell the phone
+that a request is waiting, a window opened, or a window was killed.
 
 ## Deploying the daemon
 
@@ -67,6 +66,8 @@ install -m 0755 target/release/shoephoned /usr/local/bin/
 install -d -m 0700 /etc/shoephone
 install -m 0600 shoephoned.toml /etc/shoephone/shoephoned.toml
 ```
+
+That path is the daemon's default; `--config <file>` points it elsewhere.
 
 `webauthn-rs` links the `openssl` crate, so the host needs libssl.
 
@@ -105,7 +106,7 @@ minute cooldown after a decline that doubles to a 60 minute cap.
 ### 3. Create the CA and run the service
 
 ```bash
-shoephoned --config /etc/shoephone/shoephoned.toml init-ca > user_ca.pub
+shoephoned init-ca > user_ca.pub
 cp contrib/systemd/shoephoned.service /etc/systemd/system/
 systemctl enable --now shoephoned
 journalctl -u shoephoned -f
@@ -132,18 +133,22 @@ Reach it from a certificate the phone trusts. A private CA in the phone's
 trust store is fine; the CLI uses the machine's trust store through the
 platform verifier, so the same private CA works there.
 
-### 5. Enroll the phone's security key
+### 5. Enroll the approver
 
 At the host's console, never over a session the agent could see:
 
 ```bash
-shoephoned --config /etc/shoephone/shoephoned.toml enroll --name phone
+shoephoned enroll --name phone
 ```
 
 It prints a one-time code that is good for ten minutes or five wrong
-guesses. Open `rp_origin` on the phone, enter the code, and tap the key.
-Enrolling a second device is the same again with a different name; every
-enrolled device is pushed when a window opens or is killed, so an
+guesses. In the Shoephone app on the phone, enter the code and pass Face
+ID; the app is its own WebAuthn client and authenticator and needs no
+browser. For a hardware security key instead, open `rp_origin` in a
+browser, enter the code, and tap the key. An iPhone passkey made through
+Safari will not work: iOS only makes synced ones, and the daemon refuses
+them. Enrolling a second device is the same again with a different name;
+every enrolled device is pushed when a window opens or is killed, so an
 approval from one is visible on the others.
 
 ### 6. Trust the CA on each host
