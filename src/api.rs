@@ -139,3 +139,13 @@ pub struct ApproveFinish<C> {
     pub id: u64,
     pub credential: C,
 }
+
+/// `POST /api/push/register`: the app hands the daemon its APNs device
+/// token, bound to the credential it enrolled with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PushRegister {
+    /// Credential id, base64url on the wire, as in the WebAuthn responses.
+    pub credential_id: webauthn_rs::prelude::Base64UrlSafeData,
+    /// The device token as hex.
+    pub token: String,
+}

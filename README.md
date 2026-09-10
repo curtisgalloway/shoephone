@@ -83,11 +83,25 @@ rp_origin = "https://approve.example.internal"
 [principals]
 web01 = "agent-admin:web01"
 
-[notify]                            # optional: content-free push to the phone
+[notify]                            # optional: content-free push to an ntfy-style topic
 url = "https://ntfy.example.internal/shoephone"
 token = "..."                       # if the topic is protected
 click = "https://approve.example.internal"
+
+[apns]                              # optional: content-free push to the Shoephone app
+key_file = "/etc/shoephone/apns.p8" # APNs auth key from the developer portal, root-only
+key_id = "ABC123DEFG"
+team_id = "TEAM000000"
+topic = "xyz.curtisg.shoephone"     # the app's bundle id
+sandbox = true                      # true for an app installed from Xcode
 ```
+
+With `[apns]`, the daemon pushes "a request is waiting", "a window was
+opened" and "a window was killed" straight to every enrolled device that
+has registered a device token, which the app does on each launch. The
+push carries nothing else; the app fetches what is pending when opened.
+The daemon speaks to Apple directly over HTTP/2 with an ES256 token
+minted from the `.p8` key, so nothing sits between it and the phone.
 
 The daemon refuses any credential the authenticator reports as
 backup-eligible, which is every synced passkey (iCloud Keychain, 1Password

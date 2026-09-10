@@ -33,7 +33,7 @@ use crate::ca::{self, UserCa};
 use crate::config::Config;
 use crate::exit::VERSION;
 use crate::grant::{Approval, Event, Grants, Pending, Refusal, Scope};
-use crate::notify::{Notifier, Push};
+use crate::notify::{Apns, Delivery, Notifier, Push};
 use crate::store::{self, Device, EnrollCode, LedgerEntry, Store};
 
 pub const PAGE: &str = include_str!("../assets/approve.html");
@@ -47,6 +47,7 @@ pub struct Daemon {
     webauthn: Webauthn,
     store: Store,
     notifier: Option<Arc<Notifier>>,
+    apns: Option<Arc<Apns>>,
     inner: Mutex<Inner>,
 }
 
@@ -153,12 +154,25 @@ impl Daemon {
         }
         let grants = Grants::new(config.policy(), config.principals.clone());
         let notifier = config.notify.clone().map(|n| Arc::new(Notifier::new(n)));
+        let apns = match config.apns.clone() {
+            Some(c) => {
+                let a = Apns::new(c)?;
+                eprintln!(
+                    "shoephoned: APNs push through {} for topic {}",
+                    a.gateway(),
+                    a.topic()
+                );
+                Some(Arc::new(a))
+            }
+            None => None,
+        };
         Ok(Self {
             config,
             ca,
             webauthn,
             store,
             notifier,
+            apns,
             inner: Mutex::new(Inner {
                 grants,
                 devices,
@@ -187,6 +201,11 @@ impl Daemon {
         let mut inner = self.inner.lock().expect("daemon lock");
         let out = f(&mut inner);
         let events = inner.grants.take_events();
+        let tokens: Vec<String> = inner
+            .devices
+            .iter()
+            .filter_map(|d| d.push_token.clone())
+            .collect();
         drop(inner);
         if !events.is_empty() {
             let entries: Vec<LedgerEntry> = events.iter().map(LedgerEntry::from).collect();
@@ -209,6 +228,7 @@ impl Daemon {
                 && !pushes.is_empty()
             {
                 let n = n.clone();
+                let pushes = pushes.clone();
                 let push = move || {
                     for p in pushes {
                         if let Err(e) = n.send(p) {
@@ -222,6 +242,28 @@ impl Daemon {
                     }
                     Err(_) => push(),
                 }
+            }
+            // APNs is async and needs the runtime; outside one (unit tests)
+            // there is nothing to push to anyway.
+            if let Some(a) = &self.apns
+                && !pushes.is_empty()
+                && !tokens.is_empty()
+                && let Ok(h) = tokio::runtime::Handle::try_current()
+            {
+                let a = a.clone();
+                h.spawn(async move {
+                    for p in &pushes {
+                        for t in &tokens {
+                            match a.send(*p, t).await {
+                                Delivery::Sent => {}
+                                Delivery::Unregistered => eprintln!(
+                                    "shoephoned: apns rejected a device token as unregistered; the app re-registers on launch"
+                                ),
+                                Delivery::Failed(e) => eprintln!("shoephoned: {e}"),
+                            }
+                        }
+                    }
+                });
             }
         }
         out
@@ -241,6 +283,7 @@ impl Daemon {
             .route("/api/decline", post(decline))
             .route("/api/enroll/start", post(enroll_start))
             .route("/api/enroll/finish", post(enroll_finish))
+            .route("/api/push/register", post(push_register))
             .route("/api/ledger", get(ledger));
         #[cfg(feature = "test-hooks")]
         let router = router.route("/api/test/approve", post(test_approve));
@@ -604,6 +647,7 @@ async fn enroll_finish(
             name: ceremony.device_name.clone(),
             enrolled_at: store::unix(now),
             key,
+            push_token: None,
         });
         d.store
             .save_devices(&inner.devices)
@@ -630,6 +674,42 @@ fn refuse_synced(backup_eligible: bool, backup_state: bool, allow: bool) -> Resu
         "synced_credential",
         "this credential syncs to other devices; the approver must be a device-bound key",
     ))
+}
+
+/// The app hands over its APNs device token, bound to the credential it
+/// enrolled with. Unauthenticated like the rest of the approver API: the
+/// worst a stranger on the WireGuard network can do with it is point the
+/// content-free pushes at the wrong phone, and the app re-registers on
+/// every launch.
+async fn push_register(State(d): App, Json(body): Json<PushRegister>) -> Reply<serde_json::Value> {
+    let token = body.token.to_ascii_lowercase();
+    if token.is_empty() || token.len() > 200 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Fail::new(
+            StatusCode::BAD_REQUEST,
+            "bad_token",
+            "token must be the device token as hex",
+        ));
+    }
+    d.with(|inner| {
+        let device = inner
+            .devices
+            .iter_mut()
+            .find(|x| x.key.cred_id()[..] == body.credential_id[..])
+            .ok_or_else(|| {
+                Fail::new(
+                    StatusCode::FORBIDDEN,
+                    "unknown_device",
+                    "credential is not enrolled",
+                )
+            })?;
+        device.push_token = Some(token);
+        let name = device.name.clone();
+        d.store
+            .save_devices(&inner.devices)
+            .map_err(Fail::internal)?;
+        eprintln!("shoephoned: push token registered for device {name:?}");
+        Ok(Json(serde_json::json!({ "registered": name })))
+    })
 }
 
 async fn ledger(State(d): App) -> Reply<Vec<LedgerEntry>> {

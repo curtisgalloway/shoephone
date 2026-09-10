@@ -22,6 +22,10 @@ pub struct Device {
     pub name: String,
     pub enrolled_at: u64,
     pub key: SecurityKey,
+    /// APNs device token, hex, registered by the app after enrollment.
+    /// Absent for a device that has never registered (a hardware key).
+    #[serde(default)]
+    pub push_token: Option<String>,
 }
 
 /// A one-time enrollment code minted at the console by `shoephoned enroll`.

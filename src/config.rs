@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::grant::Policy;
-use crate::notify::NotifyConfig;
+use crate::notify::{ApnsConfig, NotifyConfig};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +54,10 @@ pub struct Config {
     /// On, it is a stopgap while a device-bound authenticator is on its way.
     #[serde(default)]
     pub allow_synced_credentials: bool,
+    /// Push straight to the approver app through APNs. Content-free, like
+    /// `[notify]`; the app fetches what is pending on open.
+    #[serde(default)]
+    pub apns: Option<ApnsConfig>,
 }
 
 /// Overrides for [`Policy`], in minutes. Anything omitted keeps the default.

@@ -9,9 +9,12 @@
 //! daemon. A forged or replayed push at worst opens the page onto an empty
 //! list.
 
-use std::time::Duration;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
-use serde::Deserialize;
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use serde::{Deserialize, Serialize};
 use ureq::Agent;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,6 +109,169 @@ impl Notifier {
             Ok(())
         } else {
             Err(format!("push to {}: HTTP {status}", self.config.url))
+        }
+    }
+}
+
+/// APNs, spoken directly: one HTTP/2 POST per device token, authenticated
+/// with an ES256 token minted from the developer account's `.p8` key. The
+/// payload is content-free, like the topic push; the app fetches what is
+/// pending when it opens. Delivery is best effort and the loop never
+/// depends on it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApnsConfig {
+    /// The `.p8` auth key from the developer portal, root-only on disk.
+    pub key_file: PathBuf,
+    /// The key's id, shown beside it in the portal.
+    pub key_id: String,
+    /// The developer team id.
+    pub team_id: String,
+    /// The app's bundle id.
+    pub topic: String,
+    /// Use the sandbox gateway. True for a development-signed app, which
+    /// is what an app installed from Xcode is; false for App Store and
+    /// TestFlight builds.
+    #[serde(default)]
+    pub sandbox: bool,
+}
+
+/// What became of one push to one device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delivery {
+    Sent,
+    /// Apple says the token is dead; the app registers a fresh one on
+    /// its next launch.
+    Unregistered,
+    Failed(String),
+}
+
+pub struct Apns {
+    client: reqwest::Client,
+    config: ApnsConfig,
+    key: EncodingKey,
+    /// The bearer token and when it was minted. Apple asks that one be
+    /// reused for at least twenty minutes and refuses any older than an
+    /// hour, so this is regenerated at fifty.
+    bearer: Mutex<Option<(String, SystemTime)>>,
+}
+
+#[derive(Serialize)]
+struct Claims {
+    iss: String,
+    iat: u64,
+}
+
+const BEARER_LIFETIME: Duration = Duration::from_secs(50 * 60);
+
+impl Apns {
+    pub fn new(config: ApnsConfig) -> Result<Self, String> {
+        let pem = std::fs::read(&config.key_file)
+            .map_err(|e| format!("apns key_file {}: {e}", config.key_file.display()))?;
+        let key = EncodingKey::from_ec_pem(&pem)
+            .map_err(|e| format!("apns key_file {}: {e}", config.key_file.display()))?;
+        // reqwest is built without a crypto provider so that it shares
+        // ring with ureq instead of dragging in a second one; someone has
+        // to say so once per process, and "already installed" is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|e| format!("apns client: {e}"))?;
+        Ok(Self {
+            client,
+            config,
+            key,
+            bearer: Mutex::new(None),
+        })
+    }
+
+    pub fn gateway(&self) -> &'static str {
+        if self.config.sandbox {
+            "https://api.sandbox.push.apple.com"
+        } else {
+            "https://api.push.apple.com"
+        }
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.config.topic
+    }
+
+    /// The JWT for the `authorization` header, minted or reused.
+    pub fn bearer(&self, now: SystemTime) -> Result<String, String> {
+        let mut cached = self.bearer.lock().expect("apns bearer lock");
+        if let Some((token, minted)) = &*cached
+            && now.duration_since(*minted).unwrap_or(Duration::MAX) < BEARER_LIFETIME
+        {
+            return Ok(token.clone());
+        }
+        let iat = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs();
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(self.config.key_id.clone());
+        let claims = Claims {
+            iss: self.config.team_id.clone(),
+            iat,
+        };
+        let token = jsonwebtoken::encode(&header, &claims, &self.key)
+            .map_err(|e| format!("apns jwt: {e}"))?;
+        *cached = Some((token.clone(), now));
+        Ok(token)
+    }
+
+    /// The notification body: a title, one sentence, a sound. Nothing about
+    /// the request itself. A waiting request is time-sensitive so it
+    /// breaks through a Focus; the other two are ordinary.
+    pub fn payload(push: Push) -> serde_json::Value {
+        let level = match push {
+            Push::RequestWaiting => "time-sensitive",
+            Push::WindowOpened | Push::WindowKilled => "active",
+        };
+        serde_json::json!({
+            "aps": {
+                "alert": { "title": "shoephone", "body": push.body() },
+                "sound": "default",
+                "interruption-level": level,
+            }
+        })
+    }
+
+    pub async fn send(&self, push: Push, token: &str) -> Delivery {
+        let bearer = match self.bearer(SystemTime::now()) {
+            Ok(b) => b,
+            Err(e) => return Delivery::Failed(e),
+        };
+        let url = format!("{}/3/device/{token}", self.gateway());
+        let priority = match push {
+            Push::RequestWaiting => "10",
+            Push::WindowOpened | Push::WindowKilled => "5",
+        };
+        let sent = self
+            .client
+            .post(&url)
+            .bearer_auth(bearer)
+            .header("apns-topic", &self.config.topic)
+            .header("apns-push-type", "alert")
+            .header("apns-priority", priority)
+            .header("apns-collapse-id", push.tags())
+            .json(&Self::payload(push))
+            .send()
+            .await;
+        match sent {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                match status {
+                    200 => Delivery::Sent,
+                    410 => Delivery::Unregistered,
+                    400 if body.contains("BadDeviceToken") => Delivery::Unregistered,
+                    _ => Delivery::Failed(format!("apns HTTP {status}: {body}")),
+                }
+            }
+            Err(e) => Delivery::Failed(format!("apns: {e}")),
         }
     }
 }
@@ -224,5 +390,69 @@ mod tests {
             click: None,
         });
         assert!(n.send(Push::WindowOpened).is_err());
+    }
+
+    const TEST_P8: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg+oKoPfDu7DflZp9l\nfOKPyvzrLjlwKeVXUXXgQCY5nr2hRANCAAS5mnKOiUa2BySN8XGctQKpHZYocfQ/\nWsawjDiBH7HeZz2NDpnF/f3x2j2+VT0soQ250J0rZngMDhnfYg2YrC2H\n-----END PRIVATE KEY-----\n";
+
+    fn apns(dir: &std::path::Path) -> Apns {
+        let key_file = dir.join("apns.p8");
+        std::fs::write(&key_file, TEST_P8).unwrap();
+        Apns::new(ApnsConfig {
+            key_file,
+            key_id: "ABC123DEFG".into(),
+            team_id: "TEAM000000".into(),
+            topic: "example.app".into(),
+            sandbox: true,
+        })
+        .unwrap()
+    }
+
+    fn b64url_json(part: &str) -> serde_json::Value {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(part)
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[test]
+    fn bearer_is_es256_with_kid_and_iss_and_is_reused_for_fifty_minutes() {
+        let dir = std::env::temp_dir().join(format!("shoephone-apns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = apns(&dir);
+        let now = SystemTime::now();
+        let first = a.bearer(now).unwrap();
+        let parts: Vec<&str> = first.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let header = b64url_json(parts[0]);
+        assert_eq!(header["alg"], "ES256");
+        assert_eq!(header["kid"], "ABC123DEFG");
+        let claims = b64url_json(parts[1]);
+        assert_eq!(claims["iss"], "TEAM000000");
+        assert!(claims["iat"].as_u64().unwrap() > 1_700_000_000);
+
+        assert_eq!(a.bearer(now + Duration::from_secs(49 * 60)).unwrap(), first);
+        assert_ne!(a.bearer(now + Duration::from_secs(51 * 60)).unwrap(), first);
+        assert_eq!(a.gateway(), "https://api.sandbox.push.apple.com");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn payload_is_content_free_and_only_a_request_is_time_sensitive() {
+        let p = Apns::payload(Push::RequestWaiting);
+        assert_eq!(p["aps"]["interruption-level"], "time-sensitive");
+        assert_eq!(p["aps"]["alert"]["title"], "shoephone");
+        assert!(p.to_string().contains("waiting"));
+        assert_eq!(
+            Apns::payload(Push::WindowKilled)["aps"]["interruption-level"],
+            "active"
+        );
+        let keys: Vec<&str> = p["aps"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["alert", "interruption-level", "sound"]);
     }
 }
