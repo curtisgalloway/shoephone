@@ -47,6 +47,13 @@ pub struct Config {
     /// to open the page on their own.
     #[serde(default)]
     pub notify: Option<NotifyConfig>,
+    /// Accept credentials that an authenticator reports as backup-eligible
+    /// (WebAuthn's BE flag), which is what every synced passkey provider
+    /// sets. Off by default: a synced credential also exists on the machine
+    /// the agent runs on, which is exactly what the approver must not be.
+    /// On, it is a stopgap while a device-bound authenticator is on its way.
+    #[serde(default)]
+    pub allow_synced_credentials: bool,
 }
 
 /// Overrides for [`Policy`], in minutes. Anything omitted keeps the default.

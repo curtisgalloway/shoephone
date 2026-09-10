@@ -88,6 +88,15 @@ token = "..."                       # if the topic is protected
 click = "https://approve.example.internal"
 ```
 
+The daemon refuses any credential the authenticator reports as
+backup-eligible, which is every synced passkey (iCloud Keychain, 1Password
+and the like): a synced credential also exists on the machine the agent
+runs on, which is exactly what the approver must not be. Enrollment and
+every approval check the flag, so a credential that turns synced later
+stops working. `allow_synced_credentials = true` at the top level admits
+them as a stopgap while a device-bound authenticator is on its way; the
+daemon names every such device at startup.
+
 `[policy]` overrides the window, certificate and cooldown durations in
 minutes; the defaults are a 60 minute window (4 hours at most), 15 minute
 certificates, a 5 minute pending timeout, 6 requests an hour, and a 5

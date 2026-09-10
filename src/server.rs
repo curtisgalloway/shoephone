@@ -137,6 +137,20 @@ impl Daemon {
             .map_err(|e| format!("webauthn: {e}"))?;
         let store = Store::new(&config.state_dir);
         let devices = store.load_devices()?;
+        for device in &devices {
+            let cred = webauthn_rs::prelude::Credential::from(device.key.clone());
+            if cred.backup_eligible || cred.backup_state {
+                let verb = if config.allow_synced_credentials {
+                    "accepted only because allow_synced_credentials is on"
+                } else {
+                    "will be refused at approval"
+                };
+                eprintln!(
+                    "shoephoned: device {:?} is a synced credential (backup-eligible); {verb}",
+                    device.name
+                );
+            }
+        }
         let grants = Grants::new(config.policy(), config.principals.clone());
         let notifier = config.notify.clone().map(|n| Arc::new(Notifier::new(n)));
         Ok(Self {
@@ -427,6 +441,14 @@ async fn approve_finish(
             .webauthn
             .finish_securitykey_authentication(&body.credential, &ceremony.auth)
             .map_err(|e| Fail::new(StatusCode::FORBIDDEN, "assertion_rejected", e.to_string()))?;
+        // The flags are re-read on every assertion: a credential can turn
+        // backup-eligible after enrollment (never the reverse), and a device
+        // enrolled while the stopgap was on must stop working once it is off.
+        refuse_synced(
+            result.backup_eligible(),
+            result.backup_state(),
+            d.config.allow_synced_credentials,
+        )?;
         let device = inner
             .devices
             .iter_mut()
@@ -572,6 +594,12 @@ async fn enroll_finish(
                     e.to_string(),
                 )
             })?;
+        let cred = webauthn_rs::prelude::Credential::from(key.clone());
+        refuse_synced(
+            cred.backup_eligible,
+            cred.backup_state,
+            d.config.allow_synced_credentials,
+        )?;
         inner.devices.push(Device {
             name: ceremony.device_name.clone(),
             enrolled_at: store::unix(now),
@@ -586,6 +614,22 @@ async fn enroll_finish(
             serde_json::json!({ "enrolled": ceremony.device_name }),
         ))
     })
+}
+
+/// Refuse a credential the authenticator marks as backup-eligible or backed
+/// up unless the config's stopgap is on. Both flags are checked: a provider
+/// that syncs sets BE, and BS says a copy already exists elsewhere. A
+/// device-bound authenticator (a hardware key, a Secure Enclave key that is
+/// never exported) sets neither.
+fn refuse_synced(backup_eligible: bool, backup_state: bool, allow: bool) -> Result<(), Fail> {
+    if allow || !(backup_eligible || backup_state) {
+        return Ok(());
+    }
+    Err(Fail::new(
+        StatusCode::FORBIDDEN,
+        "synced_credential",
+        "this credential syncs to other devices; the approver must be a device-bound key",
+    ))
 }
 
 async fn ledger(State(d): App) -> Reply<Vec<LedgerEntry>> {
@@ -615,4 +659,27 @@ async fn test_approve(State(d): App, Json(body): Json<ById>) -> Reply<serde_json
         )?;
         Ok(Json(serde_json::json!({ "approved": window.id })))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refuse_synced;
+
+    #[test]
+    fn device_bound_credentials_pass() {
+        assert!(refuse_synced(false, false, false).is_ok());
+    }
+
+    #[test]
+    fn either_backup_flag_is_refused_by_default() {
+        let be = refuse_synced(true, false, false).unwrap_err();
+        assert_eq!(be.1.code, "synced_credential");
+        assert!(refuse_synced(false, true, false).is_err());
+        assert!(refuse_synced(true, true, false).is_err());
+    }
+
+    #[test]
+    fn the_stopgap_admits_synced_credentials() {
+        assert!(refuse_synced(true, true, true).is_ok());
+    }
 }

@@ -36,7 +36,12 @@ ssh-key = { version = "0.6.7", features = ["ed25519", "std", "rand_core", "getra
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 toml = "1.1.5"
 ureq = { version = "3.4.1", default-features = false, features = ["rustls", "platform-verifier", "json"] }
-webauthn-rs = { version = "0.5.5", features = ["danger-allow-state-serialisation"] }
+webauthn-rs = { version = "0.5.5", features = [
+    "danger-allow-state-serialisation",
+    # Exposes Credential's backup-eligible and backup-state flags, which
+    # the daemon reads to refuse synced passkeys.
+    "danger-credential-internals",
+] }
 
 [dev-dependencies]
 shoephone = { path = ".", features = ["test-hooks"] }
