@@ -156,7 +156,8 @@ shoephoned enroll --name phone
 ```
 
 It prints a one-time code that is good for ten minutes or five wrong
-guesses. In the Shoephone app on the phone, enter the code and pass Face
+guesses, and a QR code carrying the code and the daemon's origin. In the
+Shoephone app on the phone, scan the QR (or type the code) and pass Face
 ID; the app is its own WebAuthn client and authenticator and needs no
 browser. For a hardware security key instead, open `rp_origin` in a
 browser, enter the code, and tap the key. An iPhone passkey made through

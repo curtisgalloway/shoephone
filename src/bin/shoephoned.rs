@@ -155,12 +155,52 @@ fn enroll(config: &Config, name: &str) -> Status {
         eprintln!("shoephoned: {e}");
         return Status::Precondition;
     }
+    let pretty = format!("{}-{}", &raw[..4], &raw[4..]);
     eprintln!(
-        "shoephoned: enrollment for {name:?} is open for {} minutes; enter this code on the approve page",
+        "shoephoned: enrollment for {name:?} is open for {} minutes; scan this with the Shoephone app, or enter the code",
         EnrollCode::TTL_SECS / 60
     );
-    println!("{}-{}", &raw[..4], &raw[4..]);
+    // The QR carries the daemon's origin too, so a fresh app configures
+    // itself from the scan. It goes to stderr with the chatter; stdout
+    // stays the bare code for anything that captures it.
+    let payload = format!(
+        "shoephone://enroll?daemon={}&code={}",
+        config.rp_origin, pretty
+    );
+    match qr_text(&payload) {
+        Some(qr) => eprintln!("\n{qr}"),
+        None => eprintln!("shoephoned: (QR code too large to render)"),
+    }
+    println!("{pretty}");
     Status::Ok
+}
+
+/// A QR code as terminal text, two modules per character row using half
+/// blocks, with a two-module quiet zone. Light modules are drawn, dark
+/// ones are left to the background, which is the right way round on the
+/// dark terminals a console usually has; phone scanners read either.
+fn qr_text(payload: &str) -> Option<String> {
+    let qr = qrcodegen::QrCode::encode_text(payload, qrcodegen::QrCodeEcc::Medium).ok()?;
+    let size = qr.size();
+    const QUIET: i32 = 2;
+    let light = |x: i32, y: i32| !qr.get_module(x, y);
+    let mut out = String::new();
+    let mut y = -QUIET;
+    while y < size + QUIET {
+        for x in -QUIET..size + QUIET {
+            let top = light(x, y);
+            let bottom = light(x, y + 1);
+            out.push(match (top, bottom) {
+                (true, true) => '\u{2588}',
+                (true, false) => '\u{2580}',
+                (false, true) => '\u{2584}',
+                (false, false) => ' ',
+            });
+        }
+        out.push('\n');
+        y += 2;
+    }
+    Some(out)
 }
 
 fn serve(config: Config) -> Status {
@@ -234,6 +274,23 @@ fn serve(config: Config) -> Status {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn qr_text_has_a_quiet_zone_and_the_finder_pattern() {
+        let text =
+            qr_text("shoephone://enroll?daemon=https://approve.example&code=ABCD-EFGH").unwrap();
+        let rows: Vec<&str> = text.lines().collect();
+        // Quiet zone: the first row is two module rows of light, i.e. all full blocks.
+        assert!(rows[0].chars().all(|c| c == '\u{2588}'), "{:?}", rows[0]);
+        // Row 1 starts with quiet zone, then the finder pattern's top edge: a
+        // dark 7-wide bar whose top half is dark and bottom half is dark too,
+        // except the row pairs straddle it; just check the first module column
+        // after the quiet zone is not light in both halves.
+        let second: Vec<char> = rows[1].chars().collect();
+        assert_eq!(second[0], '\u{2588}');
+        assert_ne!(second[2], '\u{2588}');
+        assert!(rows.len() > 10);
+    }
+
     use super::*;
 
     fn argv(s: &str) -> Vec<String> {
