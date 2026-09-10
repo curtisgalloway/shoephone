@@ -57,13 +57,15 @@ URL` overrides it (https only).
    (default 5 minutes).
 4. On approval, fetches a certificate valid for one principal on that host,
    writes it next to the session key as `session_ed25519-cert.pub`, and
-   runs `ssh-add -t` so `ssh agent-admin@<host>` works for the rest of the
+   runs `ssh-add -t` so `ssh <account>@<host>` works for the rest of the
    certificate's life (default 15 minutes). The approved window (default
    60 minutes) is longer; `shoephone renew <host>` gets the next
    certificate silently, no second approval.
 
-Then use ssh as usual: `ssh agent-admin@<host> sudo ...`. When the task is
-done, `shoephone disavow <host>` closes the window; a certificate already
+The account is the part before the colon in the principal the request
+printed: `claude-admin` for `claude-admin:apps`. Then use ssh as usual:
+`ssh <account>@<host> sudo ...`. When the task is done,
+`shoephone disavow <host>` closes the window; a certificate already
 loaded expires within one certificate lifetime.
 
 ## Exit status
