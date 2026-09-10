@@ -88,6 +88,11 @@ fn run(args: &[String]) -> Status {
             return usage();
         }
     };
+    // A missing verb is a usage error before anything else: the default
+    // config path must not turn `shoephoned` alone into "config not found".
+    if parsed.verb.is_none() {
+        return usage();
+    }
     let config_path = parsed.config.unwrap_or_else(|| DEFAULT_CONFIG.to_owned());
     let config = match Config::from_file(&PathBuf::from(config_path)) {
         Ok(c) => c,
