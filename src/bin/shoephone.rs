@@ -37,6 +37,7 @@ struct Opts {
     daemon: Option<String>,
     window: Option<u64>,
     reason: Option<String>,
+    context: Option<String>,
     positional: Vec<String>,
 }
 
@@ -46,6 +47,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         daemon: None,
         window: None,
         reason: None,
+        context: None,
         positional: Vec::new(),
     };
     let mut it = args.iter();
@@ -53,6 +55,10 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         match a.as_str() {
             "--json" => opts.json = true,
             "--daemon" => opts.daemon = Some(it.next().ok_or("--daemon needs a URL")?.clone()),
+            "--context" => {
+                let v = it.next().ok_or("--context needs a URL")?;
+                opts.context = Some(v.clone());
+            }
             "--reason" => {
                 let v = it.next().ok_or("--reason needs text")?;
                 opts.reason = Some(v.clone());
@@ -172,6 +178,22 @@ fn in_minutes(unix: u64) -> String {
     } else {
         format!("{} min", secs.div_ceil(60))
     }
+}
+
+/// The link the phone shows for "open the session": `--context`, else the
+/// Claude Code session this process runs in, which the harness names in
+/// `CLAUDE_CODE_BRIDGE_SESSION_ID` and serves at claude.ai/code/<id>.
+fn session_link() -> Option<String> {
+    let id = std::env::var("CLAUDE_CODE_BRIDGE_SESSION_ID").ok()?;
+    let id = id.trim();
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    Some(format!("https://claude.ai/code/{id}"))
 }
 
 fn requester() -> String {
@@ -337,6 +359,7 @@ fn request(opts: &Opts, host: &str) -> Status {
         public_key: public_key.clone(),
         requester: requester(),
         reason: reason.to_owned(),
+        context: opts.context.clone().or_else(session_link),
         window_minutes: opts.window,
     }) {
         Ok(r) => r,

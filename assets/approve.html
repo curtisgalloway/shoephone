@@ -37,6 +37,7 @@
 <div id="pending" class="card hidden">
   <p class="scope" id="scope"></p>
   <p class="reason" id="reason"></p>
+  <p class="muted"><a id="context" class="hidden" target="_blank" rel="noopener">Open the session</a></p>
   <p class="muted">Compare this code with the terminal:</p>
   <p class="code" id="match"></p>
   <dl class="kv">
@@ -104,6 +105,7 @@ async function refresh() {
     $('scope').textContent = `admin on ${p.host} until ${when(p.ends_at)}`;
     $('match').textContent = p.match_code;
     $('reason').textContent = p.reason;
+    $('context').classList.toggle('hidden', !p.context); if (p.context) $('context').href = p.context;
     $('requester').textContent = p.requester || '(unnamed)';
     $('fingerprint').textContent = p.fingerprint;
     $('principal').textContent = p.principal;

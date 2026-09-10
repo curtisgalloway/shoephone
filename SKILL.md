@@ -22,7 +22,7 @@ expect the request to be declined without that being an error in the tool.
 ```bash
 shoephone [--json] [--daemon URL] <command>
 shoephone doctor                     # check preconditions before guessing
-shoephone request <host> --reason "..." [--window MINUTES]
+shoephone request <host> --reason "..." [--context URL] [--window MINUTES]
 shoephone renew <host>               # a fresh certificate inside the open window
 shoephone disavow <host>             # end the window early; unload the key
 shoephone status                     # open windows
@@ -39,6 +39,11 @@ their phone before deciding: what the task is, why it needs admin on
 that host, and roughly what you will run, in one or two sentences. It is
 shown beside the match code and kept in the history. A request with no
 reason is refused before anyone is asked.
+
+The request also carries a link to this session, so the person can open
+it on their phone and read the context behind the reason. Inside Claude
+Code it is filled in from the session id in the environment; `--context
+URL` overrides it (https only).
 
 ## What a request does
 

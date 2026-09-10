@@ -75,6 +75,7 @@ async fn request_decline_cooldown_and_gone() {
         public_key: key.clone(),
         requester: "test".into(),
         reason: "loop test: decline path".into(),
+        context: Some("https://claude.ai/code/session_test".into()),
         window_minutes: Some(30),
     };
     let c = client.clone();
@@ -147,6 +148,7 @@ async fn approved_window_issues_certificates_bound_to_the_key() {
             public_key: k,
             requester: "test".into(),
             reason: "loop test: approve path".into(),
+            context: None,
             window_minutes: None,
         })
     })

@@ -120,6 +120,8 @@ pub struct Pending {
     pub requester: String,
     /// The requester's stated purpose. Display only; untrusted; never empty.
     pub reason: String,
+    /// A link to the requesting session, if the requester gave one.
+    pub context: Option<String>,
 }
 
 /// What the approver's verified signature covered. The daemon builds this
@@ -213,6 +215,7 @@ pub enum Event {
         id: u64,
         host: String,
         reason: String,
+        context: Option<String>,
         at: SystemTime,
     },
     Approved {
@@ -300,6 +303,7 @@ impl Grants {
         public_key: &str,
         requester: &str,
         reason: &str,
+        context: Option<&str>,
         wanted: Option<Duration>,
     ) -> Result<Pending, Refusal> {
         self.tick(now);
@@ -307,6 +311,13 @@ impl Grants {
         if reason.is_empty() {
             return Err(Refusal::NoReason);
         }
+        // A link is only ever displayed, but it is a link the person will
+        // tap: https, no whitespace, bounded.
+        let context = context
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(|c| printable(c, 512))
+            .filter(|c| c.starts_with("https://") && !c.chars().any(char::is_whitespace));
         let principal = self
             .principals
             .get(host)
@@ -346,12 +357,14 @@ impl Grants {
             created: now,
             requester: printable(requester, 64),
             reason: reason.clone(),
+            context: context.clone(),
         };
         self.accepted.push_back(now);
         self.events.push(Event::Requested {
             id,
             host: host.to_owned(),
             reason,
+            context,
             at: now,
         });
         self.pending = Some(pending.clone());
@@ -636,7 +649,16 @@ mod tests {
 
     fn approved(g: &mut Grants, now: SystemTime) -> Window {
         let p = g
-            .request(now, &mut Counter(0), "web01", KEY, "laptop", "deploy", None)
+            .request(
+                now,
+                &mut Counter(0),
+                "web01",
+                KEY,
+                "laptop",
+                "deploy",
+                None,
+                None,
+            )
             .unwrap();
         g.approve(now, &approval_for(&p)).unwrap()
     }
@@ -652,6 +674,7 @@ mod tests {
                 KEY,
                 "laptop",
                 "deploy",
+                None,
                 None,
             )
             .unwrap();
@@ -670,6 +693,7 @@ mod tests {
                 KEY,
                 "laptop",
                 "deploy",
+                None,
                 Some(9 * HOUR),
             )
             .unwrap();
@@ -683,7 +707,16 @@ mod tests {
     #[test]
     fn unknown_hosts_and_bad_keys_are_refused_before_anything_counts() {
         let mut g = grants();
-        let r = g.request(t(0), &mut Counter(0), "nope", KEY, "laptop", "deploy", None);
+        let r = g.request(
+            t(0),
+            &mut Counter(0),
+            "nope",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+            None,
+        );
         assert_eq!(r, Err(Refusal::UnknownHost));
         let r = g.request(
             t(0),
@@ -693,9 +726,19 @@ mod tests {
             "x",
             "deploy",
             None,
+            None,
         );
         assert_eq!(r, Err(Refusal::BadKey));
-        let r = g.request(t(0), &mut Counter(0), "web01", "   ", "x", "deploy", None);
+        let r = g.request(
+            t(0),
+            &mut Counter(0),
+            "web01",
+            "   ",
+            "x",
+            "deploy",
+            None,
+            None,
+        );
         assert_eq!(r, Err(Refusal::BadKey));
         assert!(g.accepted.is_empty(), "refusals do not spend the rate cap");
         assert!(g.take_events().is_empty());
@@ -712,9 +755,19 @@ mod tests {
             "laptop",
             "deploy",
             None,
+            None,
         )
         .unwrap();
-        let r = g.request(t(1), &mut Counter(0), "db01", KEY, "laptop", "deploy", None);
+        let r = g.request(
+            t(1),
+            &mut Counter(0),
+            "db01",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+            None,
+        );
         assert_eq!(r, Err(Refusal::Busy));
     }
 
@@ -729,6 +782,7 @@ mod tests {
                 KEY,
                 "laptop",
                 "deploy",
+                None,
                 None,
             )
             .unwrap();
@@ -768,6 +822,7 @@ mod tests {
                 KEY,
                 "laptop",
                 "deploy",
+                None,
                 None,
             )
             .unwrap();
@@ -817,6 +872,7 @@ mod tests {
                 "rogue",
                 "deploy",
                 None,
+                None,
             )
             .unwrap();
         let w2 = g.approve(later, &approval_for(&p)).unwrap();
@@ -848,6 +904,7 @@ mod tests {
                 "rogue",
                 "deploy",
                 None,
+                None,
             )
             .unwrap();
         g.kill(t(20), "web01").unwrap();
@@ -878,6 +935,7 @@ mod tests {
             KEY,
             "laptop",
             "deploy",
+            None,
             None,
         )
         .unwrap();
@@ -911,6 +969,7 @@ mod tests {
                 "laptop",
                 "deploy",
                 None,
+                None,
             )
             .unwrap();
         assert!(g.pending(t(299)).is_some());
@@ -936,6 +995,7 @@ mod tests {
                 "laptop",
                 "deploy",
                 None,
+                None,
             )
             .unwrap();
         g.decline(t(10), p.id).unwrap();
@@ -946,6 +1006,7 @@ mod tests {
             KEY,
             "laptop",
             "deploy",
+            None,
             None,
         );
         assert!(matches!(r, Err(Refusal::Cooldown { until }) if until >= t(10) + 5 * MIN));
@@ -963,6 +1024,7 @@ mod tests {
                 "laptop",
                 "deploy",
                 None,
+                None,
             )
             .unwrap();
         g.decline(t(10), p.id).unwrap();
@@ -979,7 +1041,16 @@ mod tests {
         let mut seen = Vec::new();
         for strike in 0..6u32 {
             let p = g
-                .request(now, &mut Counter(0), "web01", KEY, "laptop", "deploy", None)
+                .request(
+                    now,
+                    &mut Counter(0),
+                    "web01",
+                    KEY,
+                    "laptop",
+                    "deploy",
+                    None,
+                    None,
+                )
                 .unwrap();
             if strike % 2 == 0 {
                 g.decline(now, p.id).unwrap();
@@ -1011,6 +1082,7 @@ mod tests {
                     &format!("laptop-{i}"),
                     "deploy",
                     None,
+                    None,
                 )
                 .unwrap();
             g.approve(now, &approval_for(&p)).unwrap();
@@ -1023,6 +1095,7 @@ mod tests {
             "rogue",
             "deploy",
             None,
+            None,
         );
         assert_eq!(r, Err(Refusal::RateCapped { until: t(3600) }));
         assert!(
@@ -1033,6 +1106,7 @@ mod tests {
                 OTHER_KEY,
                 "rogue",
                 "deploy",
+                None,
                 None
             )
             .is_ok()
@@ -1065,6 +1139,7 @@ mod tests {
                 KEY,
                 "laptop",
                 "deploy",
+                None,
                 None,
             )
             .unwrap();
@@ -1114,16 +1189,65 @@ mod tests {
     #[test]
     fn a_request_needs_a_reason_and_it_is_kept_printable_and_short() {
         let mut g = grants();
-        let r = g.request(t(0), &mut Counter(0), "web01", KEY, "laptop", "   ", None);
+        let r = g.request(
+            t(0),
+            &mut Counter(0),
+            "web01",
+            KEY,
+            "laptop",
+            "   ",
+            None,
+            None,
+        );
         assert_eq!(r, Err(Refusal::NoReason));
         let long = format!("rotate\x07 the {} key", "x".repeat(300));
         let p = g
-            .request(t(0), &mut Counter(0), "web01", KEY, "laptop", &long, None)
+            .request(
+                t(0),
+                &mut Counter(0),
+                "web01",
+                KEY,
+                "laptop",
+                &long,
+                None,
+                None,
+            )
             .unwrap();
         assert!(!p.reason.contains('\x07'));
         assert_eq!(p.reason.chars().count(), 200);
         assert!(
             matches!(g.take_events().as_slice(), [Event::Requested { reason, .. }] if reason == &p.reason)
         );
+    }
+
+    #[test]
+    fn context_is_kept_only_when_it_is_an_https_link() {
+        let mut g = grants();
+        for (given, kept) in [
+            (
+                Some("https://claude.ai/code/session_1"),
+                Some("https://claude.ai/code/session_1"),
+            ),
+            (Some("http://example.com"), None),
+            (Some("https://a b"), None),
+            (Some("  "), None),
+            (None, None),
+        ] {
+            let p = g
+                .request(
+                    t(0),
+                    &mut Counter(0),
+                    "web01",
+                    KEY,
+                    "laptop",
+                    "deploy",
+                    given,
+                    None,
+                )
+                .unwrap();
+            assert_eq!(p.context.as_deref(), kept, "{given:?}");
+            g.decline(t(1), p.id).unwrap();
+            g.cooldown_until = None;
+        }
     }
 }

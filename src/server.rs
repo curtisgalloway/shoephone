@@ -323,6 +323,7 @@ fn pending_view(p: &Pending, ttl: Duration) -> PendingView {
         match_code: p.match_code.clone(),
         requester: p.requester.clone(),
         reason: p.reason.clone(),
+        context: p.context.clone(),
         fingerprint: ca::fingerprint(&p.scope.public_key)
             .map(|f| f.to_string())
             .unwrap_or_default(),
@@ -369,6 +370,7 @@ async fn request(State(d): App, Json(body): Json<RequestBody>) -> Reply<RequestR
             &key,
             &body.requester,
             &body.reason,
+            body.context.as_deref(),
             wanted,
         )
     })?;

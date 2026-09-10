@@ -62,6 +62,9 @@ pub struct LedgerEntry {
     /// The stated purpose, on the `requested` line only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The requester's session link, on the `requested` line only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 impl From<&Event> for LedgerEntry {
@@ -100,6 +103,10 @@ impl From<&Event> for LedgerEntry {
             until,
             reason: match e {
                 Event::Requested { reason, .. } => Some(reason.clone()),
+                _ => None,
+            },
+            context: match e {
+                Event::Requested { context, .. } => context.clone(),
                 _ => None,
             },
         }
@@ -256,6 +263,7 @@ mod tests {
                 id: 1,
                 host: "web01".into(),
                 reason: "deploy".into(),
+                context: None,
                 at: t0,
             },
             Event::Approved {

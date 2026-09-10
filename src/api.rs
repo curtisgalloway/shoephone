@@ -20,6 +20,10 @@ pub struct RequestBody {
     /// Required; the daemon refuses an empty one. Display only, untrusted.
     #[serde(default)]
     pub reason: String,
+    /// Where the person can read more: the agent session's URL. Optional;
+    /// https only; display only, untrusted.
+    #[serde(default)]
+    pub context: Option<String>,
     /// Wanted window; clamped to policy.
     #[serde(default)]
     pub window_minutes: Option<u64>,
@@ -111,6 +115,8 @@ pub struct PendingView {
     pub match_code: String,
     pub requester: String,
     pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
     pub fingerprint: String,
     pub created: u64,
     pub expires: u64,
