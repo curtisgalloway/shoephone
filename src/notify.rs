@@ -47,8 +47,8 @@ impl Push {
     fn body(self) -> &'static str {
         match self {
             Push::RequestWaiting => "A request is waiting for your approval.",
-            Push::WindowOpened => "A window was opened.",
-            Push::WindowKilled => "A window was killed.",
+            Push::WindowOpened => "An authorization is now active.",
+            Push::WindowKilled => "An authorization was terminated.",
         }
     }
 
@@ -321,8 +321,8 @@ mod tests {
                 Push::RequestWaiting,
                 "A request is waiting for your approval.",
             ),
-            (Push::WindowOpened, "A window was opened."),
-            (Push::WindowKilled, "A window was killed."),
+            (Push::WindowOpened, "An authorization is now active."),
+            (Push::WindowKilled, "An authorization was terminated."),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
