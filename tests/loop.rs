@@ -43,6 +43,7 @@ async fn start(dir: &Path) -> (Client, Arc<Daemon>) {
         notify: None,
         allow_synced_credentials: false,
         apns: None,
+        access: None,
     };
     let daemon = Arc::new(Daemon::new(config).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

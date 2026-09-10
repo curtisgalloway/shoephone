@@ -58,6 +58,21 @@ pub struct Config {
     /// `[notify]`; the app fetches what is pending on open.
     #[serde(default)]
     pub apns: Option<ApnsConfig>,
+    /// A Cloudflare Access service token that fronts the daemon when it is
+    /// reached through a tunnel. The daemon never sends it anywhere; it only
+    /// folds it into the enrollment QR so the app can present it. Root-only
+    /// on disk like everything else here.
+    #[serde(default)]
+    pub access: Option<AccessConfig>,
+}
+
+/// The two headers Cloudflare Access expects from a service token:
+/// `CF-Access-Client-Id` and `CF-Access-Client-Secret`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessConfig {
+    pub client_id: String,
+    pub client_secret: String,
 }
 
 /// Overrides for [`Policy`], in minutes. Anything omitted keeps the default.

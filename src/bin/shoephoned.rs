@@ -163,10 +163,16 @@ fn enroll(config: &Config, name: &str) -> Status {
     // The QR carries the daemon's origin too, so a fresh app configures
     // itself from the scan. It goes to stderr with the chatter; stdout
     // stays the bare code for anything that captures it.
-    let payload = format!(
+    let mut payload = format!(
         "shoephone://enroll?daemon={}&code={}",
         config.rp_origin, pretty
     );
+    if let Some(access) = &config.access {
+        payload.push_str(&format!(
+            "&id={}&secret={}",
+            access.client_id, access.client_secret
+        ));
+    }
     match qr_text(&payload) {
         Some(qr) => eprintln!("\n{qr}"),
         None => eprintln!("shoephoned: (QR code too large to render)"),
@@ -176,11 +182,12 @@ fn enroll(config: &Config, name: &str) -> Status {
 }
 
 /// A QR code as terminal text, two modules per character row using half
-/// blocks, with a two-module quiet zone. Light modules are drawn, dark
+/// blocks, with a two-module quiet zone. Low error correction: a terminal
+/// renders every module perfectly, and the smaller code scans faster. Light modules are drawn, dark
 /// ones are left to the background, which is the right way round on the
 /// dark terminals a console usually has; phone scanners read either.
 fn qr_text(payload: &str) -> Option<String> {
-    let qr = qrcodegen::QrCode::encode_text(payload, qrcodegen::QrCodeEcc::Medium).ok()?;
+    let qr = qrcodegen::QrCode::encode_text(payload, qrcodegen::QrCodeEcc::Low).ok()?;
     let size = qr.size();
     const QUIET: i32 = 2;
     let light = |x: i32, y: i32| !qr.get_module(x, y);
