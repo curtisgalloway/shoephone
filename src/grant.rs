@@ -235,12 +235,16 @@ pub enum Event {
         at: SystemTime,
     },
     Issued {
+        /// The window, which carries the id of the request that opened it.
+        id: u64,
         serial: u64,
         host: String,
         valid_before: SystemTime,
         at: SystemTime,
     },
+    /// One per window closed, so the ledger can tie it to its request.
     Killed {
+        id: u64,
         host: String,
         at: SystemTime,
     },
@@ -455,6 +459,7 @@ impl Grants {
             .max_by_key(|w| w.scope.ends_at)
             .ok_or(Refusal::KeyMismatch)?;
         let valid_before = (now + self.policy.cert_ttl).min(window.scope.ends_at);
+        let window_id = window.id;
         let cert = Certificate {
             serial: 0,
             principal: window.scope.principal.clone(),
@@ -468,6 +473,7 @@ impl Grants {
             ..cert
         };
         self.events.push(Event::Issued {
+            id: window_id,
             serial: cert.serial,
             host: host.to_owned(),
             valid_before,
@@ -484,10 +490,11 @@ impl Grants {
     /// later must not reopen what was just closed.
     pub fn kill(&mut self, now: SystemTime, host: &str) -> Result<(), Refusal> {
         self.tick(now);
-        let before = self.windows.len();
-        self.windows.retain(|w| w.scope.host != host);
+        let (closed, kept): (Vec<Window>, Vec<Window>) =
+            self.windows.drain(..).partition(|w| w.scope.host == host);
+        self.windows = kept;
         let pending = self.pending.take_if(|p| p.scope.host == host);
-        if self.windows.len() == before && pending.is_none() {
+        if closed.is_empty() && pending.is_none() {
             return Err(Refusal::NoWindow);
         }
         if let Some(p) = pending {
@@ -498,10 +505,13 @@ impl Grants {
             });
             self.strike(now, Outcome::Declined);
         }
-        self.events.push(Event::Killed {
-            host: host.to_owned(),
-            at: now,
-        });
+        for w in closed {
+            self.events.push(Event::Killed {
+                id: w.id,
+                host: host.to_owned(),
+                at: now,
+            });
+        }
         Ok(())
     }
 

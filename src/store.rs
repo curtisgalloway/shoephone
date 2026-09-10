@@ -80,6 +80,7 @@ impl From<&Event> for LedgerEntry {
             Event::Declined { id, host, at } => ("declined", host, at, Some(*id), None, None),
             Event::TimedOut { id, host, at } => ("timed_out", host, at, Some(*id), None, None),
             Event::Issued {
+                id,
                 serial,
                 host,
                 valid_before,
@@ -88,11 +89,11 @@ impl From<&Event> for LedgerEntry {
                 "issued",
                 host,
                 at,
-                None,
+                Some(*id),
                 Some(*serial),
                 Some(unix(*valid_before)),
             ),
-            Event::Killed { host, at } => ("killed", host, at, None, None, None),
+            Event::Killed { id, host, at } => ("killed", host, at, Some(*id), None, None),
         };
         LedgerEntry {
             at: unix(*at),
@@ -273,6 +274,7 @@ mod tests {
                 at: t0,
             },
             Event::Issued {
+                id: 1,
                 serial: 2,
                 host: "web01".into(),
                 valid_before: t0 + Duration::from_secs(900),
