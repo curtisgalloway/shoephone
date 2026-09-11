@@ -38,6 +38,25 @@ impl Session {
         Self { dir }
     }
 
+    /// A session scoped to one host, at `<base>/hosts/<host>/`. Every host
+    /// gets its own keypair and certificate, so approving one host's
+    /// request never overwrites, and disavowing it never revokes, another
+    /// host's certificate.
+    ///
+    /// `host` reaches here already checked by the CLI's `hostname_ok`, but
+    /// that check exists for a different reason (is this a plausible
+    /// hostname) than this one (can it be trusted as a path component), so
+    /// it is checked again: a `host` that is empty, contains `/` or `..`,
+    /// or starts with `.` is refused rather than joined onto `base`.
+    pub fn for_host(base: PathBuf, host: &str) -> Result<Self, String> {
+        if host.is_empty() || host.contains('/') || host.contains("..") || host.starts_with('.') {
+            return Err(format!(
+                "{host:?} is not a usable per-host session directory name"
+            ));
+        }
+        Ok(Self::new(base.join("hosts").join(host)))
+    }
+
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -81,10 +100,12 @@ impl Session {
         Ok(line.trim().to_owned())
     }
 
+    /// Write the certificate atomically: `ssh` (or a concurrent `doctor`)
+    /// must never observe a half-written file, whether from a crash mid-write
+    /// or from `renew` racing another process's read.
     pub fn write_certificate(&self, line: &str) -> Result<(), String> {
         let path = self.cert_path();
-        std::fs::write(&path, format!("{}\n", line.trim()))
-            .map_err(|e| format!("writing {}: {e}", path.display()))
+        write_atomic(&path, format!("{}\n", line.trim()).as_bytes())
     }
 
     pub fn remove_certificate(&self) {
@@ -145,6 +166,18 @@ impl Session {
             )),
         }
     }
+}
+
+/// Write `bytes` to `path` by writing `<path>.tmp.<pid>` and renaming it
+/// over the target, so a reader never sees a partial file. Mirrors
+/// `store::write_atomic`; kept local so this module has no dependency on
+/// `store`.
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    std::fs::write(&tmp, bytes).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("renaming into {}: {e}", path.display()))
 }
 
 #[cfg(unix)]

@@ -14,8 +14,13 @@ use crate::exit::Status;
 
 #[derive(Debug)]
 pub enum Error {
-    /// DNS, connect, TLS, or timeout: the daemon was not reached.
+    /// DNS, connect, TLS, or a resolve/connect timeout: the daemon was
+    /// never reached, so nothing was done.
     Unreachable(String),
+    /// The connection failed, or timed out, at a point after the request
+    /// may already have left this process. The daemon may have acted on
+    /// it; there is no way to tell from here.
+    Ambiguous(String),
     /// The daemon answered with a refusal.
     Daemon { http: u16, reply: ErrorReply },
     /// The daemon answered something this client does not understand.
@@ -26,6 +31,10 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Unreachable(e) => write!(f, "daemon unreachable: {e}"),
+            Error::Ambiguous(e) => write!(
+                f,
+                "the daemon may have acted on this request; the outcome is unknown: {e}; check `shoephone status` before retrying"
+            ),
             Error::Daemon { reply, .. } => write!(f, "{} ({})", reply.error, reply.code),
             Error::Protocol(e) => write!(f, "unexpected reply from daemon: {e}"),
         }
@@ -40,6 +49,7 @@ impl Error {
     pub fn status(&self) -> Status {
         match self {
             Error::Unreachable(_) => Status::Unreachable,
+            Error::Ambiguous(_) => Status::RetryUnknown,
             Error::Protocol(_) => Status::RetryUnknown,
             Error::Daemon { http, reply } => match reply.code.as_str() {
                 "unknown_host" | "bad_key" | "reason_required" => Status::Permanent,
@@ -57,12 +67,26 @@ impl Error {
 impl From<ureq::Error> for Error {
     fn from(e: ureq::Error) -> Self {
         match e {
-            ureq::Error::Io(_)
-            | ureq::Error::HostNotFound
-            | ureq::Error::Timeout(_)
+            ureq::Error::HostNotFound
             | ureq::Error::ConnectionFailed
             | ureq::Error::Tls(_)
             | ureq::Error::Rustls(_) => Error::Unreachable(e.to_string()),
+            // Resolve and Connect fire before this process has sent a
+            // single byte of the request, so the daemon was never reached.
+            // Every later phase -- sending the body, waiting on the
+            // response, reading it back -- can time out after the daemon
+            // already acted on the request.
+            ureq::Error::Timeout(ureq::Timeout::Resolve | ureq::Timeout::Connect) => {
+                Error::Unreachable(e.to_string())
+            }
+            // A refused connection (nobody listening, or a firewall
+            // rejecting outright) fails synchronously in the OS before any
+            // request bytes exist to send; every other I/O error can
+            // happen mid-request, after bytes are already on the wire.
+            ureq::Error::Io(ref io) if io.kind() == std::io::ErrorKind::ConnectionRefused => {
+                Error::Unreachable(e.to_string())
+            }
+            ureq::Error::Timeout(_) | ureq::Error::Io(_) => Error::Ambiguous(e.to_string()),
             other => Error::Protocol(other.to_string()),
         }
     }
@@ -75,9 +99,15 @@ pub struct Client {
 
 impl Client {
     pub fn new(base: &str) -> Self {
+        Self::with_timeout(base, Duration::from_secs(15))
+    }
+
+    /// Like [`Client::new`], but with an explicit global timeout instead of
+    /// the default 15 seconds. For tests that need a short one.
+    pub fn with_timeout(base: &str, timeout: Duration) -> Self {
         let config = Agent::config_builder()
             .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(15)))
+            .timeout_global(Some(timeout))
             .user_agent(concat!("shoephone/", env!("CARGO_PKG_VERSION")))
             .build();
         Self {

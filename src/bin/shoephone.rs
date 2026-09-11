@@ -159,12 +159,21 @@ fn need_client(opts: &Opts) -> Result<Client, Status> {
     }
 }
 
-fn need_session() -> Result<Session, Status> {
-    match Session::default_dir() {
-        Ok(dir) => Ok(Session::new(dir)),
+/// The session for one host: its own keypair and certificate, so approving
+/// or disavowing this host never touches another host's.
+fn need_session(host: &str) -> Result<Session, Status> {
+    let dir = match Session::default_dir() {
+        Ok(d) => d,
         Err(e) => {
             eprintln!("shoephone: {e}");
-            Err(Status::Precondition)
+            return Err(Status::Precondition);
+        }
+    };
+    match Session::for_host(dir, host) {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            eprintln!("shoephone: {e}");
+            Err(Status::Usage)
         }
     }
 }
@@ -284,13 +293,30 @@ fn doctor(opts: &Opts) -> Status {
         );
     }
     match Session::default_dir() {
-        Ok(dir) => match Session::new(dir.clone()).public_key() {
-            Ok(_) => notes.push(format!(
-                "session key: {}",
-                dir.join("session_ed25519").display()
-            )),
-            Err(e) => problems.push(e),
-        },
+        Ok(dir) => {
+            let hosts_dir = dir.join("hosts");
+            if let Ok(entries) = std::fs::read_dir(&hosts_dir) {
+                let mut names: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect();
+                names.sort();
+                for name in names {
+                    let key_path = hosts_dir.join(&name).join("session_ed25519");
+                    if key_path.exists() {
+                        notes.push(format!("session key for {name}: {}", key_path.display()));
+                    }
+                }
+            }
+            let legacy = dir.join("session_ed25519");
+            if legacy.exists() {
+                notes.push(format!(
+                    "legacy shared session key at {} is no longer used; delete it when no host still relies on it",
+                    legacy.display()
+                ));
+            }
+        }
         Err(e) => problems.push(e),
     }
     let ok = problems.is_empty();
@@ -365,7 +391,7 @@ fn request(opts: &Opts, host: &str) -> Status {
         Ok(c) => c,
         Err(s) => return s,
     };
-    let session = match need_session() {
+    let session = match need_session(host) {
         Ok(s) => s,
         Err(s) => return s,
     };
@@ -447,7 +473,7 @@ fn renew(opts: &Opts, host: &str) -> Status {
         Ok(c) => c,
         Err(s) => return s,
     };
-    let session = match need_session() {
+    let session = match need_session(host) {
         Ok(s) => s,
         Err(s) => return s,
     };
@@ -555,7 +581,7 @@ fn disavow(opts: &Opts, host: &str) -> Status {
         Ok(c) => c,
         Err(s) => return s,
     };
-    if let Ok(session) = need_session() {
+    if let Ok(session) = need_session(host) {
         if use_agent() {
             session.remove_from_agent();
         }

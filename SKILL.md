@@ -49,23 +49,26 @@ URL` overrides it (https only).
 
 1. Sends the host, the reason, and this machine's session public key to
    the daemon.
-   The session key is generated once, unencrypted, in
-   `~/.local/state/shoephone/`; it is useless without a certificate.
+   Each host gets its own session key, generated once per host,
+   unencrypted, in `~/.local/state/shoephone/hosts/<host>/`; it is useless
+   without a certificate.
 2. Prints a **match code** on stdout. The person compares it with the one on
    their phone. It is not an input and not a secret; do not act on it.
 3. Waits for the verdict, polling for up to the daemon's pending timeout
    (default 5 minutes).
 4. On approval, fetches a certificate valid for one principal on that host,
-   writes it next to the session key as `session_ed25519-cert.pub`, and
-   runs `ssh-add -t` so `ssh <account>@<host>` works for the rest of the
-   certificate's life (default 15 minutes). The approved window (default
-   60 minutes) is longer; `shoephone renew <host>` gets the next
-   certificate silently, no second approval.
+   writes it next to that host's session key as
+   `hosts/<host>/session_ed25519-cert.pub`, and runs `ssh-add -t` so
+   `ssh <account>@<host>` works for the rest of the certificate's life
+   (default 15 minutes). The approved window (default 60 minutes) is
+   longer; `shoephone renew <host>` gets the next certificate silently, no
+   second approval.
 
 The account is the part before the colon in the principal the request
 printed: `claude-admin` for `claude-admin:apps`. Then use ssh as usual:
-`ssh <account>@<host> sudo ...`. When the task is done,
-`shoephone disavow <host>` closes the window; a certificate already
+`ssh <account>@<host> sudo ...` (the loaded identity is
+`~/.local/state/shoephone/hosts/<host>/session_ed25519`). When the task is
+done, `shoephone disavow <host>` closes the window; a certificate already
 loaded expires within one certificate lifetime.
 
 ## Exit status
@@ -81,7 +84,7 @@ loaded expires within one certificate lifetime.
 | 11 | a person must act (no open window; the request needs approval) | run `shoephone request <host>` if the task still needs admin |
 | 12 | denied: declined, timed out, or the key does not match the window | do not retry; the person saw the request and chose |
 | 20 | another request is pending | wait for it; a retry is free |
-| 22 | daemon answered with an error or nonsense; outcome unknown | check `shoephone status` before retrying |
+| 22 | daemon answered with an error or nonsense; outcome unknown, or the connection failed after the request may have been sent | check `shoephone status` before retrying |
 | 23 | cooldown or hourly cap; stderr says when | come back after that time |
 | 30 | permanent: unknown host or a malformed key | the request itself must change |
 
@@ -111,10 +114,13 @@ was empty. `request` and `renew` return
   1Password agent does; the symptom is exit 10 with "agent refused
   operation" on every request), put `agent = false` in
   `~/.config/shoephone/config.toml`. The CLI then skips ssh-agent, exits
-  0, and leaves the certificate beside the session key as
-  `session_ed25519-cert.pub`, where ssh finds it on its own given a
-  `Match user <account>` stanza in `~/.ssh/config` that sets
-  `IdentityFile` to the session key, `IdentitiesOnly yes` and
-  `IdentityAgent none`. Then `ssh <account>@<host>` needs no `-i`.
+  0, and leaves the certificate beside that host's session key as
+  `hosts/<host>/session_ed25519-cert.pub`, where ssh finds it on its own
+  given a `Match user <account>` stanza in `~/.ssh/config` that sets
+  `IdentityFile` to `~/.local/state/shoephone/hosts/<host>/session_ed25519`,
+  `IdentitiesOnly yes` and `IdentityAgent none`. Then `ssh <account>@<host>`
+  needs no `-i`. With several hosts, list one `IdentityFile` line per host
+  in the same `Match` stanza. ssh tries them in order, so keep the list
+  short or sshd's `MaxAuthTries` is reached before the right one.
 - The match code the tool prints is for the person at the terminal to
   compare against their phone. Show it to them; never paraphrase it.
