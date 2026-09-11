@@ -1790,6 +1790,7 @@ dependencies = [
  "jsonwebtoken",
  "qrcodegen",
  "reqwest",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

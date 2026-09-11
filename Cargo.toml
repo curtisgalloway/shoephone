@@ -49,4 +49,5 @@ webauthn-rs = { version = "0.5.5", features = [
 
 [dev-dependencies]
 base64 = "0.23.1"
+ring = "0.17.14"
 shoephone = { path = ".", features = ["test-hooks"] }
