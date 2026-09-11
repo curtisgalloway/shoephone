@@ -1,3 +1,6 @@
 /target
+
+# oxbox review audit trail (oxbox-review skill): keep locally, never commit
 logs/
+.oxbox-review/
 .ox-review/
