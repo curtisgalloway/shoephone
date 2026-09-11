@@ -563,9 +563,13 @@ fn disavow(opts: &Opts, host: &str) -> Status {
     }
     match client.kill(host) {
         Ok(()) => {
-            eprintln!(
-                "shoephone: window on {host} closed; the loaded certificate expires within one TTL"
-            );
+            if use_agent() {
+                eprintln!(
+                    "shoephone: window on {host} closed; the loaded certificate expires within one TTL"
+                );
+            } else {
+                eprintln!("shoephone: window on {host} closed; the certificate file is removed");
+            }
             if opts.json {
                 println!(
                     "{}",
