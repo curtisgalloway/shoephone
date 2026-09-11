@@ -29,12 +29,23 @@ async fn start(dir: &Path) -> (Client, Arc<Daemon>) {
         .unwrap()
         .write_openssh_file(&ca_key)
         .unwrap();
+    start_at(dir, &ca_key).await
+}
+
+/// Start a daemon against a state directory (and CA) an earlier daemon in
+/// this test already used, the way a restart does: neither is regenerated.
+/// Used to check that ids and serials survive a restart.
+async fn start_reusing(dir: &Path) -> (Client, Arc<Daemon>) {
+    start_at(dir, &dir.join("user_ca")).await
+}
+
+async fn start_at(dir: &Path, ca_key: &Path) -> (Client, Arc<Daemon>) {
     let mut principals = BTreeMap::new();
     principals.insert("web01".to_owned(), "agent-admin:web01".to_owned());
     let config = Config {
         listen: "127.0.0.1:0".into(),
         state_dir: dir.to_path_buf(),
-        ca_key,
+        ca_key: ca_key.to_path_buf(),
         rp_id: "localhost".into(),
         rp_origin: "http://localhost".into(),
         rp_name: "test".into(),
@@ -193,7 +204,19 @@ async fn approved_window_issues_certificates_bound_to_the_key() {
     let c = client.clone();
     let k = key.clone();
     let renewed = blocking(move || c.issue("web01", &k)).await.unwrap();
-    assert!(renewed.serial > issued.serial, "renewal is a new serial");
+    // An immediate renewal falls well inside half the certificate's TTL,
+    // so `Grants::issue` says to reuse rather than mint: the daemon hands
+    // back the identical certificate it already issued and signed, instead
+    // of minting (and logging) a new one for a session that never used the
+    // old one.
+    assert_eq!(
+        renewed.serial, issued.serial,
+        "an immediate renewal reuses the certificate"
+    );
+    assert_eq!(
+        renewed.certificate, issued.certificate,
+        "and gets back the identical signed certificate"
+    );
 
     let c = client.clone();
     blocking(move || c.kill("web01")).await.unwrap();
@@ -299,5 +322,62 @@ async fn a_broken_ledger_refuses_audited_calls_but_kill_still_works() {
 
     // Cleans up the directory planted at ledger.jsonl along with everything
     // else in the scratch dir.
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Ids and serials come from a counter the daemon persists to disk (see
+/// `Store::load_next_id`/`save_next_id`), precisely so a restart does not
+/// hand out an id or serial that is already in the ledger. This starts a
+/// daemon, files a request, then starts a second daemon against the same
+/// state directory and CA the way a restart does, and checks the second
+/// request gets a higher id than the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn request_ids_survive_a_restart() {
+    let dir = scratch("restart-ids");
+    let (client, daemon) = start(&dir).await;
+    let client = Arc::new(client);
+    let session = Session::new(dir.join("session"));
+    let key = session.public_key().unwrap();
+
+    let c = client.clone();
+    let k = key.clone();
+    let first = blocking(move || {
+        c.request(&RequestBody {
+            host: "web01".into(),
+            public_key: k,
+            requester: "test".into(),
+            reason: "loop test: id survives a restart, first daemon".into(),
+            context: None,
+            window_minutes: None,
+        })
+    })
+    .await
+    .unwrap();
+
+    drop(client);
+    drop(daemon);
+
+    let (client2, _daemon2) = start_reusing(&dir).await;
+    let client2 = Arc::new(client2);
+    let c = client2.clone();
+    let second = blocking(move || {
+        c.request(&RequestBody {
+            host: "web01".into(),
+            public_key: key,
+            requester: "test".into(),
+            reason: "loop test: id survives a restart, second daemon".into(),
+            context: None,
+            window_minutes: None,
+        })
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        second.id > first.id,
+        "a restart must not reuse an id: first {}, second {}",
+        first.id,
+        second.id
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

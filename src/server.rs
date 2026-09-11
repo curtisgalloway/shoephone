@@ -26,10 +26,11 @@
 //! [`Grants::approve`] when the assertion verifies. A request that changed
 //! underneath the ceremony is rejected there too.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -69,6 +70,28 @@ struct Inner {
     /// because "restart with a writable ledger" is the only way back to a
     /// state where every audited outcome is known to be on disk.
     ledger_failed: Option<String>,
+    /// The id/serial counter as last written to `Store::save_next_id`, so
+    /// `drain_and_append` only writes again when `grants.next_id()` has
+    /// actually moved past it.
+    persisted_next_id: u64,
+    /// Signed certificates already handed out, keyed by window id, so a
+    /// window's silent re-request that `Grants::issue` says to reuse gets
+    /// back the identical certificate string. See the `issue` handler.
+    issued: HashMap<u64, CachedCertificate>,
+}
+
+/// A signed certificate cached under its window's id. `Grants::issue`
+/// tracks that a window's last certificate can be reused, but it has no
+/// signature to hand back; this is where the daemon keeps the one it
+/// already signed so a reuse does not need a fresh signing operation, and
+/// so the caller gets back the exact same certificate string, not merely an
+/// equivalent one.
+#[derive(Debug, Clone)]
+struct CachedCertificate {
+    certificate: String,
+    serial: u64,
+    valid_before: SystemTime,
+    window_ends_at: SystemTime,
 }
 
 struct ApproveCeremony {
@@ -172,7 +195,8 @@ impl Daemon {
                 );
             }
         }
-        let grants = Grants::new(config.policy(), config.principals.clone());
+        let next_id = store.load_next_id()?;
+        let grants = Grants::new(config.policy(), config.principals.clone(), next_id);
         let notifier = config.notify.clone().map(|n| Arc::new(Notifier::new(n)));
         let apns = match config.apns.clone() {
             Some(c) => {
@@ -199,6 +223,8 @@ impl Daemon {
                 approve: None,
                 enroll: None,
                 ledger_failed: None,
+                persisted_next_id: next_id,
+                issued: HashMap::new(),
             }),
         })
     }
@@ -269,18 +295,33 @@ impl Daemon {
         )
     }
 
-    /// Drain this call's ledger events and append them while still holding
-    /// the lock. On failure this logs and sets `ledger_failed`; it does not
-    /// itself decide what the caller does about that.
+    /// Drain this call's ledger events and append them, then persist the
+    /// id/serial counter if it moved, all while still holding the lock. On
+    /// either failure this logs and sets `ledger_failed`; it does not
+    /// itself decide what the caller does about that. The counter is
+    /// checked unconditionally, not only when there were events to append:
+    /// it only ever advances alongside an event (`request` and a fresh
+    /// `issue` each push one when they call `take_id`), so this never does
+    /// avoidable work, but it also never assumes that pairing rather than
+    /// re-deriving it, which is one fewer thing to keep in sync by hand.
     fn drain_and_append(&self, inner: &mut Inner) -> Vec<Event> {
         let events = inner.grants.take_events();
-        if events.is_empty() {
-            return events;
+        if !events.is_empty() {
+            let entries: Vec<LedgerEntry> = events.iter().map(LedgerEntry::from).collect();
+            if let Err(e) = self.store.append_ledger(&entries) {
+                eprintln!("shoephoned: ledger: {e}");
+                inner.ledger_failed = Some(e);
+            }
         }
-        let entries: Vec<LedgerEntry> = events.iter().map(LedgerEntry::from).collect();
-        if let Err(e) = self.store.append_ledger(&entries) {
-            eprintln!("shoephoned: ledger: {e}");
-            inner.ledger_failed = Some(e);
+        let next_id = inner.grants.next_id();
+        if next_id != inner.persisted_next_id {
+            match self.store.save_next_id(next_id) {
+                Ok(()) => inner.persisted_next_id = next_id,
+                Err(e) => {
+                    eprintln!("shoephoned: next_id: {e}");
+                    inner.ledger_failed = Some(e);
+                }
+            }
         }
         events
     }
@@ -540,22 +581,102 @@ async fn issue(State(d): App, Json(body): Json<IssueBody>) -> Reply<IssueReply> 
     let key = ca::canonical_public_key(&body.public_key)
         .map_err(|e| Fail::new(StatusCode::BAD_REQUEST, "bad_key", e.to_string()))?;
     let now = now();
-    let cert = d.audited(|inner| {
-        inner
+    let (window_id, outcome) = d.audited(|inner| {
+        let outcome = inner
             .grants
-            .issue(now, &body.host, &key)
-            .map_err(Fail::from)
+            .issue(now, &body.host, &key, false)
+            .map_err(Fail::from)?;
+        prune_issued_cache(inner, now);
+        let window_id = window_id_for(inner, now, &body.host, &key, &outcome)?;
+        Ok((window_id, outcome))
     })?;
+    let cert = match outcome {
+        grant::Issuance::Fresh(cert) => cert,
+        grant::Issuance::Reuse { .. } => {
+            if let Some(cached) = d.with(|inner| inner.issued.get(&window_id).cloned()) {
+                return Ok(Json(IssueReply {
+                    certificate: cached.certificate,
+                    serial: cached.serial,
+                    valid_before: store::unix(cached.valid_before),
+                    ends_at: store::unix(cached.window_ends_at),
+                }));
+            }
+            // Should not happen: `Grants::issue` said to reuse, but this
+            // daemon has no signed certificate cached for that window
+            // (the cache does not survive a restart, but neither does
+            // `last_issued`, so a fresh process cannot reach this from a
+            // cold cache; a defensive fallback anyway, not the expected
+            // path). Force a fresh certificate rather than fail the call.
+            d.audited(
+                |inner| match inner.grants.issue(now, &body.host, &key, true) {
+                    Ok(grant::Issuance::Fresh(cert)) => Ok(cert),
+                    Ok(grant::Issuance::Reuse { .. }) => {
+                        Err(Fail::internal("force_fresh unexpectedly returned a reuse"))
+                    }
+                    Err(e) => Err(Fail::from(e)),
+                },
+            )?
+        }
+    };
     let signed =
         d.ca.sign(&cert, &body.host)
             .and_then(|c| c.to_openssh().map_err(ca::Error::from))
             .map_err(|e| Fail::internal(e.to_string()))?;
+    d.with(|inner| {
+        inner.issued.insert(
+            window_id,
+            CachedCertificate {
+                certificate: signed.clone(),
+                serial: cert.serial,
+                valid_before: cert.valid_before,
+                window_ends_at: cert.window_ends_at,
+            },
+        );
+    });
     Ok(Json(IssueReply {
         certificate: signed,
         serial: cert.serial,
         valid_before: store::unix(cert.valid_before),
         ends_at: store::unix(cert.window_ends_at),
     }))
+}
+
+/// The id of the window a [`grant::Issuance`] belongs to, needed to key the
+/// certificate cache. `Reuse` already carries it; for `Fresh` it is
+/// whichever window matches the certificate's host, key and
+/// `window_ends_at` -- the same selection `Grants::issue` used internally
+/// to mint it -- found here while still holding the lock the certificate
+/// was minted under.
+fn window_id_for(
+    inner: &mut Inner,
+    now: SystemTime,
+    host: &str,
+    public_key: &str,
+    outcome: &grant::Issuance,
+) -> Result<u64, Fail> {
+    match outcome {
+        grant::Issuance::Reuse { window_id, .. } => Ok(*window_id),
+        grant::Issuance::Fresh(cert) => inner
+            .grants
+            .windows(now)
+            .iter()
+            .find(|w| {
+                w.scope.host == host
+                    && w.scope.public_key == public_key
+                    && w.scope.ends_at == cert.window_ends_at
+            })
+            .map(|w| w.id)
+            .ok_or_else(|| Fail::internal("issued certificate has no matching window")),
+    }
+}
+
+/// Drop cached certificates for windows that have since closed, so the
+/// cache does not grow across a long-running daemon's lifetime. Run once
+/// per `issue` call instead of on a timer: it costs nothing when the window
+/// count is small, and needs no extra background task.
+fn prune_issued_cache(inner: &mut Inner, now: SystemTime) {
+    let live: HashSet<u64> = inner.grants.windows(now).iter().map(|w| w.id).collect();
+    inner.issued.retain(|id, _| live.contains(id));
 }
 
 async fn kill(State(d): App, Json(body): Json<KillBody>) -> Reply<serde_json::Value> {
@@ -762,6 +883,11 @@ async fn enroll_start(
     })
 }
 
+/// Finish enrollment. Transactional: the new device is written to disk
+/// before it is added to `inner.devices`, and the enrollment code is only
+/// consumed after that write succeeds, so a failure partway through cannot
+/// leave a live device the disk does not know about, nor a consumed code
+/// that is still valid with nothing enrolled to show for it.
 async fn enroll_finish(
     State(d): App,
     Json(body): Json<EnrollFinish<RegisterPublicKeyCredential>>,
@@ -803,7 +929,20 @@ async fn enroll_finish(
         let mut secret_bytes = [0u8; 32];
         ca::OsEntropy.fill(&mut secret_bytes);
         let secret: String = secret_bytes.iter().map(|b| format!("{b:02x}")).collect();
-        inner.devices.push(Device {
+        // Build the new device list and write it before touching
+        // `inner.devices`, and only consume the enrollment code once that
+        // write has landed. A failed write here must leave neither a live
+        // device the disk does not know about (if `inner.devices` were
+        // updated first and the save then failed, the device would work
+        // for the rest of this process's life but vanish on restart) nor a
+        // consumed code that is still valid (if the code were cleared
+        // before the save and the save then failed, the enrollment would
+        // be unrecoverable without minting a new code). If the code fails
+        // to clear after a successful save, the device is already durable,
+        // so this rolls the device list back rather than leave a device
+        // enrolled with no way to tell the operator it did not fully land.
+        let mut devices = inner.devices.clone();
+        devices.push(Device {
             name: ceremony.device_name.clone(),
             enrolled_at: store::unix(now),
             key,
@@ -811,10 +950,16 @@ async fn enroll_finish(
             push_kinds: None,
             push_secret_sha256: Some(store::sha256_hex(&secret)),
         });
-        d.store
-            .save_devices(&inner.devices)
-            .map_err(Fail::internal)?;
-        d.store.clear_enroll_code().map_err(Fail::internal)?;
+        d.store.save_devices(&devices).map_err(Fail::internal)?;
+        if let Err(e) = d.store.clear_enroll_code() {
+            if let Err(rollback) = d.store.save_devices(&inner.devices) {
+                eprintln!(
+                    "shoephoned: enroll: failed to clear the code ({e}), and failed to roll back the device list ({rollback}); the state directory now disagrees with `inner.devices` until the next successful save"
+                );
+            }
+            return Err(Fail::internal(e));
+        }
+        inner.devices = devices;
         eprintln!("shoephoned: enrolled device {:?}", ceremony.device_name);
         Ok(Json(serde_json::json!({
             "enrolled": ceremony.device_name,
@@ -933,8 +1078,12 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-async fn ledger(State(d): App) -> Reply<Vec<LedgerEntry>> {
-    d.store.read_ledger(50).map(Json).map_err(Fail::internal)
+async fn ledger(State(d): App, Query(q): Query<LedgerQuery>) -> Reply<Vec<LedgerEntry>> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    d.store
+        .read_ledger(q.before, limit)
+        .map(Json)
+        .map_err(Fail::internal)
 }
 
 /// Test hook: approve the pending request with no ceremony at all. Only

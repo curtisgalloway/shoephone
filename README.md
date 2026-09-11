@@ -58,6 +58,12 @@ is ordinary service setup.
 - `rp_origin` is the exact https origin the phone loads, and `rp_id` is
   its hostname. A mismatch fails every enrollment and approval.
 
+Clocks matter as much as any of that: the daemon and every host it signs
+for must keep their clocks synchronized (NTP is enough). Certificates
+carry absolute validity times, so a host whose clock runs behind accepts a
+certificate for longer than the approved window said, and one whose clock
+runs ahead rejects it early.
+
 ### 1. Build and install
 
 ```bash

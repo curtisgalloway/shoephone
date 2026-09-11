@@ -165,6 +165,19 @@ pub struct Window {
     pub id: u64,
     pub scope: Scope,
     pub started: SystemTime,
+    /// The certificate last handed out for this window, if any. A
+    /// re-request soon after gets this one back instead of a fresh serial;
+    /// see [`Grants::issue`].
+    pub last_issued: Option<LastIssued>,
+}
+
+/// The certificate `Grants::issue` most recently minted for a window, kept
+/// so a re-request can be told to reuse it instead of minting again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LastIssued {
+    pub serial: u64,
+    pub valid_after: SystemTime,
+    pub valid_before: SystemTime,
 }
 
 /// A signing request for the CA. Nothing here is chosen by the requester
@@ -178,6 +191,22 @@ pub struct Certificate {
     pub valid_before: SystemTime,
     /// When the window this certificate was issued from closes.
     pub window_ends_at: SystemTime,
+}
+
+/// What [`Grants::issue`] handed back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Issuance {
+    /// A certificate minted by this call.
+    Fresh(Certificate),
+    /// The window already has a certificate more than half its own TTL from
+    /// expiring; re-serve it rather than minting (and logging) a new one.
+    /// No [`Event`] is pushed for a reuse.
+    Reuse {
+        window_id: u64,
+        serial: u64,
+        valid_before: SystemTime,
+        window_ends_at: SystemTime,
+    },
 }
 
 /// Why a call did nothing. None of these leak anything the requester does
@@ -297,25 +326,43 @@ pub struct Grants {
     /// Consecutive requests that ended without approval.
     strikes: u32,
     events: Vec<Event>,
+    /// The latest `now` this instance has ever been ticked with. Every
+    /// public method clamps its `now` argument up to this before doing
+    /// anything else, so a clock that steps backward cannot hand out a
+    /// certificate whose `valid_after` precedes one already issued, or
+    /// resurrect a window or cooldown that already lapsed. See
+    /// [`Grants::tick`].
+    high_water: SystemTime,
 }
 
 impl Grants {
-    pub fn new(policy: Policy, principals: BTreeMap<String, String>) -> Self {
+    /// `next_id` seeds the id/serial counter; the daemon persists it across
+    /// restarts (see `Store::load_next_id`) so an id or serial is never
+    /// reused, which matters because both appear in the audit ledger.
+    pub fn new(policy: Policy, principals: BTreeMap<String, String>, next_id: u64) -> Self {
         Self {
             policy,
             principals,
-            next_id: 1,
+            next_id,
             pending: None,
             windows: Vec::new(),
             accepted: VecDeque::new(),
             cooldown_until: None,
             strikes: 0,
             events: Vec::new(),
+            high_water: UNIX_EPOCH,
         }
     }
 
     pub fn policy(&self) -> &Policy {
         &self.policy
+    }
+
+    /// The next id [`Grants::request`] or [`Grants::issue`] will hand out.
+    /// The daemon persists this after it changes, so a restart does not
+    /// reuse an id or serial already written to the ledger.
+    pub fn next_id(&self) -> u64 {
+        self.next_id
     }
 
     /// File a request. On success the returned [`Pending`] carries the
@@ -335,7 +382,7 @@ impl Grants {
         context: Option<&str>,
         wanted: Option<Duration>,
     ) -> Result<Pending, Refusal> {
-        self.tick(now);
+        let now = self.tick(now);
         let reason = printable(reason.trim(), 200);
         if reason.is_empty() {
             return Err(Refusal::NoReason);
@@ -411,7 +458,7 @@ impl Grants {
     /// already been checked by the caller; this checks that what was signed
     /// is what is pending.
     pub fn approve(&mut self, now: SystemTime, approval: &Approval) -> Result<Window, Refusal> {
-        self.tick(now);
+        let now = self.tick(now);
         let pending = self
             .pending
             .as_ref()
@@ -428,6 +475,7 @@ impl Grants {
             id: pending.id,
             scope: pending.scope,
             started: now,
+            last_issued: None,
         };
         self.strikes = 0;
         self.cooldown_until = None;
@@ -443,7 +491,7 @@ impl Grants {
 
     /// Decline the pending request. Nothing is issued and a cooldown starts.
     pub fn decline(&mut self, now: SystemTime, id: u64) -> Result<(), Refusal> {
-        self.tick(now);
+        let now = self.tick(now);
         let pending = self
             .pending
             .take_if(|p| p.id == id)
@@ -459,44 +507,74 @@ impl Grants {
 
     /// Issue a certificate inside an open window. Called on the first grant
     /// and on every silent re-request; the CLI never sees a difference.
+    ///
+    /// A re-request less than half a certificate's TTL after the last one
+    /// minted for this window, while that certificate still has time left,
+    /// gets the same certificate back ([`Issuance::Reuse`]) instead of a
+    /// fresh serial: the daemon calls this once per `issue` HTTP request,
+    /// and a client that polls or renews slightly early must not cause a
+    /// new certificate to be minted, signed, and logged for work that never
+    /// used the old one. `force_fresh` exists for the daemon's own
+    /// cache-miss fallback: if it ever holds a `Reuse` answer with no
+    /// signed certificate to go with it, it calls this again with
+    /// `force_fresh` set so a certificate always comes back.
     pub fn issue(
         &mut self,
         now: SystemTime,
         host: &str,
         public_key: &str,
-    ) -> Result<Certificate, Refusal> {
-        self.tick(now);
+        force_fresh: bool,
+    ) -> Result<Issuance, Refusal> {
+        let now = self.tick(now);
         let public_key = public_key.trim();
         // Select on host and key together. Two windows can be open for one
         // host (a second request is allowed while a window is open, and a
         // new window is a new approval), and picking by host alone would
         // refuse a key that was legitimately approved for the other one.
-        let mut for_host = self
-            .windows
-            .iter()
-            .filter(|w| w.scope.host == host)
-            .peekable();
-        if for_host.peek().is_none() {
+        if !self.windows.iter().any(|w| w.scope.host == host) {
             return Err(Refusal::NoWindow);
         }
-        let window = for_host
-            .filter(|w| w.scope.public_key == public_key)
-            .max_by_key(|w| w.scope.ends_at)
+        let idx = self
+            .windows
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| w.scope.host == host && w.scope.public_key == public_key)
+            .max_by_key(|(_, w)| w.scope.ends_at)
+            .map(|(i, _)| i)
             .ok_or(Refusal::KeyMismatch)?;
-        let valid_before = (now + self.policy.cert_ttl).min(window.scope.ends_at);
+        let window = &self.windows[idx];
         let window_id = window.id;
+        let window_ends_at = window.scope.ends_at;
+        let half_ttl = self.policy.cert_ttl / 2;
+        if let Some(last) = window.last_issued.filter(|last| {
+            !force_fresh && now < last.valid_after + half_ttl && last.valid_before > now
+        }) {
+            return Ok(Issuance::Reuse {
+                window_id,
+                serial: last.serial,
+                valid_before: last.valid_before,
+                window_ends_at,
+            });
+        }
+        let principal = window.scope.principal.clone();
+        let public_key = window.scope.public_key.clone();
+        // `window`'s borrow of `self.windows` ends with the clone above;
+        // `take_id` needs `&mut self`.
+        let valid_before = (now + self.policy.cert_ttl).min(window_ends_at);
+        let serial = self.take_id();
         let cert = Certificate {
-            serial: 0,
-            principal: window.scope.principal.clone(),
-            public_key: window.scope.public_key.clone(),
+            serial,
+            principal,
+            public_key,
             valid_after: now,
             valid_before,
-            window_ends_at: window.scope.ends_at,
+            window_ends_at,
         };
-        let cert = Certificate {
-            serial: self.take_id(),
-            ..cert
-        };
+        self.windows[idx].last_issued = Some(LastIssued {
+            serial: cert.serial,
+            valid_after: cert.valid_after,
+            valid_before: cert.valid_before,
+        });
         self.events.push(Event::Issued {
             id: window_id,
             serial: cert.serial,
@@ -504,7 +582,7 @@ impl Grants {
             valid_before,
             at: now,
         });
-        Ok(cert)
+        Ok(Issuance::Fresh(cert))
     }
 
     /// The kill switch: close every window for a host. Certificates already
@@ -514,7 +592,7 @@ impl Grants {
     /// usual cooldown: kill means "stop", and a tap on the phone a moment
     /// later must not reopen what was just closed.
     pub fn kill(&mut self, now: SystemTime, host: &str) -> Result<(), Refusal> {
-        self.tick(now);
+        let now = self.tick(now);
         let (closed, kept): (Vec<Window>, Vec<Window>) =
             self.windows.drain(..).partition(|w| w.scope.host == host);
         self.windows = kept;
@@ -570,26 +648,51 @@ impl Grants {
     }
 
     fn strike(&mut self, now: SystemTime, outcome: Outcome) {
+        self.strike_at(now, outcome);
+    }
+
+    /// Record a strike as of `at` and start the cooldown counting from
+    /// there. `decline` and `kill` pass `now`, since the person's verdict
+    /// (or the kill) happened right then; a timeout passes the moment the
+    /// pending request actually expired, which is earlier than `now` when
+    /// nothing polled the daemon between expiry and this tick. See
+    /// [`Grants::tick`].
+    fn strike_at(&mut self, at: SystemTime, outcome: Outcome) {
         self.strikes = self.strikes.saturating_add(1);
-        self.cooldown_until = Some(now + self.cooldown_after(outcome));
+        self.cooldown_until = Some(at + self.cooldown_after(outcome));
     }
 
     /// Advance time: expire the pending request, drop closed windows, and
-    /// forget accepted requests older than an hour.
-    fn tick(&mut self, now: SystemTime) {
+    /// forget accepted requests older than an hour. Returns `now` clamped to
+    /// never run behind the latest time this instance has already seen
+    /// (`self.high_water`), which every public method uses for everything
+    /// that follows, so a clock that steps backward cannot hand out a
+    /// certificate whose `valid_after` precedes one already issued, or
+    /// resurrect a window or cooldown that already lapsed.
+    ///
+    /// A pending request that has expired is timed out as of the moment it
+    /// actually expired (`p.created + ttl`), not as of `now`: the cooldown
+    /// that follows a timeout must count from when the person's window to
+    /// answer actually closed, not from whenever some later call happened
+    /// to notice.
+    fn tick(&mut self, now: SystemTime) -> SystemTime {
+        let now = now.max(self.high_water);
+        self.high_water = now;
         let ttl = self.policy.pending_ttl;
         if let Some(p) = self.pending.take_if(|p| p.created + ttl <= now) {
+            let expired_at = p.created + ttl;
             self.events.push(Event::TimedOut {
                 id: p.id,
                 host: p.scope.host,
-                at: now,
+                at: expired_at,
             });
-            self.strike(now, Outcome::TimedOut);
+            self.strike_at(expired_at, Outcome::TimedOut);
         }
         self.windows.retain(|w| w.scope.ends_at > now);
         while self.accepted.front().is_some_and(|t| *t + HOUR <= now) {
             self.accepted.pop_front();
         }
+        now
     }
 
     fn take_id(&mut self) -> u64 {
@@ -671,7 +774,7 @@ mod tests {
         let mut principals = BTreeMap::new();
         principals.insert("web01".to_owned(), "agent-admin:web01".to_owned());
         principals.insert("db01".to_owned(), "agent-admin:db01".to_owned());
-        Grants::new(Policy::default(), principals)
+        Grants::new(Policy::default(), principals, 1)
     }
 
     fn approval_for(p: &Pending) -> Approval {
@@ -867,27 +970,41 @@ mod tests {
         assert_eq!(g.windows(t(2)).len(), 1);
     }
 
+    /// Unwrap an [`Issuance`] this test expects to be fresh; panics with the
+    /// actual value otherwise, which is more useful than a bare `unwrap`.
+    fn fresh(i: Issuance) -> Certificate {
+        match i {
+            Issuance::Fresh(c) => c,
+            other => panic!("expected a fresh certificate, got {other:?}"),
+        }
+    }
+
     #[test]
     fn certificates_go_only_to_the_approved_key_and_never_outlive_the_window() {
         let mut g = grants();
         let w = approved(&mut g, t(0));
 
-        assert_eq!(g.issue(t(1), "web01", OTHER_KEY), Err(Refusal::KeyMismatch));
-        assert_eq!(g.issue(t(1), "db01", KEY), Err(Refusal::NoWindow));
+        assert_eq!(
+            g.issue(t(1), "web01", OTHER_KEY, false),
+            Err(Refusal::KeyMismatch)
+        );
+        assert_eq!(g.issue(t(1), "db01", KEY, false), Err(Refusal::NoWindow));
 
-        let c = g.issue(t(60), "web01", KEY).unwrap();
+        let c = fresh(g.issue(t(60), "web01", KEY, false).unwrap());
         assert_eq!(c.principal, "agent-admin:web01");
         assert_eq!(c.public_key, KEY);
         assert_eq!(c.valid_after, t(60));
         assert_eq!(c.valid_before, t(60) + 15 * MIN);
 
+        // Past half the certificate's TTL and still short of the window's
+        // end, a re-request mints again rather than reusing.
         let near_end = w.scope.ends_at - 5 * MIN;
-        let c2 = g.issue(near_end, "web01", KEY).unwrap();
+        let c2 = fresh(g.issue(near_end, "web01", KEY, false).unwrap());
         assert_eq!(c2.valid_before, w.scope.ends_at, "clipped to the window");
         assert!(c2.serial > c.serial);
 
         assert_eq!(
-            g.issue(w.scope.ends_at, "web01", KEY),
+            g.issue(w.scope.ends_at, "web01", KEY, false),
             Err(Refusal::NoWindow),
             "the window is closed at its end, inclusive"
         );
@@ -913,17 +1030,96 @@ mod tests {
         let w2 = g.approve(later, &approval_for(&p)).unwrap();
         assert!(w2.scope.ends_at > w1.scope.ends_at);
 
-        let c1 = g.issue(t(1200), "web01", KEY).unwrap();
+        let c1 = fresh(g.issue(t(1200), "web01", KEY, false).unwrap());
         assert_eq!(
             c1.window_ends_at, w1.scope.ends_at,
             "the first key's own window"
         );
-        let c2 = g.issue(t(1200), "web01", OTHER_KEY).unwrap();
+        let c2 = fresh(g.issue(t(1200), "web01", OTHER_KEY, false).unwrap());
         assert_eq!(c2.window_ends_at, w2.scope.ends_at);
         let third =
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIThirdThirdThirdThirdThirdThirdThirdThirdThi x";
-        assert_eq!(g.issue(t(1200), "web01", third), Err(Refusal::KeyMismatch));
-        assert_eq!(g.issue(t(1200), "db01", KEY), Err(Refusal::NoWindow));
+        assert_eq!(
+            g.issue(t(1200), "web01", third, false),
+            Err(Refusal::KeyMismatch)
+        );
+        assert_eq!(g.issue(t(1200), "db01", KEY, false), Err(Refusal::NoWindow));
+    }
+
+    #[test]
+    fn repeated_issuance_inside_a_window_re_serves_the_last_certificate() {
+        let mut g = grants();
+        approved(&mut g, t(0));
+
+        let first = fresh(g.issue(t(1), "web01", KEY, false).unwrap());
+
+        match g.issue(t(2), "web01", KEY, false).unwrap() {
+            Issuance::Reuse { serial, .. } => assert_eq!(
+                serial, first.serial,
+                "a re-request a second later gets the same certificate back"
+            ),
+            other @ Issuance::Fresh(_) => {
+                panic!("a re-request a second later must reuse, got {other:?}")
+            }
+        }
+
+        // `force_fresh` always mints, even while a reuse would otherwise
+        // apply: it exists for the daemon's cache-miss fallback, and a
+        // fallback that could itself return a reuse would defeat the point.
+        let forced = fresh(g.issue(t(2), "web01", KEY, true).unwrap());
+        assert!(forced.serial > first.serial, "force_fresh always mints");
+
+        // Past half the certificate TTL from the certificate actually on
+        // file (`forced`, since it replaced `first` in the window's
+        // `last_issued`), a plain re-request mints again rather than
+        // reusing.
+        let half_ttl = Policy::default().cert_ttl / 2;
+        let later = t(2) + half_ttl + Duration::from_secs(1);
+        match g.issue(later, "web01", KEY, false).unwrap() {
+            Issuance::Fresh(c) => assert!(
+                c.serial > forced.serial,
+                "past half the TTL a fresh certificate is minted"
+            ),
+            other @ Issuance::Reuse { .. } => {
+                panic!("past half the TTL this must be fresh, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn time_never_runs_backward_inside_grants() {
+        let mut g = grants();
+        // A 60-minute window opened at t(1000) ends at t(4600).
+        let w = approved(&mut g, t(1000));
+
+        let first = fresh(g.issue(t(2000), "web01", KEY, true).unwrap());
+        assert_eq!(first.valid_after, t(2000));
+
+        // The clock steps backward; `force_fresh` still mints, but the
+        // certificate's `valid_after` must not move behind t(2000), the
+        // latest time this `Grants` has already seen.
+        let stepped_back = fresh(g.issue(t(500), "web01", KEY, true).unwrap());
+        assert_eq!(
+            stepped_back.valid_after,
+            t(2000),
+            "time must not run backward"
+        );
+        assert!(stepped_back.serial > first.serial);
+
+        // Advance past the window's end (t(4600)); it closes for good.
+        assert_eq!(
+            g.issue(t(5000), "web01", KEY, true),
+            Err(Refusal::NoWindow),
+            "the window has expired"
+        );
+        assert!(w.scope.ends_at < t(5000));
+
+        // A clock that steps backward again must not resurrect it.
+        assert_eq!(
+            g.issue(t(4000), "web01", KEY, true),
+            Err(Refusal::NoWindow),
+            "an expired window must stay expired even if the clock steps back"
+        );
     }
 
     #[test]
@@ -988,7 +1184,7 @@ mod tests {
         approved(&mut g, t(0));
         assert_eq!(g.kill(t(1), "db01"), Err(Refusal::NoWindow));
         g.kill(t(1), "web01").unwrap();
-        assert_eq!(g.issue(t(2), "web01", KEY), Err(Refusal::NoWindow));
+        assert_eq!(g.issue(t(2), "web01", KEY, false), Err(Refusal::NoWindow));
         assert!(g.windows(t(2)).is_empty());
     }
 
@@ -1016,6 +1212,77 @@ mod tests {
         );
         let events = g.take_events();
         assert!(matches!(events.last(), Some(Event::TimedOut { id, .. }) if *id == p.id));
+    }
+
+    #[test]
+    fn timeout_cooldown_counts_from_the_requests_expiry_not_from_discovery() {
+        let ttl = Policy::default().pending_ttl;
+        let base_cooldown = Policy::default().base_cooldown;
+        let created = t(0);
+
+        // Nothing ever polled this `Grants` between the request expiring
+        // and this later call, but the cooldown it started must still be
+        // measured from the expiry, not from now: by this point it has
+        // already run out, and the request is accepted.
+        let mut g = grants();
+        g.request(
+            created,
+            &mut Counter(0),
+            "web01",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+            None,
+        )
+        .unwrap();
+        let late = created + ttl + base_cooldown + Duration::from_secs(1);
+        let r = g.request(
+            late,
+            &mut Counter(0),
+            "web01",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+            None,
+        );
+        assert!(
+            r.is_ok(),
+            "a cooldown counted from expiry has already run out: {r:?}"
+        );
+
+        // Just after the request expired, its cooldown is still running,
+        // and it ends at expiry plus the base cooldown.
+        let mut g = grants();
+        g.request(
+            created,
+            &mut Counter(0),
+            "web01",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+            None,
+        )
+        .unwrap();
+        let just_after_expiry = created + ttl + Duration::from_secs(1);
+        let r = g.request(
+            just_after_expiry,
+            &mut Counter(0),
+            "web01",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+            None,
+        );
+        assert_eq!(
+            r,
+            Err(Refusal::Cooldown {
+                until: created + ttl + base_cooldown
+            })
+        );
     }
 
     #[test]
@@ -1198,7 +1465,7 @@ mod tests {
             .unwrap();
         g.decline(t(1), p.id).unwrap();
         let w = approved(&mut g, t(600));
-        g.issue(t(601), "web01", KEY).unwrap();
+        g.issue(t(601), "web01", KEY, false).unwrap();
         g.kill(t(602), "web01").unwrap();
         let kinds: Vec<&str> = g
             .take_events()

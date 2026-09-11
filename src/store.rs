@@ -6,8 +6,9 @@
 //! Windows, nonces and counters deliberately do not persist; a restart
 //! fails closed and acts as a soft kill switch.
 
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -60,6 +61,12 @@ impl EnrollCode {
 /// so the file is greppable and stable across versions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LedgerEntry {
+    /// The entry's 1-based line number in the ledger file. Set only by
+    /// [`Store::read_ledger`], never written: an entry appended fresh does
+    /// not know its own line number, and a client pages backward through
+    /// history using the value it read back, not one it made up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     pub at: u64,
     pub kind: String,
     pub host: String,
@@ -106,6 +113,7 @@ impl From<&Event> for LedgerEntry {
             Event::Killed { id, host, at } => ("killed", host, at, Some(*id), None, None),
         };
         LedgerEntry {
+            seq: None,
             at: unix(*at),
             kind: kind.to_owned(),
             host: host.clone(),
@@ -146,6 +154,30 @@ impl Store {
 
     fn ledger_path(&self) -> PathBuf {
         self.dir.join("ledger.jsonl")
+    }
+
+    fn next_id_path(&self) -> PathBuf {
+        self.dir.join("next_id")
+    }
+
+    /// The persisted id/serial counter, so a restart does not reuse an id
+    /// or serial already written to the ledger. `1` when the file is
+    /// absent: a fresh state directory, or an upgrade from before this file
+    /// existed, both start the count over from the beginning.
+    pub fn load_next_id(&self) -> Result<u64, String> {
+        let path = self.next_id_path();
+        match fs::read_to_string(&path) {
+            Ok(text) => text
+                .trim()
+                .parse()
+                .map_err(|e| format!("parsing {}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(1),
+            Err(e) => Err(format!("reading {}: {e}", path.display())),
+        }
+    }
+
+    pub fn save_next_id(&self, next_id: u64) -> Result<(), String> {
+        write_atomic(&self.next_id_path(), next_id.to_string().as_bytes())
     }
 
     pub fn load_devices(&self) -> Result<Vec<Device>, String> {
@@ -217,20 +249,56 @@ impl Store {
             .map_err(|e| format!("syncing {}: {e}", path.display()))
     }
 
-    /// The most recent `limit` ledger lines, newest last.
-    pub fn read_ledger(&self, limit: usize) -> Result<Vec<LedgerEntry>, String> {
+    /// Up to `limit` entries with `seq` (the entry's 1-based line number in
+    /// the file) less than `before`, or every entry when `before` is
+    /// `None`, returned oldest first. A client pages backward through
+    /// history by calling with no parameters for the newest page, then
+    /// repeating with `before` set to the smallest `seq` it received, until
+    /// an empty page comes back; see `GET /api/ledger` in `api.rs`.
+    ///
+    /// Streams the file line by line rather than reading it whole, so
+    /// memory stays bounded by `limit` no matter how large the ledger has
+    /// grown. A line that fails to parse is skipped, with the line number
+    /// logged, rather than failing the whole read: a line torn by a crash
+    /// mid-write must not take the rest of the history down with it.
+    pub fn read_ledger(
+        &self,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<LedgerEntry>, String> {
         let path = self.ledger_path();
-        let text = match fs::read_to_string(&path) {
-            Ok(t) => t,
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(format!("reading {}: {e}", path.display())),
+            Err(e) => return Err(format!("opening {}: {e}", path.display())),
         };
-        let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        let start = lines.len().saturating_sub(limit);
-        lines[start..]
-            .iter()
-            .map(|l| serde_json::from_str(l).map_err(|e| format!("ledger line: {e}")))
-            .collect()
+        let mut window: VecDeque<LedgerEntry> = VecDeque::new();
+        for (i, line) in BufReader::new(file).lines().enumerate() {
+            let seq = (i + 1) as u64;
+            let line = line.map_err(|e| format!("reading {}: {e}", path.display()))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            if before.is_some_and(|before| seq >= before) {
+                continue;
+            }
+            let mut entry: LedgerEntry = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!(
+                        "shoephoned: ledger: skipping unparsable line {seq} in {}: {e}",
+                        path.display()
+                    );
+                    continue;
+                }
+            };
+            entry.seq = Some(seq);
+            window.push_back(entry);
+            if window.len() > limit {
+                window.pop_front();
+            }
+        }
+        Ok(window.into_iter().collect())
     }
 }
 
@@ -274,7 +342,7 @@ mod tests {
     fn ledger_appends_and_reads_back_the_tail() {
         let dir = tmp("ledger");
         let store = Store::new(&dir);
-        assert!(store.read_ledger(10).unwrap().is_empty());
+        assert!(store.read_ledger(None, 10).unwrap().is_empty());
         let t0 = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let events = [
             Event::Requested {
@@ -300,11 +368,68 @@ mod tests {
         ];
         let entries: Vec<LedgerEntry> = events.iter().map(LedgerEntry::from).collect();
         store.append_ledger(&entries).unwrap();
-        let tail = store.read_ledger(2).unwrap();
+        let tail = store.read_ledger(None, 2).unwrap();
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].kind, "approved");
+        assert_eq!(tail[0].seq, Some(2), "seq is the 1-based line number");
         assert_eq!(tail[0].until, Some(1_800_003_600));
         assert_eq!(tail[1].serial, Some(2));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn read_ledger_pages_backward_and_skips_a_garbage_line() {
+        let dir = tmp("ledger-paging");
+        let store = Store::new(&dir);
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let entries: Vec<LedgerEntry> = (1..=7u64)
+            .map(|id| {
+                LedgerEntry::from(&Event::Requested {
+                    id,
+                    host: "web01".into(),
+                    reason: format!("entry {id}"),
+                    context: None,
+                    at: t0 + Duration::from_secs(id),
+                })
+            })
+            .collect();
+        store.append_ledger(&entries).unwrap();
+
+        let seqs = |v: &[LedgerEntry]| -> Vec<u64> { v.iter().map(|e| e.seq.unwrap()).collect() };
+
+        assert_eq!(seqs(&store.read_ledger(None, 3).unwrap()), [5, 6, 7]);
+        assert_eq!(seqs(&store.read_ledger(Some(5), 3).unwrap()), [2, 3, 4]);
+        assert_eq!(seqs(&store.read_ledger(Some(2), 3).unwrap()), [1]);
+        assert!(store.read_ledger(Some(1), 3).unwrap().is_empty());
+
+        // Corrupt line 4 in place, keeping every other line (and so every
+        // other line's seq) exactly where it was.
+        let path = dir.join("ledger.jsonl");
+        let text = fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines[3] = "{ not json";
+        fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let all = store.read_ledger(None, 10).unwrap();
+        assert_eq!(
+            seqs(&all),
+            [1, 2, 3, 5, 6, 7],
+            "the garbage line is skipped, not fatal, and does not renumber its neighbors"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn next_id_round_trips_and_defaults_to_one() {
+        let dir = tmp("next-id");
+        let store = Store::new(&dir);
+        assert_eq!(
+            store.load_next_id().unwrap(),
+            1,
+            "absent file defaults to 1"
+        );
+        store.save_next_id(42).unwrap();
+        assert_eq!(store.load_next_id().unwrap(), 42);
         fs::remove_dir_all(&dir).unwrap();
     }
 

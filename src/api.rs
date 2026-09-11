@@ -95,6 +95,20 @@ pub struct WindowView {
     pub fingerprint: String,
 }
 
+/// `GET /api/ledger` query parameters.
+///
+/// A client pages backward through history: call with no parameters for
+/// the newest page, then repeat the call with `before` set to the smallest
+/// `seq` it received in the previous page, until an empty page comes back.
+/// `limit` defaults to 50 and is clamped to the range 1..=500.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LedgerQuery {
+    /// Return only entries with `seq` less than this.
+    pub before: Option<u64>,
+    /// At most this many entries.
+    pub limit: Option<usize>,
+}
+
 /// Every error body. `code` is the machine-readable name; `until` is set
 /// for cooldowns and the rate cap.
 #[derive(Debug, Clone, Serialize, Deserialize)]
