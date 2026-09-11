@@ -107,5 +107,14 @@ was empty. `request` and `renew` return
 - Run `shoephone doctor` first in a fresh environment. It reports the
   daemon, the enrolled approver devices, the hosts the daemon signs for,
   and whether ssh-agent is reachable, and exits 3 if anything is missing.
+- If the machine's ssh-agent refuses keys it did not create (the
+  1Password agent does; the symptom is exit 10 with "agent refused
+  operation" on every request), put `agent = false` in
+  `~/.config/shoephone/config.toml`. The CLI then skips ssh-agent, exits
+  0, and leaves the certificate beside the session key as
+  `session_ed25519-cert.pub`, where ssh finds it on its own given a
+  `Match user <account>` stanza in `~/.ssh/config` that sets
+  `IdentityFile` to the session key, `IdentitiesOnly yes` and
+  `IdentityAgent none`. Then `ssh <account>@<host>` needs no `-i`.
 - The match code the tool prints is for the person at the terminal to
   compare against their phone. Show it to them; never paraphrase it.

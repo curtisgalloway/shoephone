@@ -77,8 +77,20 @@ fn parse(args: &[String]) -> Result<Opts, String> {
     Ok(opts)
 }
 
-/// `--daemon`, else `$SHOEPHONE_DAEMON`, else `daemon = "..."` in
-/// `$XDG_CONFIG_HOME/shoephone/config.toml` (default `~/.config`).
+/// `$XDG_CONFIG_HOME/shoephone/config.toml` (default `~/.config`), parsed;
+/// `None` when it is absent or unreadable.
+fn config_file() -> Option<toml::Table> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+        })?;
+    let text = std::fs::read_to_string(base.join("shoephone/config.toml")).ok()?;
+    text.parse().ok()
+}
+
+/// `--daemon`, else `$SHOEPHONE_DAEMON`, else `daemon = "..."` in the
+/// config file.
 fn daemon_url(opts: &Opts) -> Option<String> {
     if let Some(d) = &opts.daemon {
         return Some(d.clone());
@@ -88,14 +100,17 @@ fn daemon_url(opts: &Opts) -> Option<String> {
     {
         return Some(d);
     }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
-        })?;
-    let text = std::fs::read_to_string(base.join("shoephone/config.toml")).ok()?;
-    let table: toml::Table = text.parse().ok()?;
-    table.get("daemon")?.as_str().map(str::to_owned)
+    config_file()?.get("daemon")?.as_str().map(str::to_owned)
+}
+
+/// `agent = false` in the config file turns off ssh-agent entirely: the
+/// certificate is only written beside the session key, where ssh finds it
+/// through an `IdentityFile` line. For machines whose agent refuses keys
+/// it did not create (the 1Password agent does). Default true.
+fn use_agent() -> bool {
+    config_file()
+        .and_then(|t| t.get("agent")?.as_bool())
+        .unwrap_or(true)
 }
 
 fn run(args: &[String]) -> Status {
@@ -257,9 +272,16 @@ fn doctor(opts: &Opts) -> Status {
             Err(e) => problems.push(e.to_string()),
         }
     }
-    match Session::agent_reachable() {
-        Ok(()) => notes.push("ssh-agent reachable".into()),
-        Err(e) => problems.push(e),
+    if use_agent() {
+        match Session::agent_reachable() {
+            Ok(()) => notes.push("ssh-agent reachable".into()),
+            Err(e) => problems.push(e),
+        }
+    } else {
+        notes.push(
+            "ssh-agent not used (agent = false); ssh reads the certificate beside the session key"
+                .into(),
+        );
     }
     match Session::default_dir() {
         Ok(dir) => match Session::new(dir.clone()).public_key() {
@@ -461,19 +483,32 @@ fn load(
     };
     // Unload the previous certificate first; a second ssh-add would leave it
     // in the agent as a separate identity until it expired.
-    session.remove_from_agent();
+    let agent_wanted = use_agent();
+    if agent_wanted {
+        session.remove_from_agent();
+    }
     if let Err(e) = session.write_certificate(&issued.certificate) {
         eprintln!("shoephone: {e}");
         return Status::Precondition;
     }
     let lifetime = issued.valid_before.saturating_sub(now_unix());
-    let agent = session.add_to_agent(lifetime);
-    if let Err(e) = &agent {
+    let loaded = if agent_wanted {
+        session.add_to_agent(lifetime)
+    } else {
+        Ok(())
+    };
+    if let Err(e) = &loaded {
         eprintln!("shoephone: {e}");
         eprintln!(
             "shoephone: certificate is at {} for `ssh -i {}`",
             session.cert_path().display(),
             session.key_path().display()
+        );
+    }
+    if !agent_wanted {
+        eprintln!(
+            "shoephone: certificate is at {}; ssh finds it beside the session key (agent = false)",
+            session.cert_path().display()
         );
     }
     eprintln!(
@@ -493,7 +528,7 @@ fn load(
                     "ends_at": issued.ends_at,
                     "certificate": session.cert_path(),
                     "key": session.key_path(),
-                    "in_agent": agent.is_ok(),
+                    "in_agent": agent_wanted && loaded.is_ok(),
                 },
                 "empty": false,
             })
@@ -504,7 +539,7 @@ fn load(
             in_minutes(issued.valid_before)
         );
     }
-    if agent.is_ok() {
+    if loaded.is_ok() {
         Status::Ok
     } else {
         Status::AuthRemediable
@@ -521,7 +556,9 @@ fn disavow(opts: &Opts, host: &str) -> Status {
         Err(s) => return s,
     };
     if let Ok(session) = need_session() {
-        session.remove_from_agent();
+        if use_agent() {
+            session.remove_from_agent();
+        }
         session.remove_certificate();
     }
     match client.kill(host) {
