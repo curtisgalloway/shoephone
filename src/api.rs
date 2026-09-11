@@ -106,13 +106,22 @@ pub struct ErrorReply {
 }
 
 /// `GET /api/pending`, the approver's view.
+///
+/// `public_key` and `nonce` are exposed deliberately, alongside the fields
+/// already here: the approve page recomputes
+/// `sha256(scope.bytes_to_sign(nonce))` from exactly what it displays and
+/// checks it against the WebAuthn challenge before it will sign anything, so
+/// it needs every field that goes into that computation, not just the ones
+/// that are otherwise human-readable.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingView {
     pub id: u64,
     pub host: String,
     pub principal: String,
+    pub public_key: String,
     pub ends_at: u64,
     pub match_code: String,
+    pub nonce: String,
     pub requester: String,
     pub reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -159,6 +168,11 @@ pub struct PushRegister {
     pub credential_id: webauthn_rs::prelude::Base64UrlSafeData,
     /// The device token as hex.
     pub token: String,
+    /// The per-device secret minted at enrollment, hex. Credential ids are
+    /// public (`approve/start` discloses them to anyone who can reach the
+    /// daemon), so this secret, known only to the app that enrolled, is what
+    /// authenticates this call.
+    pub secret: String,
     /// Which pushes to send, by kind name (`request_waiting`,
     /// `window_opened`, `window_killed`). Absent means all.
     #[serde(default)]

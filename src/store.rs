@@ -30,6 +30,12 @@ pub struct Device {
     /// means all of them (a device registered before the choice existed).
     #[serde(default)]
     pub push_kinds: Option<Vec<String>>,
+    /// SHA-256 of the per-device secret minted at enrollment, which
+    /// `push/register` requires the caller to present. Absent for a device
+    /// enrolled before that check existed; such a device is refused at
+    /// `push/register` until it enrolls again.
+    #[serde(default)]
+    pub push_secret_sha256: Option<String>,
 }
 
 /// A one-time enrollment code minted at the console by `shoephoned enroll`.
@@ -185,8 +191,14 @@ impl Store {
         }
     }
 
-    /// Append entries; the file is opened append-only for every write so a
-    /// crash mid-batch loses at most one line.
+    /// Append entries and `fsync` before returning. The file is opened
+    /// append-only for every write, which bounds a crash mid-batch to
+    /// losing at most one line, but that alone says nothing about a clean
+    /// process exit: without the `fsync`, a successful return here could
+    /// still be sitting in the OS page cache when the machine loses power.
+    /// `Daemon::audited` treats a failure here as a reason to fail closed,
+    /// so "this call returned `Ok`" has to mean the bytes are actually on
+    /// disk, not just handed to the kernel.
     pub fn append_ledger(&self, entries: &[LedgerEntry]) -> Result<(), String> {
         if entries.is_empty() {
             return Ok(());
@@ -201,7 +213,8 @@ impl Store {
             let line = serde_json::to_string(e).map_err(|e| e.to_string())?;
             writeln!(f, "{line}").map_err(|e| format!("writing {}: {e}", path.display()))?;
         }
-        Ok(())
+        f.sync_all()
+            .map_err(|e| format!("syncing {}: {e}", path.display()))
     }
 
     /// The most recent `limit` ledger lines, newest last.

@@ -149,6 +149,12 @@ $('approve').onclick = async () => {
   try {
     const opts = await api('/api/approve/start', {id: current.id});
     const pk = opts.publicKey;
+    const p = current;
+    const bytes = "shoephone-scope-v1\nhost=" + p.host + "\nprincipal=" + p.principal + "\nkey=" + p.public_key + "\nends_at=" + p.ends_at + "\nnonce=" + p.nonce + "\n";
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(bytes));
+    if (b64u.enc(digest) !== pk.challenge) {
+      throw new Error("the daemon's challenge does not match the request on screen");
+    }
     pk.challenge = b64u.dec(pk.challenge);
     (pk.allowCredentials || []).forEach(c => c.id = b64u.dec(c.id));
     const cred = await navigator.credentials.get({publicKey: pk});

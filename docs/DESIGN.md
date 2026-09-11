@@ -286,14 +286,22 @@ the operator's phone.
   the session's public key; every certificate in the window is issued to
   that key only, so a renewal cannot be handed to a different key.
 - **Revocation is a kill switch, not a revocation list.** The daemon
-  exposes "end session", which closes the window; worst-case latency is one
-  certificate TTL. A `RevokedKeys` list on every host was the earlier
-  answer and carries a lockout trap: if the option is set and the file is
-  unreadable, sshd refuses public-key authentication for all users,
-  including the static recovery accounts. Distributing it by push also
-  means the daemon holds a credential to every host, which inverts custody
-  rule 4. If sub-TTL revocation is ever needed, ship an empty valid list in
-  the base image, have hosts pull it on a timer, and write it atomically.
+  exposes "end session", which closes the window: no further certificate is
+  issued for it, and any certificate already out expires within one TTL.
+  That bounds how soon a *new* login stops working, not how soon an
+  existing one does. A session already open when the window closes is
+  unaffected: the certificate authenticated that connection once, sshd does
+  not re-check it for the life of the session, and closing the window does
+  not reach into a running sshd process. Bounding an already-open session,
+  if that is ever needed, is a host-side control (an idle timeout, a hard
+  session-length limit), not this daemon's job. A `RevokedKeys` list on
+  every host was the earlier answer and carries a lockout trap: if the
+  option is set and the file is unreadable, sshd refuses public-key
+  authentication for all users, including the static recovery accounts.
+  Distributing it by push also means the daemon holds a credential to every
+  host, which inverts custody rule 4. If sub-TTL revocation of a *new*
+  login is ever needed, ship an empty valid list in the base image, have
+  hosts pull it on a timer, and write it atomically.
 - **Grant flow.** The session runs the grant CLI, which submits the request
   (host, public key) to the daemon and prints a short match code. The
   daemon notifies the phone with a content-free push. The operator opens

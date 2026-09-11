@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use shoephone::api::{RequestBody, RequestState};
+use shoephone::api::{ErrorReply, RequestBody, RequestState};
 use shoephone::ca::UserCa;
 use shoephone::client::{Client, Error};
 use shoephone::config::{Config, PolicyConfig};
@@ -210,5 +210,94 @@ async fn approved_window_issues_certificates_bound_to_the_key() {
             "{kind} missing:\n{ledger}"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn push_register_refuses_an_unknown_credential() {
+    let dir = scratch("push-unknown");
+    let (client, _daemon) = start(&dir).await;
+
+    let err = ureq::post(format!("{}/api/push/register", client.base()))
+        .send_json(serde_json::json!({
+            "credential_id": "AAAA",
+            "token": "00",
+            "secret": "irrelevant",
+        }))
+        .unwrap_err();
+    match err {
+        ureq::Error::StatusCode(403) => {}
+        other => panic!("expected 403 for an unknown credential id, got {other}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A ledger that cannot be written must refuse everything that would grant
+/// a certificate or open a window, but must not stop the kill switch: kill
+/// and decline stay effective under `with`, which appends best-effort and
+/// returns its own result either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_broken_ledger_refuses_audited_calls_but_kill_still_works() {
+    let dir = scratch("ledger-fail");
+    let (client, _daemon) = start(&dir).await;
+    let client = Arc::new(client);
+    let session = Session::new(dir.join("session"));
+    let key = session.public_key().unwrap();
+
+    let c = client.clone();
+    let k = key.clone();
+    let reply = blocking(move || {
+        c.request(&RequestBody {
+            host: "web01".into(),
+            public_key: k,
+            requester: "test".into(),
+            reason: "loop test: ledger failure".into(),
+            context: None,
+            window_minutes: None,
+        })
+    })
+    .await
+    .unwrap();
+
+    let ledger_path = dir.join("ledger.jsonl");
+    assert!(
+        ledger_path.exists(),
+        "the request itself should have written a ledger line"
+    );
+    std::fs::remove_file(&ledger_path).unwrap();
+    std::fs::create_dir(&ledger_path).unwrap();
+
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .into();
+    let mut resp = agent
+        .post(format!("{}/api/test/approve", client.base()))
+        .send_json(serde_json::json!({ "id": reply.id }))
+        .unwrap();
+    assert_eq!(resp.status(), 503, "approve must be refused closed");
+    let body: ErrorReply = resp.body_mut().read_json().unwrap();
+    assert_eq!(body.code, "ledger_unavailable");
+
+    let c = client.clone();
+    let k = key.clone();
+    let err = blocking(move || c.issue("web01", &k)).await.unwrap_err();
+    match err {
+        Error::Daemon { http, reply } => {
+            assert_eq!(http, 503);
+            assert_eq!(reply.code, "ledger_unavailable");
+        }
+        other => panic!("issue should also fail closed: {other}"),
+    }
+
+    let c = client.clone();
+    let killed = blocking(move || c.kill("web01")).await;
+    assert!(
+        killed.is_ok(),
+        "kill must stay effective when the ledger cannot be written: {killed:?}"
+    );
+
+    // Cleans up the directory planted at ledger.jsonl along with everything
+    // else in the scratch dir.
     let _ = std::fs::remove_dir_all(&dir);
 }

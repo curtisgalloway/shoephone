@@ -7,8 +7,9 @@
 //! only randomness arrives through [`Entropy`], so the whole thing is
 //! exercised by plain unit tests. The daemon wraps it in a mutex, feeds it
 //! the wall clock and the OS random source, verifies the approver's WebAuthn
-//! assertion over [`Scope::bytes_to_sign`] *before* calling
-//! [`Grants::approve`], and hands each [`Certificate`] to the signer.
+//! assertion over a challenge derived from [`Scope::bytes_to_sign`] (see
+//! [`bound_challenge`]) *before* calling [`Grants::approve`], and hands each
+//! [`Certificate`] to the signer.
 //!
 //! The invariants from `AGENTS.md`, restated as the rules this module holds:
 //!
@@ -41,8 +42,15 @@ pub struct Policy {
     /// Longest window the daemon enforces; a request asking for more is
     /// clamped, and the approver sees the clamped value.
     pub max_window: Duration,
-    /// Lifetime of each certificate issued inside a window. This is also the
-    /// worst-case latency of the kill switch.
+    /// Lifetime of each certificate issued inside a window. Expiry and the
+    /// kill switch both work by refusing to hand out (or renew) a
+    /// certificate older than this once they fire, so this duration bounds
+    /// how long a *new* login can happen afterward. Neither one terminates a
+    /// session that is already open: the certificate authenticated that
+    /// connection once, and sshd does not re-check it for the rest of the
+    /// session's life. Bounding an already-open session is a host-side
+    /// concern (an idle timeout, a hard session-length limit), not this
+    /// daemon's.
     pub cert_ttl: Duration,
     /// How long a request waits for a verdict before it times out.
     pub pending_ttl: Duration,
@@ -105,6 +113,22 @@ impl Scope {
     }
 }
 
+/// SHA-256 of `scope.bytes_to_sign(nonce)`: the WebAuthn challenge the
+/// approver's device must sign, in place of the random challenge the
+/// WebAuthn library would otherwise generate. Binding the challenge itself
+/// to the displayed scope, rather than binding it out of band, means the
+/// approver's own recomputation of this digest (from the fields the approve
+/// page showed) either matches the challenge it is about to sign or it does
+/// not: there is no separate value a dishonest channel could relay unchanged
+/// while lying about the scope on screen.
+pub fn bound_challenge(scope: &Scope, nonce: &str) -> [u8; 32] {
+    use ssh_key::sha2::{Digest, Sha256};
+    let digest = Sha256::digest(scope.bytes_to_sign(nonce));
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 /// A request awaiting a verdict. There is at most one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
@@ -126,7 +150,8 @@ pub struct Pending {
 
 /// What the approver's verified signature covered. The daemon builds this
 /// from the client's submission only after the WebAuthn assertion checks out
-/// over `scope.bytes_to_sign(&nonce)`.
+/// over a challenge equal to [`bound_challenge`]`(&scope, &nonce)`: SHA-256 of
+/// `scope.bytes_to_sign(&nonce)`, not those bytes directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Approval {
     pub id: u64,
@@ -1135,6 +1160,24 @@ mod tests {
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             "shoephone-scope-v1\nhost=web01\nprincipal=agent-admin:web01\nkey=ssh-ed25519 AAAA key\nends_at=1800003600\nnonce=abc123\n"
+        );
+    }
+
+    #[test]
+    fn bound_challenge_is_sha256_of_bytes_to_sign() {
+        let scope = Scope {
+            host: "web01".to_owned(),
+            principal: "agent-admin:web01".to_owned(),
+            public_key: "ssh-ed25519 AAAA key".to_owned(),
+            ends_at: t(3600),
+        };
+        let challenge = bound_challenge(&scope, "abc123");
+        let hex: String = challenge.iter().map(|b| format!("{b:02x}")).collect();
+        // Computed once with `shasum -a 256` over the same bytes
+        // `bytes_to_sign_are_stable` asserts above.
+        assert_eq!(
+            hex,
+            "247cc1ea3aa1105567d6c526cc4b32ecea5c9ccb440247497cb07caecc1bc48d"
         );
     }
 

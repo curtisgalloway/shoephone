@@ -85,7 +85,9 @@ here first, then in the code.
 - The rate cap is global per CA and per approver, never keyed on anything the
   requester chooses. A decline costs a cooldown.
 - The daemon never holds a credential to any host it signs for. Revocation is
-  a kill switch that closes the window, bounded by one certificate TTL.
+  a kill switch that closes the window: no new login after one certificate
+  TTL. It does not end a session that is already open; that is a host-side
+  limit, not this daemon's.
 - Every issuance, renewal, decline, and kill is reported to the approver's
   device. The daemon's own logs are not the audit trail.
 

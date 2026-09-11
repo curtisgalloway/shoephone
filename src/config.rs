@@ -134,6 +134,22 @@ impl Config {
                 }
             }
         }
+        // A certificate for a host carries exactly that host's principal
+        // (see `AGENTS.md`'s per-host principals decision), and sshd's
+        // `AuthorizedPrincipalsFile` on each host lists only its own. Two
+        // hosts sharing a principal would make a certificate issued for one
+        // of them valid on the other too, which is exactly the estate-wide
+        // principal design this repo rejected.
+        let mut first_host_for: BTreeMap<&str, &str> = BTreeMap::new();
+        for (host, principal) in &self.principals {
+            if let Some(other_host) = first_host_for.get(principal.as_str()) {
+                return Err(format!(
+                    "principal {principal:?} is shared by hosts {other_host:?} and {host:?}; \
+                     one host per principal"
+                ));
+            }
+            first_host_for.insert(principal.as_str(), host.as_str());
+        }
         if self.rp_id.contains('/') || self.rp_id.contains(':') {
             return Err(format!("rp_id {:?} must be a bare hostname", self.rp_id));
         }
@@ -217,5 +233,20 @@ web01 = "agent-admin:web01"
         assert!(c.validate().unwrap_err().contains("whitespace"));
 
         assert!(toml::from_str::<Config>(&format!("{MINIMAL}\nsurprise = 1\n")).is_err());
+    }
+
+    #[test]
+    fn two_hosts_cannot_share_a_principal() {
+        let text = MINIMAL.replace(
+            "web01 = \"agent-admin:web01\"",
+            "web01 = \"agent-admin:web01\"\ncode = \"agent-admin:web01\"",
+        );
+        let c: Config = toml::from_str(&text).unwrap();
+        let err = c.validate().unwrap_err();
+        assert_eq!(
+            err,
+            "principal \"agent-admin:web01\" is shared by hosts \"code\" and \"web01\"; \
+             one host per principal"
+        );
     }
 }
