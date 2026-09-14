@@ -5,6 +5,8 @@
 
 # shoephone
 
+<img src="assets/logo/shoephone-mark-256.png" alt="" width="160" align="right">
+
 Phone-approved, short-lived SSH certificates for coding agents.
 
 An agent that operates machines needs two kinds of access. Most of what it
