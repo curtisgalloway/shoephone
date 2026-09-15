@@ -1,0 +1,61 @@
+{
+  "note": "Shared between shoephone (Rust daemon) and shoephone-app (Swift approver). Both derive the bound challenge independently; each repo has a test asserting its own implementation reproduces every vector here. Edit in the daemon repo and copy to the app; scripts/e2e.sh in the app fails if the two copies differ.",
+  "derivation": "challenge = base64url(sha256(bytes_to_sign)), no padding",
+  "vectors": [
+    {
+      "name": "the daemon's own unit-test vector",
+      "host": "web01",
+      "principal": "agent-admin:web01",
+      "public_key": "ssh-ed25519 AAAA key",
+      "ends_at": 1800003600,
+      "nonce": "abc123",
+      "bytes_to_sign": "shoephone-scope-v1\nhost=web01\nprincipal=agent-admin:web01\nkey=ssh-ed25519 AAAA key\nends_at=1800003600\nnonce=abc123\n",
+      "challenge_sha256_hex": "247cc1ea3aa1105567d6c526cc4b32ecea5c9ccb440247497cb07caecc1bc48d",
+      "challenge_base64url": "JHzB6jqhEFVn1sUmzEsy7OpcnMtEAkdJfLB8rswbxI0"
+    },
+    {
+      "name": "a different host",
+      "host": "db01",
+      "principal": "agent-admin:db01",
+      "public_key": "ssh-ed25519 AAAA key",
+      "ends_at": 1800003600,
+      "nonce": "abc123",
+      "bytes_to_sign": "shoephone-scope-v1\nhost=db01\nprincipal=agent-admin:db01\nkey=ssh-ed25519 AAAA key\nends_at=1800003600\nnonce=abc123\n",
+      "challenge_sha256_hex": "b89c6b6c901544c7f01a8e963dae60209311b38d6d1373b78922534e67fe7ce7",
+      "challenge_base64url": "uJxrbJAVRMfwGo6WPa5gIJMRs41tE3O3iSJTTmf-fOc"
+    },
+    {
+      "name": "an ed25519 line with a comment",
+      "host": "web01",
+      "principal": "agent-admin:web01",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBwvYPsYpLIZhiILx7JVedtn4H/6BS0w51pv5RmgsqUb fixture",
+      "ends_at": 1800003600,
+      "nonce": "abc123",
+      "bytes_to_sign": "shoephone-scope-v1\nhost=web01\nprincipal=agent-admin:web01\nkey=ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBwvYPsYpLIZhiILx7JVedtn4H/6BS0w51pv5RmgsqUb fixture\nends_at=1800003600\nnonce=abc123\n",
+      "challenge_sha256_hex": "6ed575ca6fb4abc2b59fa9a33cebbcbd2be62437779b72317be4393b4493b38c",
+      "challenge_base64url": "btV1ym-0q8K1n6mjPOu8vSvmJDd3m3Ixe-Q5O0STs4w"
+    },
+    {
+      "name": "a one-second difference in the window",
+      "host": "web01",
+      "principal": "agent-admin:web01",
+      "public_key": "ssh-ed25519 AAAA key",
+      "ends_at": 1800003601,
+      "nonce": "abc123",
+      "bytes_to_sign": "shoephone-scope-v1\nhost=web01\nprincipal=agent-admin:web01\nkey=ssh-ed25519 AAAA key\nends_at=1800003601\nnonce=abc123\n",
+      "challenge_sha256_hex": "74b97d4c8db8cec530f1dc97da6d8ceb50d2f3fb66a74da8f411d75e0de8c010",
+      "challenge_base64url": "dLl9TI24zsUw8dyX2m2M61DS8_tmp02o9BHXXg3owBA"
+    },
+    {
+      "name": "a different nonce",
+      "host": "web01",
+      "principal": "agent-admin:web01",
+      "public_key": "ssh-ed25519 AAAA key",
+      "ends_at": 1800003600,
+      "nonce": "abc124",
+      "bytes_to_sign": "shoephone-scope-v1\nhost=web01\nprincipal=agent-admin:web01\nkey=ssh-ed25519 AAAA key\nends_at=1800003600\nnonce=abc124\n",
+      "challenge_sha256_hex": "d20579f1b36e5b9705b29810877a19375cba583a6dd89c6e5feead029625142c",
+      "challenge_base64url": "0gV58bNuW5cFspgQh3oZN1y6WDpt2JxuX-6tApYlFCw"
+    }
+  ]
+}
