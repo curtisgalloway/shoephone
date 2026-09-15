@@ -543,3 +543,15 @@ predict is a classifier you will fight.
 - It does not replace the operator's own access. Humans keep their own keys
   and their own accounts; the agent principals exist alongside them, which
   is what makes attribution and revocation clean.
+- It does not put the approver on an Apple Watch. The ceremony rests on a
+  gesture that proves a person is there, and watchOS has no biometric:
+  `LAPolicyDeviceOwnerAuthenticationWithBiometrics` is unavailable on that
+  platform, and the closest substitute, wrist detection, asserts only that
+  the watch has stayed on a wrist since it was unlocked. Custody is not
+  what would be lost — the key would still be enclave-bound and still out
+  of the agent's reach — but a wrist tap is the cheap, rubber-stampable
+  gesture the two tiers exist to avoid, and an approve screen that must
+  carry host, principal, window and reason would truncate the one field a
+  person has to read. The watch still earns its place as a notifier: the
+  "a request is waiting" push reaches the wrist through the phone, and the
+  approval happens on the phone.
