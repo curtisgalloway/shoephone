@@ -232,6 +232,28 @@ impl Store {
         }
     }
 
+    /// Remove one enrolled approver by name, returning how many devices
+    /// remain, or `None` when no device had that name.
+    ///
+    /// Lives here rather than in the `forget` verb so it is reachable from
+    /// tests that enrol through the real ceremony: a device's key is a
+    /// webauthn credential, which is not something to hand-write into a
+    /// fixture.
+    ///
+    /// The caller is responsible for making sure no daemon is running. This
+    /// writes `devices.json` whole, and so does a running `serve`, from its
+    /// own in-memory copy.
+    pub fn forget_device(&self, name: &str) -> Result<Option<usize>, String> {
+        let devices = self.load_devices()?;
+        let kept: Vec<Device> = devices.iter().filter(|d| d.name != name).cloned().collect();
+        if kept.len() == devices.len() {
+            return Ok(None);
+        }
+        let remaining = kept.len();
+        self.save_devices(&kept)?;
+        Ok(Some(remaining))
+    }
+
     pub fn save_devices(&self, devices: &[Device]) -> Result<(), String> {
         let json = serde_json::to_vec_pretty(devices).map_err(|e| e.to_string())?;
         write_atomic(&self.devices_path(), &json)

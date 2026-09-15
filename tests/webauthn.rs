@@ -842,6 +842,55 @@ async fn a_regressing_counter_is_rejected() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forgetting_a_device_removes_only_that_one_and_survives_reload() {
+    // Enrolment is the only way to get a real webauthn credential into
+    // devices.json, so removal is tested against one rather than against a
+    // hand-written fixture that could drift from what the daemon writes.
+    let dir = scratch("forget-device");
+    let (client, _daemon) = start(&dir).await;
+    let base = client.base().to_owned();
+    let agent = test_agent();
+
+    let (_k1, _h1, _s1) = enroll(&dir, &base, &agent, "old-phone");
+    let (_k2, _h2, _s2) = enroll(&dir, &base, &agent, "new-phone");
+
+    let store = Store::new(&dir);
+    assert_eq!(store.load_devices().unwrap().len(), 2, "both enrolled");
+
+    assert_eq!(
+        store.forget_device("ghost").unwrap(),
+        None,
+        "a name nobody has is not a removal"
+    );
+    assert_eq!(
+        store.load_devices().unwrap().len(),
+        2,
+        "a miss must not disturb the file"
+    );
+
+    assert_eq!(store.forget_device("old-phone").unwrap(), Some(1));
+
+    // Re-read from disk, not from memory: the point of the verb is that the
+    // next `serve` loads a list without the removed device in it.
+    let left = Store::new(&dir).load_devices().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].name, "new-phone");
+    assert!(
+        left[0].push_secret_sha256.is_some(),
+        "the surviving device keeps its push secret"
+    );
+
+    assert_eq!(
+        store.forget_device("new-phone").unwrap(),
+        Some(0),
+        "removing the last approver is allowed; only the console can undo it"
+    );
+    assert!(Store::new(&dir).load_devices().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enrollment_returns_a_secret_only_once_and_stores_its_hash() {
     let dir = scratch("secret-once");
     let (client, _daemon) = start(&dir).await;

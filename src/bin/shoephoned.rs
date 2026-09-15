@@ -10,11 +10,16 @@
 //!   public line for every host's `TrustedUserCAKeys`.
 //! - `enroll --name <device>`: mint a one-time code for the approve page's
 //!   enrollment form. Human-only: it runs at this host's console.
+//! - `devices`: list the enrolled approvers.
+//! - `forget --name <device>`: remove one. Human-only and console-only for
+//!   the same reason as `enroll`, and it refuses to run while the daemon
+//!   holds the device list in memory.
 
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use shoephone::ca::{OsEntropy, UserCa};
 use shoephone::config::Config;
@@ -37,7 +42,7 @@ const DEFAULT_CONFIG: &str = "/etc/shoephone/shoephoned.toml";
 
 fn usage() -> Status {
     eprintln!(
-        "usage: shoephoned [--config <file>] (serve | init-ca | enroll --name <device>)\n       shoephoned --version\n\n--config defaults to /etc/shoephone/shoephoned.toml"
+        "usage: shoephoned [--config <file>] (serve | init-ca | enroll --name <device>\n                                          | devices | forget --name <device>)\n       shoephoned --version\n\n--config defaults to /etc/shoephone/shoephoned.toml"
     );
     Status::Usage
 }
@@ -105,6 +110,8 @@ fn run(args: &[String]) -> Status {
         (Some("serve"), None) => serve(config),
         (Some("init-ca"), None) => init_ca(&config.ca_key),
         (Some("enroll"), Some(name)) => enroll(&config, &name),
+        (Some("devices"), None) => devices(&config),
+        (Some("forget"), Some(name)) => forget(&config, &name),
         _ => usage(),
     }
 }
@@ -139,6 +146,105 @@ fn init_ca(path: &Path) -> Status {
             Status::Permanent
         }
     }
+}
+
+/// Whether something is already listening where the daemon would.
+///
+/// `serve` loads `devices.json` once at startup and keeps the list in
+/// memory, writing the whole list back whenever it changes. So a removal
+/// made on disk underneath a running daemon is not merely late — it is
+/// undone by the daemon's next save, which knows nothing about it. The next
+/// `push/register` would resurrect the device we just removed, and nothing
+/// would report it. Refusing to run is the only honest option.
+fn daemon_is_listening(listen: &str) -> bool {
+    let Ok(addrs) = listen.to_socket_addrs() else {
+        return false;
+    };
+    addrs
+        .into_iter()
+        .any(|a| TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok())
+}
+
+fn devices(config: &Config) -> Status {
+    let store = Store::new(&config.state_dir);
+    let devices = match store.load_devices() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("shoephoned: {e}");
+            return Status::Precondition;
+        }
+    };
+    if devices.is_empty() {
+        eprintln!("shoephoned: no enrolled devices; `shoephoned enroll --name <device>`");
+        return Status::Empty;
+    }
+    for d in &devices {
+        // Say which devices cannot be pushed to, because that is the
+        // difference an operator is usually looking for: a device enrolled
+        // before per-device push secrets existed is refused at
+        // push/register and silently receives nothing.
+        let push = match (&d.push_token, &d.push_secret_sha256) {
+            (Some(_), Some(_)) => "push ok",
+            (Some(_), None) => "push token but no secret: re-enroll for notifications",
+            (None, _) => "no push token registered",
+        };
+        // Epoch seconds, as the daemon stores them, plus an age: which
+        // enrollment is the stale one is the question this list answers.
+        let age = store::unix(SystemTime::now()).saturating_sub(d.enrolled_at) / 86_400;
+        println!("{}\t{}\t{age}d ago\t{}", d.name, d.enrolled_at, push);
+    }
+    Status::Ok
+}
+
+/// Remove an enrolled approver.
+///
+/// There is no remote form of this and there should not be: the approver is
+/// the root of the whole model, so the ability to remove one must not be
+/// reachable by anything the approver authorizes. Same custody as `enroll`.
+fn forget(config: &Config, name: &str) -> Status {
+    if daemon_is_listening(&config.listen) {
+        eprintln!(
+            "shoephoned: something is listening on {}, so shoephoned is probably running.",
+            config.listen
+        );
+        eprintln!(
+            "shoephoned: it holds the device list in memory and would write this removal back out. Stop it first:"
+        );
+        eprintln!("shoephoned:     systemctl stop shoephoned");
+        return Status::Precondition;
+    }
+    let store = Store::new(&config.state_dir);
+    let remaining = match store.forget_device(name) {
+        Ok(Some(n)) => n,
+        Ok(None) => {
+            eprintln!("shoephoned: no enrolled device named {name:?}");
+            match store.load_devices() {
+                Ok(d) if !d.is_empty() => {
+                    let names: Vec<&str> = d.iter().map(|x| x.name.as_str()).collect();
+                    eprintln!("shoephoned: enrolled: {}", names.join(", "));
+                }
+                _ => {}
+            }
+            return Status::Usage;
+        }
+        Err(e) => {
+            eprintln!("shoephoned: {e}");
+            return Status::Precondition;
+        }
+    };
+    eprintln!(
+        "shoephoned: removed {name:?}; {remaining} device(s) remain. Its key can no longer approve anything."
+    );
+    if remaining == 0 {
+        // Recoverable, but only from this console, so say so plainly rather
+        // than refusing: an operator removing a lost phone may have no other
+        // device to keep.
+        eprintln!(
+            "shoephoned: NO APPROVERS REMAIN. Nothing can be approved until you run `shoephoned enroll --name <device>` here."
+        );
+    }
+    eprintln!("shoephoned: start the daemon again: systemctl start shoephoned");
+    Status::Ok
 }
 
 fn enroll(config: &Config, name: &str) -> Status {
