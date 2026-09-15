@@ -624,6 +624,18 @@ impl Grants {
         &self.windows
     }
 
+    /// How many things are outstanding: open windows, plus a request still
+    /// waiting for a verdict. What the phone's app icon badges.
+    ///
+    /// Both halves count because both want the person, and the request wants
+    /// them more: a window is a state of the world, a pending request is a
+    /// question with a five-minute fuse. At most one request is pending at a
+    /// time, so this is the window count plus zero or one.
+    pub fn outstanding(&mut self, now: SystemTime) -> u64 {
+        self.tick(now);
+        self.windows.len() as u64 + u64::from(self.pending.is_some())
+    }
+
     /// Drain the ledger entries recorded since the last drain.
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
@@ -1176,6 +1188,43 @@ mod tests {
             "kill with no window still cancels the request"
         );
         assert_eq!(g.kill(t(3), "web01"), Err(Refusal::NoWindow));
+    }
+
+    #[test]
+    fn outstanding_counts_windows_and_a_waiting_request() {
+        let mut g = grants();
+        assert_eq!(g.outstanding(t(0)), 0, "nothing open, nothing waiting");
+
+        g.request(
+            t(0),
+            &mut Counter(0),
+            "web01",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(g.outstanding(t(1)), 1, "a request waiting counts");
+
+        let p = g.pending(t(1)).unwrap().clone();
+        g.approve(t(2), &approval_for(&p)).unwrap();
+        assert_eq!(
+            g.outstanding(t(2)),
+            1,
+            "approving trades the request for a window, it does not add one"
+        );
+
+        g.kill(t(3), "web01").unwrap();
+        assert_eq!(g.outstanding(t(3)), 0, "killing the window clears it");
+
+        // And expiry, which sends no push at all: the count is still right
+        // whenever it is next asked, even though nothing announced it.
+        approved(&mut g, t(10));
+        assert_eq!(g.outstanding(t(11)), 1);
+        let far = t(10) + Policy::default().max_window + Duration::from_secs(1);
+        assert_eq!(g.outstanding(far), 0, "an expired window stops counting");
     }
 
     #[test]

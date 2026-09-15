@@ -255,8 +255,9 @@ impl Daemon {
         let out = f(&mut inner);
         let events = self.drain_and_append(&mut inner);
         let targets = push_targets(&inner);
+        let badge = badge_count(&mut inner, SystemTime::now());
         drop(inner);
-        self.dispatch_pushes(&events, targets);
+        self.dispatch_pushes(&events, targets, badge);
         out
     }
 
@@ -279,8 +280,9 @@ impl Daemon {
         let events = self.drain_and_append(&mut inner);
         let append_failed = inner.ledger_failed.is_some();
         let targets = push_targets(&inner);
+        let badge = badge_count(&mut inner, SystemTime::now());
         drop(inner);
-        self.dispatch_pushes(&events, targets);
+        self.dispatch_pushes(&events, targets, badge);
         if append_failed {
             return Err(Self::ledger_unavailable());
         }
@@ -330,7 +332,12 @@ impl Daemon {
     /// after the lock is released: notifier and APNs delivery can block, or
     /// need the tokio runtime, and neither should happen while another
     /// caller is waiting on the daemon lock.
-    fn dispatch_pushes(&self, events: &[Event], targets: Vec<(String, Option<Vec<String>>)>) {
+    fn dispatch_pushes(
+        &self,
+        events: &[Event],
+        targets: Vec<(String, Option<Vec<String>>)>,
+        badge: u64,
+    ) {
         if events.is_empty() {
             return;
         }
@@ -381,7 +388,7 @@ impl Daemon {
                         {
                             continue;
                         }
-                        match a.send(*p, t).await {
+                        match a.send(*p, t, badge).await {
                             Delivery::Sent => {}
                             Delivery::Unregistered => eprintln!(
                                 "shoephoned: apns rejected a device token as unregistered; the app re-registers on launch"
@@ -423,6 +430,15 @@ fn now() -> SystemTime {
 }
 
 /// Each device's push token with the kinds it asked for; `None` means all.
+/// What the app icon should read: live authorizations, plus a request if one
+/// is waiting. Computed under the lock beside the targets, because by the
+/// time the push is sent the lock is gone and the state may have moved.
+///
+/// The daemon holds at most one pending request, so this is windows + 0 or 1.
+fn badge_count(inner: &mut Inner, now: SystemTime) -> u64 {
+    inner.grants.outstanding(now)
+}
+
 fn push_targets(inner: &Inner) -> Vec<(String, Option<Vec<String>>)> {
     inner
         .devices

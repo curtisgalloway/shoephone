@@ -234,10 +234,17 @@ impl Apns {
         Ok(token)
     }
 
-    /// The notification body: a title, one sentence, a sound. Nothing about
-    /// the request itself. A waiting request is time-sensitive so it
-    /// breaks through a Focus; the other two are ordinary.
-    pub fn payload(push: Push) -> serde_json::Value {
+    /// The notification body: a title, one sentence, a sound, and the badge
+    /// count. Nothing about the request itself -- no host, no reason, no
+    /// requester -- which is the property worth keeping; the count says only
+    /// how many things are outstanding, and the body already announces that
+    /// there is one. A waiting request is time-sensitive so it breaks
+    /// through a Focus; the other two are ordinary.
+    ///
+    /// The badge is here rather than left to the app because the app only
+    /// polls while it is in front: a push arriving at a closed app would set
+    /// no badge at all, which is most of the time and most of the point.
+    pub fn payload(push: Push, badge: u64) -> serde_json::Value {
         let level = match push {
             Push::RequestWaiting => "time-sensitive",
             Push::WindowOpened | Push::WindowKilled => "active",
@@ -247,12 +254,13 @@ impl Apns {
                 "alert": { "title": "shoephone", "body": push.body() },
                 "sound": "default",
                 "interruption-level": level,
+                "badge": badge,
             },
             "shoephone": { "kind": push.kind() }
         })
     }
 
-    pub async fn send(&self, push: Push, token: &str) -> Delivery {
+    pub async fn send(&self, push: Push, token: &str, badge: u64) -> Delivery {
         let bearer = match self.bearer(SystemTime::now()) {
             Ok(b) => b,
             Err(e) => return Delivery::Failed(e),
@@ -270,7 +278,7 @@ impl Apns {
             .header("apns-push-type", "alert")
             .header("apns-priority", priority)
             .header("apns-collapse-id", push.tags())
-            .json(&Self::payload(push))
+            .json(&Self::payload(push, badge))
             .send()
             .await;
         match sent {
@@ -451,14 +459,25 @@ mod tests {
     }
 
     #[test]
-    fn payload_is_content_free_and_only_a_request_is_time_sensitive() {
-        let p = Apns::payload(Push::RequestWaiting);
+    fn payload_says_nothing_about_the_request_and_only_one_is_time_sensitive() {
+        // Renamed from "content free". The payload was never free of
+        // content -- it announces that a request is waiting -- and now
+        // carries a count as well. The property actually worth holding is
+        // narrower and is what this asserts: nothing identifying the
+        // request. No host, no reason, no requester, no id.
+        let p = Apns::payload(Push::RequestWaiting, 3);
         assert_eq!(p["aps"]["interruption-level"], "time-sensitive");
         assert_eq!(p["aps"]["alert"]["title"], "shoephone");
         assert!(p.to_string().contains("waiting"));
+        assert_eq!(p["aps"]["badge"], 3);
         assert_eq!(
-            Apns::payload(Push::WindowKilled)["aps"]["interruption-level"],
+            Apns::payload(Push::WindowKilled, 0)["aps"]["interruption-level"],
             "active"
+        );
+        assert_eq!(
+            Apns::payload(Push::WindowKilled, 0)["aps"]["badge"],
+            0,
+            "a badge of zero clears the icon rather than leaving a stale count"
         );
         let keys: Vec<&str> = p["aps"]
             .as_object()
@@ -466,11 +485,23 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(keys, ["alert", "interruption-level", "sound"]);
+        assert_eq!(keys, ["alert", "badge", "interruption-level", "sound"]);
         assert_eq!(p["shoephone"]["kind"], "request_waiting");
         assert_eq!(
-            Apns::payload(Push::WindowKilled)["shoephone"]["kind"],
+            Apns::payload(Push::WindowKilled, 0)["shoephone"]["kind"],
             "window_killed"
         );
+
+        // The whole payload, for every kind, must not name anything about
+        // the request. This is the assertion the old name was gesturing at.
+        for push in [Push::RequestWaiting, Push::WindowOpened, Push::WindowKilled] {
+            let text = Apns::payload(push, 1).to_string();
+            for forbidden in ["web01", "apps", "reason", "requester", "\"id\""] {
+                assert!(
+                    !text.contains(forbidden),
+                    "payload for {push:?} leaked {forbidden}: {text}"
+                );
+            }
+        }
     }
 }
