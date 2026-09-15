@@ -11,9 +11,10 @@
 //! - `enroll --name <device>`: mint a one-time code for the approve page's
 //!   enrollment form. Human-only: it runs at this host's console.
 //! - `devices`: list the enrolled approvers.
-//! - `forget --name <device>`: remove one. Human-only and console-only for
-//!   the same reason as `enroll`, and it refuses to run while the daemon
-//!   holds the device list in memory.
+//! - `forget --name <device>` or `--id <handle>`: remove one. Human-only and
+//!   console-only for the same reason as `enroll`, and it refuses to run
+//!   while the daemon holds the device list in memory. Names are not
+//!   unique, so an ambiguous one is refused rather than resolved.
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -42,7 +43,7 @@ const DEFAULT_CONFIG: &str = "/etc/shoephone/shoephoned.toml";
 
 fn usage() -> Status {
     eprintln!(
-        "usage: shoephoned [--config <file>] (serve | init-ca | enroll --name <device>\n                                          | devices | forget --name <device>)\n       shoephoned --version\n\n--config defaults to /etc/shoephone/shoephoned.toml"
+        "usage: shoephoned [--config <file>] (serve | init-ca | enroll --name <device>\n                                          | devices | forget (--name <device> | --id <handle>))\n       shoephoned --version\n\n--config defaults to /etc/shoephone/shoephoned.toml"
     );
     Status::Usage
 }
@@ -54,6 +55,7 @@ fn usage() -> Status {
 struct Args {
     config: Option<String>,
     name: Option<String>,
+    id: Option<String>,
     verb: Option<String>,
 }
 
@@ -62,15 +64,15 @@ fn parse(args: &[String]) -> Result<Args, String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--config" | "--name" => {
+            "--config" | "--name" | "--id" => {
                 let value = it
                     .next()
                     .filter(|v| !v.starts_with("--"))
                     .ok_or_else(|| format!("{a} needs a value"))?;
-                let slot = if a == "--config" {
-                    &mut out.config
-                } else {
-                    &mut out.name
+                let slot = match a.as_str() {
+                    "--config" => &mut out.config,
+                    "--name" => &mut out.name,
+                    _ => &mut out.id,
                 };
                 if slot.is_some() {
                     return Err(format!("{a} given twice"));
@@ -106,12 +108,14 @@ fn run(args: &[String]) -> Status {
             return Status::Precondition;
         }
     };
-    match (parsed.verb.as_deref(), parsed.name) {
-        (Some("serve"), None) => serve(config),
-        (Some("init-ca"), None) => init_ca(&config.ca_key),
-        (Some("enroll"), Some(name)) => enroll(&config, &name),
-        (Some("devices"), None) => devices(&config),
-        (Some("forget"), Some(name)) => forget(&config, &name),
+    match (parsed.verb.as_deref(), parsed.name, parsed.id) {
+        (Some("serve"), None, None) => serve(config),
+        (Some("init-ca"), None, None) => init_ca(&config.ca_key),
+        (Some("enroll"), Some(name), None) => enroll(&config, &name),
+        (Some("devices"), None, None) => devices(&config),
+        (Some("forget"), Some(target), None) | (Some("forget"), None, Some(target)) => {
+            forget(&config, &target)
+        }
         _ => usage(),
     }
 }
@@ -191,7 +195,15 @@ fn devices(config: &Config) -> Status {
         // Epoch seconds, as the daemon stores them, plus an age: which
         // enrollment is the stale one is the question this list answers.
         let age = store::unix(SystemTime::now()).saturating_sub(d.enrolled_at) / 86_400;
-        println!("{}\t{}\t{age}d ago\t{}", d.name, d.enrolled_at, push);
+        // The handle first: it is the only field guaranteed to identify one
+        // device, and it is what `forget --id` takes.
+        println!(
+            "{}\t{}\t{}\t{age}d ago\t{}",
+            d.handle(),
+            d.name,
+            d.enrolled_at,
+            push
+        );
     }
     Status::Ok
 }
@@ -201,7 +213,7 @@ fn devices(config: &Config) -> Status {
 /// There is no remote form of this and there should not be: the approver is
 /// the root of the whole model, so the ability to remove one must not be
 /// reachable by anything the approver authorizes. Same custody as `enroll`.
-fn forget(config: &Config, name: &str) -> Status {
+fn forget(config: &Config, target: &str) -> Status {
     if daemon_is_listening(&config.listen) {
         eprintln!(
             "shoephoned: something is listening on {}, so shoephoned is probably running.",
@@ -214,18 +226,47 @@ fn forget(config: &Config, name: &str) -> Status {
         return Status::Precondition;
     }
     let store = Store::new(&config.state_dir);
-    let remaining = match store.forget_device(name) {
+    let matches = match store.match_devices(target) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("shoephoned: {e}");
+            return Status::Precondition;
+        }
+    };
+    // Names are not unique and the ambiguous case is the common one: a
+    // replacement enrolled under the name it replaces. Resolving it by
+    // picking one, or by removing both, would take the working device at the
+    // moment this tool is reached for. So it refuses and shows the handles.
+    if matches.len() > 1 {
+        eprintln!(
+            "shoephoned: {target:?} matches {} devices; name it by handle instead:",
+            matches.len()
+        );
+        for d in &matches {
+            let age = (store::unix(SystemTime::now()).saturating_sub(d.enrolled_at)) / 86_400;
+            eprintln!(
+                "shoephoned:     --id {}   ({}, enrolled {age}d ago)",
+                d.handle(),
+                d.name
+            );
+        }
+        return Status::Usage;
+    }
+    let Some(found) = matches.first() else {
+        eprintln!("shoephoned: no enrolled device matching {target:?}");
+        if let Ok(d) = store.load_devices() {
+            for x in &d {
+                eprintln!("shoephoned:     {} {}", x.handle(), x.name);
+            }
+        }
+        return Status::Usage;
+    };
+    let name = found.name.clone();
+    let remaining = match store.forget_device(&found.handle()) {
         Ok(Some(n)) => n,
         Ok(None) => {
-            eprintln!("shoephoned: no enrolled device named {name:?}");
-            match store.load_devices() {
-                Ok(d) if !d.is_empty() => {
-                    let names: Vec<&str> = d.iter().map(|x| x.name.as_str()).collect();
-                    eprintln!("shoephoned: enrolled: {}", names.join(", "));
-                }
-                _ => {}
-            }
-            return Status::Usage;
+            eprintln!("shoephoned: {target:?} vanished between the lookup and the removal");
+            return Status::Precondition;
         }
         Err(e) => {
             eprintln!("shoephoned: {e}");

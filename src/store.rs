@@ -39,6 +39,22 @@ pub struct Device {
     pub push_secret_sha256: Option<String>,
 }
 
+impl Device {
+    /// A short stable handle, because names are not unique: `enroll` accepts
+    /// any name, so enrolling a replacement under the name it replaces
+    /// leaves two devices answering to it. Derived from the credential id,
+    /// which is the only thing about a device that is guaranteed distinct.
+    pub fn handle(&self) -> String {
+        let cred = webauthn_rs::prelude::Credential::from(self.key.clone());
+        cred.cred_id
+            .as_ref()
+            .iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+}
+
 /// A one-time enrollment code minted at the console by `shoephoned enroll`.
 /// Only the SHA-256 of the code is stored, so reading the file does not
 /// reveal it. It expires and is deleted on first use or after a few wrong
@@ -232,8 +248,27 @@ impl Store {
         }
     }
 
-    /// Remove one enrolled approver by name, returning how many devices
-    /// remain, or `None` when no device had that name.
+    /// Devices whose name equals `target`, or whose handle starts with it.
+    ///
+    /// One lookup for both so `forget` can take either without the caller
+    /// guessing which the operator meant, and so an ambiguous answer is
+    /// visible rather than silently resolved.
+    pub fn match_devices(&self, target: &str) -> Result<Vec<Device>, String> {
+        let devices = self.load_devices()?;
+        Ok(devices
+            .into_iter()
+            .filter(|d| d.name == target || d.handle().starts_with(target))
+            .collect())
+    }
+
+    /// Remove exactly the device with this handle, returning how many remain,
+    /// or `None` when no device had it.
+    ///
+    /// By handle and never by name: `enroll` accepts any name, so a
+    /// replacement enrolled under the name it replaces leaves two devices
+    /// answering to it, and the one an operator wants gone is whichever the
+    /// other one is not. A name-matching removal takes both -- including the
+    /// working one, at the exact moment the tool is reached for.
     ///
     /// Lives here rather than in the `forget` verb so it is reachable from
     /// tests that enrol through the real ceremony: a device's key is a
@@ -243,9 +278,13 @@ impl Store {
     /// The caller is responsible for making sure no daemon is running. This
     /// writes `devices.json` whole, and so does a running `serve`, from its
     /// own in-memory copy.
-    pub fn forget_device(&self, name: &str) -> Result<Option<usize>, String> {
+    pub fn forget_device(&self, handle: &str) -> Result<Option<usize>, String> {
         let devices = self.load_devices()?;
-        let kept: Vec<Device> = devices.iter().filter(|d| d.name != name).cloned().collect();
+        let kept: Vec<Device> = devices
+            .iter()
+            .filter(|d| d.handle() != handle)
+            .cloned()
+            .collect();
         if kept.len() == devices.len() {
             return Ok(None);
         }

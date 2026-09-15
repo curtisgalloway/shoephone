@@ -860,7 +860,7 @@ async fn forgetting_a_device_removes_only_that_one_and_survives_reload() {
     assert_eq!(
         store.forget_device("ghost").unwrap(),
         None,
-        "a name nobody has is not a removal"
+        "a handle nobody has is not a removal"
     );
     assert_eq!(
         store.load_devices().unwrap().len(),
@@ -868,7 +868,14 @@ async fn forgetting_a_device_removes_only_that_one_and_survives_reload() {
         "a miss must not disturb the file"
     );
 
-    assert_eq!(store.forget_device("old-phone").unwrap(), Some(1));
+    let old_handle = store
+        .load_devices()
+        .unwrap()
+        .into_iter()
+        .find(|d| d.name == "old-phone")
+        .unwrap()
+        .handle();
+    assert_eq!(store.forget_device(&old_handle).unwrap(), Some(1));
 
     // Re-read from disk, not from memory: the point of the verb is that the
     // next `serve` loads a list without the removed device in it.
@@ -880,12 +887,51 @@ async fn forgetting_a_device_removes_only_that_one_and_survives_reload() {
         "the surviving device keeps its push secret"
     );
 
+    let last = store.load_devices().unwrap()[0].handle();
     assert_eq!(
-        store.forget_device("new-phone").unwrap(),
+        store.forget_device(&last).unwrap(),
         Some(0),
         "removing the last approver is allowed; only the console can undo it"
     );
     assert!(Store::new(&dir).load_devices().unwrap().is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_devices_may_share_a_name_and_are_still_separable() {
+    // The case that bit: a replacement enrolled under the name it replaces.
+    // Both answer to "7phone"; only the handle tells them apart, and a
+    // name-matching removal would take the working one with the stale one.
+    let dir = scratch("same-name");
+    let (client, _daemon) = start(&dir).await;
+    let base = client.base().to_owned();
+    let agent = test_agent();
+
+    let _ = enroll(&dir, &base, &agent, "7phone");
+    let _ = enroll(&dir, &base, &agent, "7phone");
+
+    let store = Store::new(&dir);
+    let devices = store.load_devices().unwrap();
+    assert_eq!(devices.len(), 2, "one name, two devices");
+    let handles: Vec<String> = devices.iter().map(|d| d.handle()).collect();
+    assert_ne!(handles[0], handles[1], "handles distinguish them");
+
+    assert_eq!(
+        store.match_devices("7phone").unwrap().len(),
+        2,
+        "the name is ambiguous and must be seen to be"
+    );
+    assert_eq!(
+        store.match_devices(&handles[0]).unwrap().len(),
+        1,
+        "a handle is not"
+    );
+
+    assert_eq!(store.forget_device(&handles[0]).unwrap(), Some(1));
+    let left = Store::new(&dir).load_devices().unwrap();
+    assert_eq!(left.len(), 1, "the other one survives");
+    assert_eq!(left[0].handle(), handles[1]);
 
     let _ = std::fs::remove_dir_all(&dir);
 }
