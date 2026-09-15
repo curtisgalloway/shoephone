@@ -922,6 +922,23 @@ async fn enroll_finish(
             cred.backup_state,
             d.config.allow_synced_credentials,
         )?;
+        // One name, one device. Enrolling over a name that is already taken
+        // used to add a second device answering to it, which is how a
+        // routine app reinstall left two approvers called the same thing and
+        // no way to tell from the name which one still worked. Refuse here
+        // rather than replace: the device holding that name may be the only
+        // one that can approve, and removing it is a decision for whoever is
+        // at the console, made with `shoephoned forget --id <handle>`.
+        if inner.devices.iter().any(|x| x.name == ceremony.device_name) {
+            return Err(Fail::new(
+                StatusCode::CONFLICT,
+                "name_taken",
+                format!(
+                    "a device named {:?} is already enrolled; remove it with `shoephoned forget` or enroll under another name",
+                    ceremony.device_name
+                ),
+            ));
+        }
         // A secret only the enrolling app ever sees, so `push/register`
         // later has something to authenticate against besides the
         // credential id, which `approve/start` hands to anyone who can

@@ -908,10 +908,16 @@ async fn two_devices_may_share_a_name_and_are_still_separable() {
     let base = client.base().to_owned();
     let agent = test_agent();
 
+    // Two devices can still share a name in a store written before the
+    // daemon refused it, which is the state an upgrade inherits, so the
+    // separation has to work regardless of how they got there.
     let _ = enroll(&dir, &base, &agent, "7phone");
-    let _ = enroll(&dir, &base, &agent, "7phone");
-
+    let _ = enroll(&dir, &base, &agent, "7phone-2");
     let store = Store::new(&dir);
+    let mut devices = store.load_devices().unwrap();
+    devices[1].name = "7phone".to_owned();
+    store.save_devices(&devices).unwrap();
+
     let devices = store.load_devices().unwrap();
     assert_eq!(devices.len(), 2, "one name, two devices");
     let handles: Vec<String> = devices.iter().map(|d| d.handle()).collect();
@@ -932,6 +938,37 @@ async fn two_devices_may_share_a_name_and_are_still_separable() {
     let left = Store::new(&dir).load_devices().unwrap();
     assert_eq!(left.len(), 1, "the other one survives");
     assert_eq!(left[0].handle(), handles[1]);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_name_already_enrolled_is_refused() {
+    // An app reinstall is a fresh enrollment, and it used to add a second
+    // device under the same name rather than being refused -- leaving two
+    // approvers that nothing on screen could tell apart.
+    let dir = scratch("name-taken");
+    let (client, _daemon) = start(&dir).await;
+    let base = client.base().to_owned();
+    let agent = test_agent();
+
+    let _ = enroll(&dir, &base, &agent, "phone");
+    assert_eq!(Store::new(&dir).load_devices().unwrap().len(), 1);
+
+    let (key, ccr) = enroll_start(&dir, &base, &agent, "phone");
+    let challenge_b64 = b64url(ccr.public_key.challenge.as_slice());
+    let credential = key.register(&challenge_b64, 0x45); // UP | UV | AT
+    let resp = agent
+        .post(format!("{base}/api/enroll/finish"))
+        .send_json(json!({ "code": ENROLL_CODE, "credential": credential }))
+        .unwrap();
+    expect_error(resp, 409, "name_taken");
+
+    assert_eq!(
+        Store::new(&dir).load_devices().unwrap().len(),
+        1,
+        "the refused enrollment added nothing"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -290,6 +290,26 @@ fn forget(config: &Config, target: &str) -> Status {
 
 fn enroll(config: &Config, name: &str) -> Status {
     let store = Store::new(&config.state_dir);
+    // Fail here rather than after someone has walked to their phone, scanned
+    // the code and passed Face ID. The daemon refuses the same name again at
+    // enroll_finish, which is the check that counts -- this one only saves
+    // the trip.
+    match store.load_devices() {
+        Ok(devices) => {
+            if let Some(taken) = devices.iter().find(|d| d.name == name) {
+                eprintln!("shoephoned: a device named {name:?} is already enrolled");
+                eprintln!(
+                    "shoephoned: remove it with `shoephoned forget --id {}`, or choose another name",
+                    taken.handle()
+                );
+                return Status::Usage;
+            }
+        }
+        Err(e) => {
+            eprintln!("shoephoned: {e}");
+            return Status::Precondition;
+        }
+    }
     let mut buf = [0u8; 8];
     OsEntropy.fill(&mut buf);
     const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
