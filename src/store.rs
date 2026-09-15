@@ -161,9 +161,16 @@ impl Store {
     }
 
     /// The persisted id/serial counter, so a restart does not reuse an id
-    /// or serial already written to the ledger. `1` when the file is
-    /// absent: a fresh state directory, or an upgrade from before this file
-    /// existed, both start the count over from the beginning.
+    /// or serial already written to the ledger.
+    ///
+    /// When the file is absent the count cannot simply start at 1. That is
+    /// right for a fresh state directory and wrong for an upgrade from
+    /// before this file existed, because the installer preserves
+    /// `/var/lib/shoephone`: the ledger comes through the upgrade holding
+    /// ids that a counter restarting at 1 would hand out a second time, and
+    /// two different certificates under one id is exactly what the ledger
+    /// exists to prevent. So an absent file is answered from the ledger
+    /// instead — one id past the highest it already names.
     pub fn load_next_id(&self) -> Result<u64, String> {
         let path = self.next_id_path();
         match fs::read_to_string(&path) {
@@ -171,9 +178,44 @@ impl Store {
                 .trim()
                 .parse()
                 .map_err(|e| format!("parsing {}: {e}", path.display())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(1),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Ok(self.highest_ledger_id()?.map_or(1, |n| n + 1))
+            }
             Err(e) => Err(format!("reading {}: {e}", path.display())),
         }
+    }
+
+    /// The largest id any ledger line names, or `None` for no ledger and for
+    /// a ledger whose lines predate ids (`id` was added later, so those
+    /// lines carry `null` and are not a gap to be filled).
+    ///
+    /// Unlike [`Store::read_ledger`], an unreadable file is an error rather
+    /// than an empty result. A read that fails here would silently answer
+    /// "start at 1" and resume the very id reuse this exists to stop, so it
+    /// fails closed and the daemon refuses to start. An individual line that
+    /// does not parse is still skipped: one torn by a crash mid-write must
+    /// not hold up the count, and it cannot hide a larger id than the lines
+    /// around it.
+    fn highest_ledger_id(&self) -> Result<Option<u64>, String> {
+        let path = self.ledger_path();
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("opening {}: {e}", path.display())),
+        };
+        let mut highest = None;
+        for line in BufReader::new(file).lines() {
+            let line = line.map_err(|e| format!("reading {}: {e}", path.display()))?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: LedgerEntry = match serde_json::from_str(&line) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            highest = highest.max(entry.id);
+        }
+        Ok(highest)
     }
 
     pub fn save_next_id(&self, next_id: u64) -> Result<(), String> {
@@ -416,6 +458,67 @@ mod tests {
             [1, 2, 3, 5, 6, 7],
             "the garbage line is skipped, not fatal, and does not renumber its neighbors"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_upgrade_resumes_the_count_past_the_ledger_it_inherited() {
+        // install.sh preserves /var/lib/shoephone, so a daemon that predates
+        // the next_id file leaves its ledger behind. Starting over at 1 would
+        // reissue ids the ledger already names.
+        let dir = tmp("next-id-upgrade");
+        let store = Store::new(&dir);
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let entries: Vec<LedgerEntry> = (1..=6u64)
+            .map(|id| {
+                LedgerEntry::from(&Event::Requested {
+                    id,
+                    host: "web01".into(),
+                    reason: format!("entry {id}"),
+                    context: None,
+                    at: t0 + Duration::from_secs(id),
+                })
+            })
+            .collect();
+        store.append_ledger(&entries).unwrap();
+        assert!(
+            !dir.join("next_id").exists(),
+            "the upgrade case: no counter"
+        );
+
+        assert_eq!(
+            store.load_next_id().unwrap(),
+            7,
+            "one past the highest id the inherited ledger names"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_ledger_older_than_ids_does_not_shift_the_count() {
+        // `id` was added after the ledger existed, so the oldest lines carry
+        // null. Those are not a gap to be filled.
+        let dir = tmp("next-id-idless");
+        let store = Store::new(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("ledger.jsonl"),
+            "{\"kind\":\"requested\",\"host\":\"web01\",\"at\":1800000000}\n",
+        )
+        .unwrap();
+        assert_eq!(store.load_next_id().unwrap(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_ledger_refuses_to_answer_rather_than_guessing_one() {
+        // Answering 1 here would silently resume the id reuse this exists to
+        // stop, so the read fails closed and the daemon does not start.
+        let dir = tmp("next-id-unreadable");
+        fs::create_dir_all(dir.join("ledger.jsonl")).unwrap();
+        let store = Store::new(&dir);
+        let err = store.load_next_id().unwrap_err();
+        assert!(err.contains("ledger.jsonl"), "names the file: {err}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
