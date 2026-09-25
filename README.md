@@ -9,128 +9,155 @@
 
 Phone-approved, short-lived SSH certificates for coding agents.
 
-An agent that operates machines needs two kinds of access. Most of what it
-does is reading: logs, status, disk, containers. That should be promptless,
-or every prompt becomes noise and gets rubber-stamped. A little of what it
-does is dangerous, and that should cost one meaningful ceremony a person can
-perform from anywhere, on a device the agent cannot touch.
+A coding agent that runs machines needs two kinds of access. Reading logs,
+status and disk should be promptless, because a prompt on every command gets
+approved without being read. Admin work should cost one deliberate approval,
+made on a device the agent cannot touch. shoephone handles the admin half.
 
-shoephone is the dangerous half. The agent runs `shoephone` to ask for admin
-on one host. A daemon on a host the agent cannot reach shows the person the
-enforced scope on their phone, together with a short match code the agent's
-terminal also printed. The person compares the codes and approves by signing
-that scope plus a single-use nonce. The daemon signs an SSH certificate that
-is valid only on that host, only for the key that asked, and only until a
-window the person saw closes. The agent's ssh-agent picks it up and the
-session continues. Decline or timeout, and nothing is issued.
+1. The agent runs `shoephone request web01 --reason "..."`. Its terminal
+   prints a short match code.
+2. The person's phone shows the same code, the host, the admin account and
+   how long the access will last.
+3. The person checks that the codes match and approves with Face ID. The
+   phone signs exactly what it showed.
+4. The daemon issues an SSH certificate that works only on `web01`, only for
+   the key that asked, and only until the approved time runs out.
 
-The name is from Get Smart. The approver is a phone; the agency is CONTROL.
+A decline or a timeout issues nothing.
+
+The name comes from Get Smart: the approver is a phone, and the agency is
+CONTROL.
+
+**Terms**
+
+- **Agent:** a program such as Claude Code that runs shell commands for you,
+  including `ssh`.
+- **SSH certificate:** a public key signed by a certificate authority (CA).
+  sshd accepts it in place of an `authorized_keys` entry.
+- **Principal:** a name inside the certificate. Each host accepts only its
+  own, which is how a certificate is limited to one host.
+- **Window:** the span of time the person approved. Certificates are issued
+  inside it and never outlive it.
+- **Match code:** a short code shown on both the terminal and the phone, so
+  the person knows which request they are approving.
+- **WebAuthn:** the web standard for signing a server's challenge with a key
+  held on a device.
 
 ## Status
 
-Deployed. `shoephoned` holds the user CA, enforces the window, per-host
-principals, rate cap, cooldown and single-use nonce, serves the approve
-page, enrolls approver devices through WebAuthn, refuses any credential
-that syncs, and appends every outcome to a ledger. `shoephone` requests,
-waits, loads the certificate into ssh-agent, renews inside the window,
-disavows, and has a `doctor` that says why a request cannot succeed before
-you make it. The approver is the companion iOS app,
-[shoephone-app](https://github.com/curtisgalloway/shoephone-app), whose
-key lives in the phone's Secure Enclave behind Face ID; the web approve
-page remains for a hardware security key. The design is in
-[docs/DESIGN.md](docs/DESIGN.md), which also covers the three things to
-close *before* deploying any of this (an unattended secrets token that can
-read admin credentials, the infrastructure repository as the trusted
-computing base, and backup servers that accept deletes with no
-credential). A content-free push to an ntfy-style topic can tell the phone
-that a request is waiting, a window opened, or a window was killed.
+Deployed.
+
+- **`shoephoned`**, the daemon, holds the CA, enforces every limit, enrolls
+  approver devices, sends push notifications, and logs every outcome.
+- **`shoephone`**, the CLI, requests, renews and ends access, and loads
+  certificates into ssh-agent.
+- **The approver** is the iOS app
+  [shoephone-app](https://github.com/curtisgalloway/shoephone-app), with its
+  key in the Secure Enclave behind Face ID, or a hardware security key on the
+  daemon's web page.
+
+Read [docs/DESIGN.md](docs/DESIGN.md) before deploying. shoephone protects
+nothing if the agent can already read admin credentials from a vault, apply
+changes from your infrastructure repository, or delete backups without a
+credential.
+
+## Using the CLI
+
+```bash
+export SHOEPHONE_DAEMON=https://approve.example.internal   # or ~/.config/shoephone/config.toml
+shoephone doctor                # checks everything a request needs
+shoephone request web01 --reason "rotate the TLS cert; needs a service restart"
+ssh agent-admin@web01 sudo systemctl restart something
+shoephone renew web01           # the next 15-minute certificate, no second approval
+shoephone disavow web01         # end the window early
+```
+
+`request` prints the match code, waits for the phone, and loads the
+certificate into ssh-agent. `shoephone --skill` prints the full contract for
+agents, including every exit code.
 
 ## Deploying the daemon
 
-`shoephoned` belongs on the failsafe host described in the design: a small
-machine outside the hypervisor's failure domain, with no agent account of
-any tier, where admin is human-only. Four things are invariants; the rest
-is ordinary service setup.
+Run `shoephoned` on a small machine outside the failure domain of the hosts
+it signs for, with no agent account of any kind. Admin on that machine is for
+humans only.
 
-- The state directory and the CA key are root-only. `init-ca` creates the
-  key at mode 0600 and refuses to overwrite one that exists.
-- The config file holds the push token, so it is root-only too.
-- The daemon speaks plain HTTP on loopback. A TLS reverse proxy in front
-  serves the approve page to the phone; WebAuthn refuses anything else.
-- `rp_origin` is the exact https origin the phone loads, and `rp_id` is
-  its hostname. A mismatch fails every enrollment and approval.
+Four settings must be right:
 
-Clocks matter as much as any of that: the daemon and every host it signs
-for must keep their clocks synchronized (NTP is enough). Certificates
-carry absolute validity times, so a host whose clock runs behind accepts a
-certificate for longer than the approved window said, and one whose clock
-runs ahead rejects it early.
+- The state directory, the CA key and the config file are readable by root
+  only. The config holds push tokens.
+- The daemon serves plain HTTP on loopback. A reverse proxy in front provides
+  TLS, which WebAuthn requires.
+- `rp_origin` is the exact https origin the phone loads, and `rp_id` is its
+  hostname. If either is wrong, every enrollment and approval fails.
+- The daemon and every host it signs for keep their clocks in sync (NTP is
+  enough). A host whose clock runs slow accepts a certificate past the end of
+  the approved window.
 
 ### 1. Build and install
 
 ```bash
-cargo build --release           # never with --features test-hooks for a deployed daemon
+cargo build --release      # never add --features test-hooks for a deployed daemon
 install -m 0755 target/release/shoephoned /usr/local/bin/
 install -d -m 0700 /etc/shoephone
 install -m 0600 shoephoned.toml /etc/shoephone/shoephoned.toml
 ```
 
-That path is the daemon's default; `--config <file>` points it elsewhere.
-
-`webauthn-rs` links the `openssl` crate, so the host needs libssl.
+That config path is the default; `--config <file>` overrides it. The host
+needs libssl, which `webauthn-rs` links.
 
 ### 2. Configure
 
 ```toml
-listen = "127.0.0.1:7391"          # the reverse proxy is the only client
-state_dir = "/var/lib/shoephone"   # root-only; the systemd unit creates it 0700
+listen = "127.0.0.1:7391"          # only the reverse proxy connects
+state_dir = "/var/lib/shoephone"   # root-only; the systemd unit creates it
 ca_key = "/var/lib/shoephone/user_ca"
 rp_id = "approve.example.internal"
 rp_origin = "https://approve.example.internal"
 
-[principals]
+[principals]                        # the hosts this daemon signs for
 web01 = "agent-admin:web01"
 
-[notify]                            # optional: content-free push to an ntfy-style topic
-url = "https://ntfy.example.internal/shoephone"
-token = "..."                       # if the topic is protected
-click = "https://approve.example.internal"
-
-[apns]                              # optional: content-free push to the Shoephone app
-key_file = "/etc/shoephone/apns.p8" # APNs auth key from the developer portal, root-only
+[apns]                              # optional: push to the Shoephone app
+key_file = "/etc/shoephone/apns.p8" # APNs auth key, root-only
 key_id = "ABC123DEFG"
 team_id = "TEAM000000"
 topic = "xyz.curtisg.shoephone"     # the app's bundle id
 sandbox = true                      # true for an app installed from Xcode
 
-[access]                            # optional: Cloudflare Access service token, when the
-client_id = "....access"            # daemon is reached through a Cloudflare Tunnel; the
-client_secret_file = "/etc/shoephone/access.secret"  # or client_secret = "..." inline; the
-                                    # enrollment QR carries it to the app, nothing else uses it
+[notify]                            # optional: push to an ntfy-style topic
+url = "https://ntfy.example.internal/shoephone"
+token = "..."                       # if the topic is protected
+click = "https://approve.example.internal"
+
+[access]                            # optional: a Cloudflare Access service token
+client_id = "....access"            # for a daemon behind a Cloudflare Tunnel;
+client_secret_file = "/etc/shoephone/access.secret"
+                                    # the enrollment QR carries it to the app
 ```
 
-With `[apns]`, the daemon pushes "a request is waiting", "a window was
-opened" and "a window was killed" straight to every enrolled device that
-has registered a device token, which the app does on each launch. The
-push carries nothing else; the app fetches what is pending when opened.
-The daemon speaks to Apple directly over HTTP/2 with an ES256 token
-minted from the `.p8` key, so nothing sits between it and the phone.
+**Push.** Both channels announce three events and nothing else: a request is
+waiting, a window opened, a window was killed. The app fetches details when
+opened.
 
-The daemon refuses any credential the authenticator reports as
-backup-eligible, which is every synced passkey (iCloud Keychain, 1Password
-and the like): a synced credential also exists on the machine the agent
-runs on, which is exactly what the approver must not be. Enrollment and
-every approval check the flag, so a credential that turns synced later
-stops working. `allow_synced_credentials = true` at the top level admits
-them as a stopgap while a device-bound authenticator is on its way; the
-daemon names every such device at startup.
+**Synced passkeys are refused,** at enrollment and at every approval. A
+passkey synced through iCloud Keychain or 1Password also exists on the
+computer the agent runs on. `allow_synced_credentials = true` admits them as
+a stopgap, and the daemon lists each such device at startup.
 
-`[policy]` overrides the window, certificate and cooldown durations in
-minutes; the defaults are a 60 minute window (4 hours at most), 15 minute
-certificates, a 5 minute pending timeout, 6 requests an hour, and a 5
-minute cooldown after a decline that doubles to a 60 minute cap.
+**Limits.** A `[policy]` table overrides these defaults:
 
-### 3. Create the CA and run the service
+| Key | Default | Meaning |
+|---|---|---|
+| `default_window_minutes` | 60 | how long an approval lasts |
+| `max_window_minutes` | 240 | the longest window a request may ask for |
+| `cert_ttl_minutes` | 15 | lifetime of each certificate inside the window |
+| `pending_ttl_minutes` | 5 | how long a request waits for the phone |
+| `base_cooldown_minutes` | 5 | wait after a decline or timeout; doubles on each repeat |
+| `max_cooldown_minutes` | 60 | the cap on that doubling |
+| `max_requests_per_hour` | 6 | accepted requests per rolling hour, across all requesters |
+
+### 3. Create the CA and start the service
 
 ```bash
 shoephoned init-ca > user_ca.pub
@@ -139,16 +166,15 @@ systemctl enable --now shoephoned
 journalctl -u shoephoned -f
 ```
 
-The unit in [contrib/systemd/shoephoned.service](contrib/systemd/shoephoned.service)
-runs the daemon as root, because the key and state directory are
-root-only, and then removes every capability, makes the filesystem
-read-only except for the state directory, and filters system calls.
-It restarts on a crash only. A restart fails closed: enrolled devices
-survive, open windows and pending requests do not.
+`init-ca` writes the key at mode 0600 and never overwrites one. The
+[systemd unit](contrib/systemd/shoephoned.service) runs as root but drops all
+capabilities, keeps the filesystem read-only outside the state directory,
+and filters system calls. A restart keeps enrolled devices and drops open
+windows and pending requests.
 
 ### 4. Put TLS in front
 
-Any reverse proxy works; with Caddy the whole configuration is:
+Any reverse proxy works. With Caddy:
 
 ```
 approve.example.internal {
@@ -156,33 +182,34 @@ approve.example.internal {
 }
 ```
 
-Reach it from a certificate the phone trusts. A private CA in the phone's
-trust store is fine; the CLI uses the machine's trust store through the
-platform verifier, so the same private CA works there.
+The phone must trust the certificate. A private CA in the phone's trust store
+is fine, and the CLI uses the machine's trust store, so the same CA works
+there.
 
-### 5. Enroll the approver
+### 5. Enroll the phone
 
-At the host's console, never over a session the agent could see:
+At the daemon host's console, never in a session an agent can see:
 
 ```bash
 shoephoned enroll --name phone
 ```
 
-It prints a one-time code that is good for ten minutes or five wrong
-guesses, and a QR code carrying the code and the daemon's origin. In the
-Shoephone app on the phone, scan the QR (or type the code) and pass Face
-ID; the app is its own WebAuthn client and authenticator and needs no
-browser. For a hardware security key instead, open `rp_origin` in a
-browser, enter the code, and tap the key. An iPhone passkey made through
-Safari will not work: iOS only makes synced ones, and the daemon refuses
-them. Enrolling a second device is the same again with a different name;
-every enrolled device is pushed when a window opens or is killed, so an
-approval from one is visible on the others.
+This prints a QR code and a one-time code, good for ten minutes or five wrong
+guesses. In the Shoephone app, scan the QR (or type the code) and pass Face
+ID. For a hardware security key instead, open `rp_origin` in a browser, enter
+the code, and tap the key.
+
+A passkey made in Safari on an iPhone will not work: iOS makes only synced
+passkeys. To add a second device, enroll again with a different name. By
+default every enrolled device is notified when a window opens or is killed,
+so an approval on one shows up on the others.
+
+`shoephoned devices` lists enrolled devices; `shoephoned forget --id
+<handle>` removes one.
 
 ### 6. Trust the CA on each host
 
-For every host in `[principals]`, in `sshd_config`, scoped to the one
-user so no other account ever consults the CA:
+On every host in `[principals]`, add to `sshd_config`:
 
 ```
 Match User agent-admin
@@ -191,30 +218,15 @@ Match User agent-admin
     AuthorizedKeysFile none
 ```
 
-with `/etc/ssh/principals/agent-admin` containing exactly that host's
-principal from the table, for example `agent-admin:web01`. A certificate
-for any other host carries a different principal and is refused, and
-`AuthorizedKeysFile none` means no static key can drift in beside it.
-
-## Using the CLI
-
-```bash
-export SHOEPHONE_DAEMON=https://approve.example.internal   # or ~/.config/shoephone/config.toml
-shoephone doctor                # what is missing, before guessing
-shoephone request web01 --reason "rotate the TLS cert; needs a service restart"
-                                # prints a match code, waits for the phone, loads the cert
-ssh agent-admin@web01 sudo systemctl restart something
-shoephone renew web01           # next 15 minutes, no second tap, inside the window
-shoephone disavow web01         # close the window early
-```
-
-`shoephone --skill` prints the agent-facing document with the full exit
-code table.
+Put that host's principal, and only that one, in
+`/etc/ssh/principals/agent-admin`, for example `agent-admin:web01`. A
+certificate for another host is then refused, no static key can sit beside
+it, and no other account trusts the CA.
 
 ## Building
 
 ```bash
-cargo build --release           # never with --features test-hooks for a deployed daemon
+cargo build --release
 target/release/shoephone --skill
 ```
 
