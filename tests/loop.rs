@@ -12,6 +12,7 @@ use shoephone::ca::UserCa;
 use shoephone::client::{Client, Error};
 use shoephone::config::{Config, PolicyConfig};
 use shoephone::exit::Status;
+use shoephone::notify::NotifyConfig;
 use shoephone::server::Daemon;
 use shoephone::session::Session;
 use ssh_key::{Certificate, HashAlg};
@@ -40,6 +41,14 @@ async fn start_reusing(dir: &Path) -> (Client, Arc<Daemon>) {
 }
 
 async fn start_at(dir: &Path, ca_key: &Path) -> (Client, Arc<Daemon>) {
+    start_with(dir, ca_key, None).await
+}
+
+async fn start_with(
+    dir: &Path,
+    ca_key: &Path,
+    notify: Option<NotifyConfig>,
+) -> (Client, Arc<Daemon>) {
     let mut principals = BTreeMap::new();
     principals.insert("web01".to_owned(), "agent-admin:web01".to_owned());
     let config = Config {
@@ -51,7 +60,7 @@ async fn start_at(dir: &Path, ca_key: &Path) -> (Client, Arc<Daemon>) {
         rp_name: "test".into(),
         principals,
         policy: PolicyConfig::default(),
-        notify: None,
+        notify,
         allow_synced_credentials: false,
         apns: None,
         access: None,
@@ -233,6 +242,136 @@ async fn approved_window_issues_certificates_bound_to_the_key() {
             "{kind} missing:\n{ledger}"
         );
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stand-in ntfy topic: answers every POST with 200 and a closed
+/// connection, and sends each body down the channel.
+fn fake_topic() -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/shoephone", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let mut sock = sock.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 1024];
+            let body = loop {
+                let n = sock.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw);
+                let Some(head_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let len = text[..head_end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= head_end + 4 + len {
+                    break text[head_end + 4..].to_string();
+                }
+            };
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            if tx.send(body).is_err() {
+                return;
+            }
+        }
+    });
+    (url, rx)
+}
+
+/// DESIGN.md: every issuance, renewal, decline and kill is reported to the
+/// approver's device, because the daemon's own ledger is worthless once the
+/// daemon is compromised. So every line the ledger gains must have gone out
+/// as a push too -- one for one, not just the events that need a tap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_ledger_event_is_pushed_to_the_device() {
+    let dir = scratch("audit-push");
+    let ca_key = dir.join("user_ca");
+    UserCa::generate("test CA")
+        .unwrap()
+        .write_openssh_file(&ca_key)
+        .unwrap();
+    let (url, pushes) = fake_topic();
+    let notify = NotifyConfig {
+        url,
+        token: None,
+        click: None,
+    };
+    let (client, _daemon) = start_with(&dir, &ca_key, Some(notify)).await;
+    let client = Arc::new(client);
+    let key = Session::new(dir.join("session")).public_key().unwrap();
+    let body = RequestBody {
+        host: "web01".into(),
+        public_key: key.clone(),
+        requester: "test".into(),
+        reason: "loop test: every event is pushed".into(),
+        context: None,
+        window_minutes: None,
+    };
+
+    // requested, approved, issued, killed
+    let c = client.clone();
+    let b = body.clone();
+    let reply = blocking(move || c.request(&b)).await.unwrap();
+    let http = ureq::post(format!("{}/api/test/approve", client.base()))
+        .send_json(serde_json::json!({ "id": reply.id }))
+        .unwrap();
+    assert_eq!(http.status(), 200);
+    let c = client.clone();
+    let k = key.clone();
+    blocking(move || c.issue("web01", &k)).await.unwrap();
+    let c = client.clone();
+    blocking(move || c.kill("web01")).await.unwrap();
+
+    // requested, declined
+    let c = client.clone();
+    let b = body.clone();
+    let reply = blocking(move || c.request(&b)).await.unwrap();
+    let http = ureq::post(format!("{}/api/decline", client.base()))
+        .send_json(serde_json::json!({ "id": reply.id }))
+        .unwrap();
+    assert_eq!(http.status(), 200);
+
+    let ledger = std::fs::read_to_string(dir.join("ledger.jsonl")).unwrap();
+    let mut expected: Vec<&str> = ledger
+        .lines()
+        .map(|line| {
+            let kind = serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            match kind.as_str() {
+                "requested" => "A request is waiting for your approval.",
+                "approved" => "An authorization is now active.",
+                "issued" => "A certificate was issued.",
+                "killed" => "An authorization was terminated.",
+                "declined" => "A request was declined.",
+                "timed_out" => "A request expired without an answer.",
+                other => panic!("ledger kind {other} has no push"),
+            }
+        })
+        .collect();
+    assert_eq!(expected.len(), 6, "{ledger}");
+
+    // Each call's pushes go out on their own blocking task, so arrival
+    // order across calls is not guaranteed; compare as multisets.
+    let mut got: Vec<String> = (0..expected.len())
+        .map(|_| pushes.recv_timeout(Duration::from_secs(5)).unwrap())
+        .collect();
+    assert!(
+        pushes.recv_timeout(Duration::from_millis(200)).is_err(),
+        "more pushes than ledger lines"
+    );
+    expected.sort_unstable();
+    got.sort_unstable();
+    assert_eq!(got, expected);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

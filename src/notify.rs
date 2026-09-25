@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The content-free push to the approver's phone.
 //!
-//! When a request arrives, a window opens, or a window is killed, the
-//! daemon POSTs a fixed message to an ntfy-style topic the operator runs.
-//! The payload never carries the host, the scope, or anything else from the
-//! request: the phone opens the approve page and fetches the state from the
-//! daemon. A forged or replayed push at worst opens the page onto an empty
-//! list.
+//! Every ledger event reaches the phone as a push: a request arriving, a
+//! window opening, a certificate issued, a request declined or timed out,
+//! a window killed. That is the design's audit rule -- the daemon's own
+//! ledger is worthless once the daemon is compromised, but a push already
+//! delivered stays on the phone. The payload is one fixed sentence and
+//! never carries the host, the scope, or anything else from the request:
+//! the phone fetches the state from the daemon. A forged or replayed push
+//! at worst opens the page onto an empty list.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -41,6 +43,12 @@ pub enum Push {
     WindowOpened,
     /// A window was killed from the page.
     WindowKilled,
+    /// A certificate was signed: the first one in a window, or a renewal.
+    CertificateIssued,
+    /// A pending request was declined, from the page or by a kill.
+    RequestDeclined,
+    /// A pending request expired with no answer.
+    RequestTimedOut,
 }
 
 impl Push {
@@ -51,25 +59,40 @@ impl Push {
             Push::RequestWaiting => "request_waiting",
             Push::WindowOpened => "window_opened",
             Push::WindowKilled => "window_killed",
+            Push::CertificateIssued => "certificate_issued",
+            Push::RequestDeclined => "request_declined",
+            Push::RequestTimedOut => "request_timed_out",
         }
     }
 
-    pub const ALL: [Push; 3] = [Push::RequestWaiting, Push::WindowOpened, Push::WindowKilled];
+    pub const ALL: [Push; 6] = [
+        Push::RequestWaiting,
+        Push::WindowOpened,
+        Push::WindowKilled,
+        Push::CertificateIssued,
+        Push::RequestDeclined,
+        Push::RequestTimedOut,
+    ];
 
     fn body(self) -> &'static str {
         match self {
             Push::RequestWaiting => "A request is waiting for your approval.",
             Push::WindowOpened => "An authorization is now active.",
             Push::WindowKilled => "An authorization was terminated.",
+            Push::CertificateIssued => "A certificate was issued.",
+            Push::RequestDeclined => "A request was declined.",
+            Push::RequestTimedOut => "A request expired without an answer.",
         }
     }
 
-    /// Only the request interrupts; the other two are for the record.
+    /// Only the request asks for the person. Everything else is the audit
+    /// record: it should land on the phone, not interrupt.
+    fn is_record(self) -> bool {
+        !matches!(self, Push::RequestWaiting)
+    }
+
     fn priority(self) -> &'static str {
-        match self {
-            Push::RequestWaiting => "high",
-            Push::WindowOpened | Push::WindowKilled => "default",
-        }
+        if self.is_record() { "default" } else { "high" }
     }
 
     fn tags(self) -> &'static str {
@@ -77,6 +100,9 @@ impl Push {
             Push::RequestWaiting => "phone",
             Push::WindowOpened => "unlock",
             Push::WindowKilled => "no_entry",
+            Push::CertificateIssued => "key",
+            Push::RequestDeclined => "x",
+            Push::RequestTimedOut => "hourglass",
         }
     }
 }
@@ -239,7 +265,11 @@ impl Apns {
     /// requester -- which is the property worth keeping; the count says only
     /// how many things are outstanding, and the body already announces that
     /// there is one. A waiting request is time-sensitive so it breaks
-    /// through a Focus; the other two are ordinary.
+    /// through a Focus. A window opening or closing is ordinary. The rest --
+    /// issued, declined, timed out -- are passive: they go into the
+    /// notification list, where the record is kept, without lighting the
+    /// screen, because a renewal every quarter hour must not become the
+    /// noise that trains the person to stop looking.
     ///
     /// The badge is here rather than left to the app because the app only
     /// polls while it is in front: a push arriving at a closed app would set
@@ -248,6 +278,7 @@ impl Apns {
         let level = match push {
             Push::RequestWaiting => "time-sensitive",
             Push::WindowOpened | Push::WindowKilled => "active",
+            Push::CertificateIssued | Push::RequestDeclined | Push::RequestTimedOut => "passive",
         };
         serde_json::json!({
             "aps": {
@@ -260,27 +291,33 @@ impl Apns {
         })
     }
 
+    pub fn collapse_id(push: Push) -> Option<&'static str> {
+        (!push.is_record()).then(|| push.tags())
+    }
+
     pub async fn send(&self, push: Push, token: &str, badge: u64) -> Delivery {
         let bearer = match self.bearer(SystemTime::now()) {
             Ok(b) => b,
             Err(e) => return Delivery::Failed(e),
         };
         let url = format!("{}/3/device/{token}", self.gateway());
-        let priority = match push {
-            Push::RequestWaiting => "10",
-            Push::WindowOpened | Push::WindowKilled => "5",
-        };
-        let sent = self
+        let priority = if push.is_record() { "5" } else { "10" };
+        let mut req = self
             .client
             .post(&url)
             .bearer_auth(bearer)
             .header("apns-topic", &self.config.topic)
             .header("apns-push-type", "alert")
-            .header("apns-priority", priority)
-            .header("apns-collapse-id", push.tags())
-            .json(&Self::payload(push, badge))
-            .send()
-            .await;
+            .header("apns-priority", priority);
+        // A collapse id makes the phone replace the previous notification of
+        // the same id. Right for "a request is waiting", where only the
+        // latest matters; wrong for a record, where the second issuance
+        // replacing the first would erase exactly the history this exists
+        // to keep.
+        if let Some(id) = Self::collapse_id(push) {
+            req = req.header("apns-collapse-id", id);
+        }
+        let sent = req.json(&Self::payload(push, badge)).send().await;
         match sent {
             Ok(resp) => {
                 let status = resp.status().as_u16();
@@ -337,14 +374,8 @@ mod tests {
 
     #[test]
     fn every_push_is_fixed_text_with_the_headers_and_nothing_else() {
-        for (push, body) in [
-            (
-                Push::RequestWaiting,
-                "A request is waiting for your approval.",
-            ),
-            (Push::WindowOpened, "An authorization is now active."),
-            (Push::WindowKilled, "An authorization was terminated."),
-        ] {
+        for push in Push::ALL {
+            let body = push.body();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let receiver = receive_one(listener);
@@ -437,6 +468,36 @@ mod tests {
     }
 
     #[test]
+    fn records_are_quiet_and_never_collapse_onto_each_other() {
+        assert_eq!(
+            Apns::collapse_id(Push::RequestWaiting),
+            Some("phone"),
+            "a newer waiting request should replace the stale one"
+        );
+        for push in Push::ALL.into_iter().filter(|p| p.is_record()) {
+            assert_eq!(
+                Apns::collapse_id(push),
+                None,
+                "{push:?} would overwrite the previous record on the phone"
+            );
+            assert_eq!(push.priority(), "default", "{push:?}");
+        }
+        for push in [
+            Push::CertificateIssued,
+            Push::RequestDeclined,
+            Push::RequestTimedOut,
+        ] {
+            assert_eq!(
+                Apns::payload(push, 0)["aps"]["interruption-level"],
+                "passive",
+                "{push:?}"
+            );
+        }
+        let kinds: std::collections::BTreeSet<&str> = Push::ALL.iter().map(|p| p.kind()).collect();
+        assert_eq!(kinds.len(), Push::ALL.len(), "kind names must be distinct");
+    }
+
+    #[test]
     fn bearer_is_es256_with_kid_and_iss_and_is_reused_for_fifty_minutes() {
         let dir = std::env::temp_dir().join(format!("shoephone-apns-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -494,7 +555,7 @@ mod tests {
 
         // The whole payload, for every kind, must not name anything about
         // the request. This is the assertion the old name was gesturing at.
-        for push in [Push::RequestWaiting, Push::WindowOpened, Push::WindowKilled] {
+        for push in Push::ALL {
             let text = Apns::payload(push, 1).to_string();
             for forbidden in ["web01", "apps", "reason", "requester", "\"id\""] {
                 assert!(

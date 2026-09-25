@@ -341,18 +341,7 @@ impl Daemon {
         if events.is_empty() {
             return;
         }
-        // Only these three reach the phone. Declined and TimedOut are
-        // either the approver's own doing or nothing happening, and Issued
-        // is the agent collecting what was already approved.
-        let pushes: Vec<Push> = events
-            .iter()
-            .filter_map(|e| match e {
-                Event::Requested { .. } => Some(Push::RequestWaiting),
-                Event::Approved { .. } => Some(Push::WindowOpened),
-                Event::Killed { .. } => Some(Push::WindowKilled),
-                _ => None,
-            })
-            .collect();
+        let pushes: Vec<Push> = events.iter().map(push_for).collect();
         if let Some(n) = &self.notifier
             && !pushes.is_empty()
         {
@@ -437,6 +426,21 @@ fn now() -> SystemTime {
 /// The daemon holds at most one pending request, so this is windows + 0 or 1.
 fn badge_count(inner: &mut Inner, now: SystemTime) -> u64 {
     inner.grants.outstanding(now)
+}
+
+/// Every ledger event becomes a push; the device, not the daemon, keeps the
+/// audit trail (DESIGN.md, custody rule 6). The match is exhaustive on
+/// purpose, with no `_` arm: a new `Event` variant does not compile until
+/// someone decides what the phone is told about it.
+fn push_for(event: &Event) -> Push {
+    match event {
+        Event::Requested { .. } => Push::RequestWaiting,
+        Event::Approved { .. } => Push::WindowOpened,
+        Event::Issued { .. } => Push::CertificateIssued,
+        Event::Declined { .. } => Push::RequestDeclined,
+        Event::TimedOut { .. } => Push::RequestTimedOut,
+        Event::Killed { .. } => Push::WindowKilled,
+    }
 }
 
 fn push_targets(inner: &Inner) -> Vec<(String, Option<Vec<String>>)> {

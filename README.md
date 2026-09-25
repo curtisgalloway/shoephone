@@ -136,9 +136,12 @@ client_secret_file = "/etc/shoephone/access.secret"
                                     # the enrollment QR carries it to the app
 ```
 
-**Push.** Both channels announce three events and nothing else: a request is
-waiting, a window opened, a window was killed. The app fetches details when
-opened.
+**Push.** Every event the daemon logs is also pushed, so the phone keeps an
+audit trail the daemon cannot rewrite: a request is waiting, a window
+opened, a certificate was issued, a request was declined or expired, a
+window was killed. Each push is one fixed sentence; the app fetches details
+when opened. Only a waiting request interrupts. On the app, issued,
+declined and expired arrive silently in the notification list.
 
 **Synced passkeys are refused,** at enrollment and at every approval. A
 passkey synced through iCloud Keychain or 1Password also exists on the
