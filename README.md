@@ -5,7 +5,7 @@
 
 # shoephone
 
-<img src="assets/logo/shoephone-mark-256.png" alt="" width="160" align="right">
+<a href="https://commons.wikimedia.org/wiki/File:DonAdams.jpg"><img src="assets/banner/shoe-phone.jpg" alt="Don Adams as Maxwell Smart, holding a shoe to his ear as a phone" title="Don Adams as Maxwell Smart, 1968. Public domain, via Wikimedia Commons." width="280" align="left" hspace="16" vspace="4"></a>
 
 Phone-approved, short-lived SSH certificates for coding agents.
 
@@ -13,6 +13,8 @@ A coding agent that runs machines needs two kinds of access. Reading logs,
 status and disk should be promptless, because a prompt on every command gets
 approved without being read. Admin work should cost one deliberate approval,
 made on a device the agent cannot touch. shoephone handles the admin half.
+
+<br clear="left">
 
 1. The agent runs `shoephone request web01 --reason "..."`. Its terminal
    prints a short match code.
@@ -24,9 +26,6 @@ made on a device the agent cannot touch. shoephone handles the admin half.
    the key that asked, and only until the approved time runs out.
 
 A decline or a timeout issues nothing.
-
-The name comes from Get Smart: the approver is a phone, and the agency is
-CONTROL.
 
 **Terms**
 
