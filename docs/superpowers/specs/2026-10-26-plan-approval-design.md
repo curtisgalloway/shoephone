@@ -3,348 +3,357 @@
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Plan approval: one phone tap applies one Terraform plan
+# Plan approval: an agent applies Terraform after one phone tap
 
-Status: design, 2026-10-26. Not built. Decisions marked **(operator)** were
-made by the operator on 2026-10-26; decisions marked **(builder's call)** are
-the author's defaults and may be changed in review.
+Status: design, 2026-10-26, revised the same day after an outside review (see
+Review history). Not built. Decisions marked **(operator)** were made by the
+operator; **(builder's call)** marks the author's defaults, open to change in
+review.
 
 ## Terms
 
-- **Plan** — the output of `terraform plan -out FILE`: a saved, exact list of
-  the changes Terraform would make. `terraform apply FILE` applies that list
-  and nothing else, and refuses if the state changed since the plan was made.
-- **Runner** — a new, single-purpose host (or guest) that holds the
-  credentials Terraform needs and is the only place Terraform runs. It is not
-  the daemon's host and has no agent account.
-- **Project** — one Terraform root module the runner knows by name, with its
-  working directory, credentials and allowed providers fixed in the runner's
-  own configuration, not in the repository.
-- **Provider** — a Terraform plugin binary (Proxmox, Cloudflare, 1Password)
-  that talks to an API. It runs with the credentials loaded.
-- **Bundle** — a `git bundle` of one commit, which the CLI uploads so the
-  runner can check out exactly that commit without the agent pushing.
-- **Enforced scope** — what the approver's signature covers. Today it is
-  host, principal and window; for an apply grant it is project, commit and
-  plan digest (below).
+- **Plan**: the output of `terraform plan -out FILE`. It is a saved, exact
+  list of changes. `terraform apply FILE` applies that list and nothing else,
+  and refuses if the state has changed since the plan was made.
+- **Runner**: a new single-purpose host that holds the credentials Terraform
+  needs and is the only place Terraform runs. It is not the daemon's host and
+  has no agent account.
+- **Project**: one Terraform root module that the runner knows by name.
+- **Trusted revision**: the one commit of a project that the operator has
+  reviewed and authorized to run with credentials. Each project has at most
+  one at a time.
+- **Execution input**: every file the runner gives Terraform for a project:
+  `.tf` files, local modules, templates, cloud-init assets, any file the
+  configuration reads, the dependency lock file, and file modes.
+- **Manifest**: the values the agent supplies for an apply. It holds data
+  only, never code, and is checked against the schema.
+- **Schema**: the declared agent-settable variables, each with a type and a
+  constraint. It is part of the trusted revision, so the operator authorizes
+  it together with the code.
+- **Protected credential**: a secret the runner uses to act: hypervisor,
+  DNS, secrets store, state database. It must never reach the agent.
+- **Released secret**: a runtime secret the trusted code deliberately places
+  on a machine the agent may administer, such as a service token in a VM's
+  cloud-init. Placing it there discloses it to that machine's administrators.
+- **Bundle**: a `git bundle` of one commit, which the CLI uploads so that
+  the agent does not have to push.
 
 The rest of shoephone's vocabulary is in [DESIGN.md](../../DESIGN.md) → Terms.
 
 ## Why
 
-An agent session can prepare a Terraform change but cannot apply it: the
-credentials Terraform needs (hypervisor API, DNS provider, the secrets store
-Terraform reads from, the state database) sit in a store no agent identity
-can read, by design. So every apply is a command handed to the operator to
-paste. The operator wants the agent to apply after one phone approval, for
-any Terraform project, not only the first consumer.
+An agent session can prepare a Terraform change but cannot apply it. The
+credentials Terraform needs are in a store no agent identity can read, by
+design, so every apply is a command handed to the operator to paste. The
+operator wants the agent to apply after a phone approval, for any Terraform
+project.
 
-shoephone's existing grant, an SSH certificate for a time window, is the wrong
-shape for this. If the agent gets a shell on a host that holds Terraform's
-credentials, it can read them during the window and keep them afterwards, so
-the window bounds nothing. And DESIGN.md's Perimeter 2 already says an apply
-needs human approval of the change, not of a time slot.
+Two shapes were rejected:
+
+- **An SSH window to a host that holds the credentials.** The agent could
+  read the credentials during the window and keep them afterward.
+- **Running agent-written Terraform beside the credentials, guarded by
+  automated checks.** The first version of this design did that. An outside
+  review found four independent ways for agent code to leak a credential
+  past every check (Review history). Terraform evaluates code with the
+  credentials loaded, and no syntax filter is a boundary against that.
+
+The rule this design follows instead: **the agent supplies data, never code,
+to anything that holds credentials.** Code runs with credentials only after
+the operator has reviewed it.
 
 ## Goals
 
 1. One phone approval applies one specific, already-computed plan.
-2. The agent never holds, and cannot read, any credential Terraform uses.
+2. The agent never holds or reads a protected credential.
 3. Generic: any Terraform project the runner is configured for, with no
    per-project code in shoephone.
-4. What the approver sees is computed by the runner, not described by the
-   agent.
-5. Every step reaches the approver's devices and the ledger, as every SSH
-   grant event does today.
+4. Everything the approver sees is computed by the runner, not described by
+   the agent.
+5. Every step reaches the approver's devices and the ledger.
 
 ## Non-goals
 
 - Ansible, or anything else over SSH. The existing SSH grant covers that.
-- Reviewing the change's *intent*. The approver sees what will change; the
-  runner's policy check (below) is what keeps agent-written code from
-  leaking credentials, whether or not the approver reads the diff.
-- Running Terraform on the agent's machine with borrowed credentials.
-- Minting short-lived provider tokens. Rejected **(operator)**: it cannot
-  cover every credential Terraform reads, and it would put credentials in the
-  daemon.
+- Running unreviewed agent-written code with credentials, in any form.
+- Releasing a secret onto a host as its own action. Deferred; see Later.
 
 ## Anti-goals (this fails even if it works)
 
-- Any path where a credential reaches the agent: in plan output, in an error
-  message, in a log the agent can read, or through a network request from
-  agent-written code.
-- Any approval whose screen text came from the agent rather than the runner.
+- A protected credential reaching the agent through plan output, an error
+  message, a log, the ledger, an address, or a network request.
+- An approval whose screen text came from the agent rather than the runner.
 - The daemon holding a credential to anything it gates.
 - An approval that applies something other than the plan shown.
+- A trust approval that becomes a reflex. It must stay rare and look
+  different from an apply approval.
 
 ## Decisions
 
 | Question | Decision |
 |---|---|
-| What an approval authorizes | **(operator)** One saved plan, identified by its digest, for one commit of one project. Not a window. |
-| Plan-time code | **(operator)** The runner refuses configurations that can run code or reach the network at plan time, and its firewall allows only the APIs the project needs. See Policy check. |
-| Where Terraform runs | **(operator)** A new dedicated runner. Nothing else runs there and no agent account exists on it. Root on it means every credential it holds. |
-| How the runner gets credentials | **(operator)** Its own secrets-store identity (in the reference deployment, a new 1Password service account) that can read the privileged store, token root-only on the runner. The agent's identity never gains that store. |
-| How code reaches the runner | **(builder's call)** The CLI uploads a bundle of HEAD through the daemon. The agent does not have to push, which in several projects needs the operator anyway. The runner checks the bundle's commit id matches the request. |
-| Who talks to whom | **(builder's call)** The runner has no inbound ports. It polls the daemon over HTTPS, authenticating with its own ed25519 key named in the daemon's config. The agent talks only to the daemon. |
-| Where credentials come from per project | **(builder's call)** Runner configuration only. The repository's own `.env` or wrapper scripts are never read or run: they are agent-editable. |
-| Rate cap, cooldown, kill | **(builder's call)** Shared with SSH grants: same per-approver hourly cap, same decline cooldown, `kill <project>` cancels a pending apply. |
-| Apply-time leakage | **(operator)** A sensitivity check on the saved plan: a value Terraform tags as sensitive may land only in the project's listed secret destinations. See Sensitivity check. |
-| What the agent sees on failure | **(operator)** Terraform's own diagnostics, which already redact sensitive values, behind the runner's masking of every value it resolved. |
-| Secrets-store reach | **(operator)** One runner identity reading the whole privileged store. The sensitivity check, not item scoping, keeps looked-up values from leaving. |
-| Approvals per apply | **(operator)** One. The runner plans as soon as the agent asks; plan start is recorded and pushed passively. |
+| What authorizes code | **(operator)** A *trust* approval. The operator reads the full diff of the execution input against the current trusted revision and signs its digest. The reading happens on the approve page for small diffs, and elsewhere for large ones. |
+| What authorizes a change | **(operator)** An *apply* approval of one saved plan, by digest, computed from the trusted revision and a validated manifest. |
+| Agent-written code | **(operator)** Never runs with credentials until a trust approval covers it. |
+| Errors the agent sees | **(operator)** Runner-defined categories, resource addresses from the trusted code, and messages the runner explicitly vetted. Never Terraform's or a provider's own text: even its one-line summary can carry a raw API error. |
+| Full errors | **(operator)** Stay on the runner. The operator reads them over their own SSH session. They never pass through the daemon. |
+| Secret-install action | **(operator)** Deferred until after v1. |
+| Where Terraform runs | **(operator)** A dedicated runner with no agent account and no inbound ports. Root on it means every credential it holds. |
+| Runner credentials | **(operator)** Its own secrets-store identity, which can read the privileged store. The token is readable by root only. The agent's identity never gains that store. |
+| Approvals per apply | **(operator)** One. Planning starts as soon as the agent asks; plan start is recorded and pushed silently. |
+| Delete and replace | **(builder's call)** Refused unless the request asks for them. When the runner's plan contains either, the phone shows a distinct, warning-style approval. The runner decides the classification from the plan and binds it into the scope. |
+| Concurrency | **(builder's call)** One active job across all projects in v1. |
+| Rate cap, cooldown, kill | **(builder's call)** Shared with SSH grants and counted per approver. |
 
-## How it works
+## Trust: authorizing code
 
-```
-agent CLI ──request + bundle──▶ daemon ◀──poll (signed)── runner
-                                  │                          │
-                                  │◀── plan summary + digest ┤  checkout, policy check,
-                                  │                          │  terraform plan -out
-  phone ◀── push: apply waiting ──┤                          │
-  phone ── WebAuthn(scope+nonce)─▶│                          │
-                                  │── approved(job, digest) ▶│  terraform apply <saved plan>
-agent CLI ◀── result ─────────────┤◀── result ───────────────┤
+```bash
+shoephone trust <project> --reason "..."
 ```
 
-1. **Request.** In the project's checkout the agent runs
-   `shoephone apply <project> --reason "..."`. The CLI refuses a dirty tree
-   (so what is applied is a commit), bundles HEAD, and sends project, commit
-   id, reason and bundle to the daemon. The daemon checks the project name
-   against its configured list, the rate cap and the cooldown, exactly as for
-   a host, and stores the job as pending. It prints a match code, as today.
-2. **Plan.** The runner's poll returns the job and the daemon records
-   `plan started` (ledger, passive push): credentials are in use from here
-   on, before any approval. The runner unpacks the bundle
-   into a fresh directory, checks the commit id, runs the policy check, runs
-   `terraform init` (no downloads, see below) and `terraform plan -out`, then
-   `terraform show -json` on the saved plan, and runs the sensitivity check
-   on that JSON (refusal: exit 30, nothing shown to the approver). From the
-   JSON it builds the
-   **plan summary**: counts of create, update, replace and delete, and the
-   list of resource addresses with their action. It posts the summary and the
-   SHA-256 of the saved plan file to the daemon, and keeps the file.
-3. **Approve.** The daemon pushes "apply waiting" to the approver's devices.
-   The enforced scope is `project`, `commit`, `plan_digest`, the counts and
-   the address list, as the runner reported them. The approver's WebAuthn
-   signature covers that scope and a nonce, through the same server-side
-   ceremony snapshot used for SSH grants. The screen shows deletes and
-   replacements first and in a warning style.
-4. **Apply.** On approval the runner's next poll returns
-   `approved(job, plan_digest)`. The runner re-hashes its saved file, refuses
-   on a mismatch, and runs `terraform apply` on it. Terraform itself refuses
-   a plan whose state has moved on.
-5. **Result.** The runner posts success or failure and a sanitized log (see
-   What the agent sees). The daemon records it in the ledger, pushes it to
-   the devices, and returns it to the waiting CLI.
+1. The CLI refuses a dirty tree, bundles HEAD and uploads it with the reason.
+2. A **credential-free review worker** on the runner unpacks the bundle. It
+   computes the full diff of the execution input against the current trusted
+   revision, or the full content if this is the first one, and records any
+   change to the schema. It also lists the warnings described below. It
+   never runs Terraform on the candidate.
+3. The trust scope is: project, baseline revision digest, candidate digest,
+   diff digest, schema digest, and trust-policy version. The approve page
+   shows the diff in full when it fits under a size limit. When it does not,
+   the page shows only the digests and a command for the operator to run in
+   their own checkout, which prints the same diff digest. The page never
+   shows a truncated diff. The phone shows a short summary (files changed,
+   lines added and removed, schema changed or not) in a style unlike an
+   apply approval.
+4. On approval the candidate becomes the one trusted revision, and the
+   previous one stops being runnable. A trust review whose baseline has
+   changed since it was computed is refused as stale. `shoephoned untrust
+   <project>`, at the daemon's console, leaves a project with none.
 
-A job that is not approved within the pending timeout (5 minutes) is a
-timeout, counted as a decline, and the runner deletes its saved plan.
+**The reviewer's obligation**, printed at the top of every trust review:
 
-## Policy check (runs before `terraform init`)
+> For every manifest the schema accepts, protected credentials may reach only
+> their provider authentication and the approved destinations, and nothing
+> the agent can see (results, addresses, which actions run) may reveal them.
 
-The repository is agent-written, and Terraform evaluates it with the
-credentials loaded. The check refuses, with exit 30, any configuration that:
+That obligation is about what agent-settable values can steer, not only
+about their types. Examples of trusted code that would fail it: an
+agent-settable item id fed to a secrets-store lookup; an agent-settable file
+path given to a resource that reads local files; an agent-settable pattern
+matched against a secret; `count` or a condition that compares a secret with
+an agent-settable value; an agent-settable VM or disk id that could select
+the runner itself.
 
-- uses a resource or data-source **type** not in the project's allowlist.
-  The allowlist names types (`proxmox_virtual_environment_vm`,
-  `onepassword_item`), not whole providers, because any data source on an
-  allowed provider makes API calls with agent-chosen arguments.
-  `data "external"`, `data "http"` and `terraform_remote_state` (which reads
-  other projects' state with the runner's backend credentials) are never
-  allowed;
-- contains a `provider` block. The runner writes provider configuration
-  itself, as an override file, so the repository cannot redirect an
-  endpoint or feed one provider's credential from another's data source;
-- calls a provider-defined function (`provider::...`);
-- has a `provisioner` block of any kind (`local-exec`, `remote-exec`, `file`);
-- calls `nonsensitive(...)` (which can lift a secret into plan output);
-- calls `file`, `filebase64`, `templatefile`, `fileset` or similar with a
-  path that is not a literal inside the module directory;
-- contains a symbolic link anywhere in the checkout;
-- sources a module from anywhere but a relative local path;
-- declares a backend other than the one in the runner's project config, or
-  sets backend options the runner did not provide.
+The review worker flags constructs that make the obligation hard to meet:
+provisioners, `external` and `http` data sources, `import` blocks,
+`nonsensitive()`, provider-defined functions, non-local modules, symlinks,
+and any schema variable that reaches a secrets-store selector, a file path,
+`count`, `for_each` or a condition. These are warnings for the reviewer, not
+a boundary. **(builder's call)**
 
-Providers come from a plugin directory on the runner (`-plugin-dir`), pinned
-by hash, so `init` never downloads one and a new provider cannot be slipped
-in through `.terraform.lock.hcl`.
+## Apply: authorizing a change
 
-The runner's egress firewall allows only the endpoints in the project's
-config (hypervisor API, DNS API, secrets store, state database) and the
-daemon. Some providers also need SSH to the hypervisor (the bpg/proxmox
-provider uploads snippets that way), so an endpoint entry may be SSH as well
-as HTTPS. There are no pre-plan hooks: anything a project's own preflight
-script checks either surfaces as a plan or apply error or stays a human
-step. Even a check that misses something then has nowhere to send it.
+```bash
+shoephone apply <project> --manifest FILE --reason "..." [--allow-destroy]
+```
 
-**(builder's call)** The check parses HCL with a real parser (the `hcl-edit`
-or `hcl-rs` crate), not with regular expressions, and walks every
-expression, so a banned function inside a nested block is still found.
-JSON-syntax `.tf.json` files are refused.
+1. **Request.** The CLI sends the project, the manifest and the reason. The
+   daemon checks the project, the rate cap and the cooldown, and stores a
+   pending job.
+2. **Validate.** The runner checks the manifest against the trusted
+   revision's schema. It refuses unknown variables, duplicate keys, implicit
+   type coercion, values outside their constraint, and oversized
+   collections. Each agent-settable variable must be given, unless the
+   schema states its default. Constraints favor choosing from an
+   operator-owned map (an image name, a size class) over free strings. The
+   manifest becomes the only source of variable values. The runner ignores
+   `*.auto.tfvars` and `terraform.tfvars` in the checkout, and it clears
+   `TF_VAR_*` from the environment, except for values it supplies itself
+   from the project's config.
+3. **Plan.** The daemon records `plan started`, with a silent push. The
+   worker runs `terraform plan -out` at the trusted revision with the
+   manifest, then runs `terraform show -json` and builds the summary: the
+   variable diff against the last *successfully applied* manifest, counts of
+   create, update, replace and delete, and the address list. Replace means
+   either action order. If the plan contains delete or replace and the
+   request did not ask for them, the job stops with exit 30. After a failed
+   or unknown-outcome apply, the summary says the baseline is uncertain
+   instead of showing a clean diff.
+4. **Approve.** The daemon pushes `apply waiting`. The scope is: project,
+   trusted revision digest, schema digest, manifest digest, plan digest, the
+   destructive classification, the counts and the address list. The
+   signature covers the scope and a nonce, through the existing server-side
+   ceremony snapshot. The screen shows the variable diff first, then deletes
+   and replaces.
+5. **Apply.** The runner claims the approval once (atomically, with a durable
+   record written before Terraform starts), re-hashes the saved plan, and
+   applies it.
+6. **Result.** The result is applied, failed, or *outcome unknown* (the
+   runner restarted mid-apply). It goes to the ledger, the devices and the
+   CLI. Nothing is retried automatically.
 
-## Sensitivity check (runs on the saved plan, before the approver sees it)
+The agent receives: the variable diff, the counts and addresses, the
+classification, the result, and on failure a category plus vetted messages.
 
-The policy check limits which constructs the code may use; it cannot follow
-where a value goes. At apply time, agent code using only allowed types could
-copy a secret into something the agent can later read: a DNS TXT record, a
-VM description, a store item in an agent-readable vault.
+## Protocol rules
 
-Terraform already tracks this. A value from a sensitive source (a provider
-attribute its schema marks sensitive, a `sensitive = true` variable) stays
-tagged through expressions and functions, `base64encode` and `substr`
-included, and `terraform show -json` reports the tag per attribute in
-`after_sensitive`. `nonsensitive()` is the only way to drop the tag, and the
-policy check bans it.
+- **Frozen scope.** The daemon accepts a plan only from the runner assigned
+  to the job, in the expected state. Once an approval ceremony starts,
+  neither the digest nor the summary can change. A new plan needs a new
+  approval.
+- **Signed runner messages.** Each message is signed with the runner's key
+  over protocol version, method, path, body digest, job id and a freshness
+  value (timestamp plus nonce, checked by the daemon), so a captured message
+  cannot be replayed.
+- **Single-use approvals.** A poll never hands out the same executable
+  approval twice. The claim is a state transition.
+- **Cancellation.** `kill <project>` stops a pending or planning job, drops
+  any late plan report, and voids an approval that has not been claimed. An
+  apply that has already started runs to its end; there is no rollback.
+- **Timeouts.** These are separate: planning (default 10 minutes), approval
+  (5 minutes from `apply waiting`), and maximum plan age before the claim.
+  The existing pending timer starts when a request is created, which is too
+  early for this.
+- **Pinned context.** A pending approval is void if the runner's policy, its
+  provider binaries, the backend identity or the project config changed
+  after the plan was made.
+- **Bounded input.** The bundle is limited in compressed size, unpacked size,
+  object count, file count and processing time. The runner refuses
+  `.terraform/`, state files and plan files inside it.
 
-So the runner refuses, with exit 30, any plan in which a sensitive value
-appears in an attribute that is not on the project's **secret destinations**
-list. Each entry is a resource type, an attribute path, and optionally fixed
-values for sibling attributes, for example "a VM's cloud-init user data", or
-"`onepassword_item.password`, only when `vault` is the privileged store's
-id". The same rule covers outputs: a sensitive output is refused unless
-listed.
+## The runner
 
-**Each destination also names the sources allowed into it (operator,
-2026-10-26).** Terraform's tag says a value is secret, not which secret, and
-some legitimate destinations are ones the agent can read later: a
-lower-privilege store vault that VMs read at runtime, or the cloud-init of a
-VM the agent can get admin on. A binary rule would let the hypervisor's
-credential into those as easily as a freshly generated password. So an entry
-reads, for example, "`onepassword_item.password` in the runtime vault, from
-`random_password.*` only", or "the VM's cloud-init user data, from
-`tls_private_key.host_key`, `random_password.*` and
-`data.onepassword_item.connect_access_token`". The runner resolves each
-destination attribute's expression statically, through locals, variables,
-module inputs, `for_each` and conditionals, to the set of sensitive sources
-it references, and refuses the plan if any is not on that entry's list. A
-reference it cannot resolve statically counts as a refusal. Terraform's own
-tag check above stays as the backstop for anything this misses.
+`shoephone-runner`, a separate binary in this repository. Its parts, each a
+separate Unix user:
 
-Two limits the builder must handle:
+- **The resolver** holds the secrets token, talks to the daemon, and starts
+  the other two. It resolves the project's secret references and passes the
+  values to the Terraform worker's environment. It never parses repository
+  content.
+- **The review worker** has no credentials. It unpacks bundles, computes
+  trust diffs and validates manifests.
+- **The Terraform worker** owns only the job directory. It cannot read the
+  token, the runner's config, or other jobs, and it runs in a filesystem
+  sandbox that exposes only the job directory and the plugin directory.
 
-- **Untagged secret fields.** A provider schema can forget to mark a secret
-  field sensitive. Before a provider type goes on an allowlist, its schema
-  (`terraform providers schema -json`) is reviewed, and the runner's project
-  config can mark extra attributes as sensitive, which the runner enforces
-  itself.
-- **Secrets that are not Terraform values.** Credentials the runner injects
-  as provider configuration never enter the plan. Ones it passes as
-  variables are declared `sensitive = true` by the runner's override file,
-  whatever the repository says.
+Providers come from a plugin directory pinned by hash, so `init` downloads
+nothing. The egress firewall allows only the project's endpoints (HTTPS, or
+SSH where a provider uploads files that way) and the daemon. With trusted
+code these are defense in depth, not the boundary. There are no pre-plan
+hooks.
 
-## What the agent sees
+Full Terraform output stays in a root-only log directory on the runner, kept
+for a set number of days. The operator reads it over their own SSH session.
 
-The CLI returns the plan summary (actions and addresses), Terraform's own
-diagnostics on failure **(operator)**, and the apply result. It never returns
-the raw plan or the state. Terraform already prints `(sensitive value)` in
-place of tagged values in diagnostics; behind that, the runner masks every
-value it resolved for the job, in plain, base64 and hex form. The remaining
-exposure is a provider error that echoes an untagged API response; that is
-accepted.
+Per-project configuration: name, path in the repository, Terraform version,
+backend, the secret references it resolves, the endpoints, and the Terraform
+variables it supplies itself.
 
-Resource addresses are agent-chosen and can carry a value through a
-`for_each` key. The sensitivity check covers tagged values (Terraform
-refuses sensitive `for_each` keys outright); untagged ones are not secrets.
+## Daemon changes
+
+- Two new grant kinds, `trust` and `apply`, in the same state machine as SSH
+  grants. They share the approver's cap and cooldown, and only one request
+  of any kind is pending at a time.
+- Config: `[runners.<name>]` (the runner's public key) and
+  `[projects.<name>]` (which runner serves the project).
+- Signed runner endpoints: poll, post review, post plan, claim, post result.
+  The agent-side endpoints stay unauthenticated as they are today, with a
+  size cap on bundles.
+- Ledger and push: `trust requested`, `trust waiting`, `trusted`,
+  `apply requested`, `plan started`, `plan refused`, `apply waiting`,
+  `applied`, `apply failed`, `outcome unknown`, plus the existing declined
+  and timed out. Only the two `waiting` events interrupt. `server::push_for`
+  stays an exhaustive match.
+- The ledger and `/api/pending` have no read authentication today. So
+  nothing that could hold a credential may go into them: categories and
+  digests only. Full output stays on the runner.
+- The daemon holds no credential. It relays bundles, manifests, summaries
+  and digests only.
+
+## Approver changes
+
+These are more than display changes. The approve page (`assets/approve.html`)
+and the iOS app rebuild the scope bytes themselves and check them against the
+challenge hash. Both need a versioned encoding for the trust and apply
+scopes, a verification path for each, and the screens described above, so
+that a trust approval looks unlike an apply approval.
 
 ## Command line
 
 ```bash
-shoephone apply <project> --reason "..."   # request, wait, apply on approval
-shoephone status                           # also lists pending apply jobs
-shoephone kill <project>                   # cancel a pending apply (daemon side)
+shoephone trust <project> --reason "..."
+shoephone apply <project> --manifest FILE --reason "..." [--allow-destroy]
+shoephone status        # also lists trust and apply jobs
 ```
 
-Exit codes use the existing bands: 0 applied; 12 declined or timed out; 20
-another request pending; 23 cooldown or cap; 30 unknown project or a policy
-refusal (the request must change). Two new tool-specific codes
-**(builder's call)**, to be recorded in AGENTS.md: **100** the plan failed
-(Terraform error; nothing was shown to the approver), **101** the apply
-failed after approval (state may be partly changed; read the result before
-retrying).
+Exit codes use the existing bands: 0 done; 12 declined or timed out; 20
+another request pending; 23 cooldown or cap; 30 unknown project, manifest
+refused, no trusted revision, or an unrequested delete or replace. New
+tool-specific codes **(builder's call)**, to be recorded in AGENTS.md: **100**
+plan failed; **101** apply failed after approval (state may be partly
+changed); **102** outcome unknown (check before doing anything else).
 
-## Daemon changes
+## Security invariants this adds
 
-- A second grant kind, `apply`, beside the SSH window, in the same state
-  machine: pending → planned → approved/declined/timed out → applied/failed.
-  The approver's cap counts both kinds.
-- Config: `[runners.<name>]` with the runner's public key, and
-  `[projects.<name>]` naming which runner serves it.
-- Endpoints for the runner (poll, post plan, post result), each request
-  signed with the runner's key. The agent-side endpoints stay
-  unauthenticated as today; the bundle upload has a size cap.
-- Ledger and push: new events `apply requested`, `plan started`,
-  `plan refused` (a policy or sensitivity refusal, or a Terraform error),
-  `apply waiting` (the one that interrupts), `applied`, `apply failed`, plus
-  the existing declined and timed out. Every event before `apply waiting` is
-  passive. `server::push_for` stays an exhaustive match.
-- The daemon holds no credential: it relays bundles and summaries only.
+For AGENTS.md:
 
-## The runner
+- Terraform runs with credentials only at a project's one trusted revision,
+  and only with a manifest that passed that revision's schema.
+- An apply grant applies only the saved plan whose digest the approver
+  signed, at most once.
+- Nothing that can hold a credential is returned to the agent or written to
+  the daemon's ledger.
 
-A separate binary, `shoephone-runner`, in this repository, split across two
-unprivileged users so that Terraform can never read the secrets token:
+## Later: releasing a secret onto a host
 
-- **The resolver** (`shoephone-runner` itself) holds the token, talks to the
-  daemon, runs both checks, resolves the project's secret references, and
-  starts Terraform with the resolved values in its environment and the
-  generated override files beside the checkout.
-- **The Terraform user** owns only the job directory, cannot read the token,
-  the runner's config, or other jobs' directories, and is the only identity
-  the egress firewall lets reach the project's APIs. Terraform runs under a
-  filesystem sandbox (`bubblewrap` or systemd's `ProtectSystem`/`ReadWritePaths`;
-  builder's call) that exposes the job directory, the plugin directory and
-  nothing of the runner's own state.
+The first consumer has a playbook that copies two privileged items into
+root-only files on a VM and restarts the services that use them, at first
+build and on rotation. It could become an operator-defined runner action
+that the agent requests by name and the operator approves with one tap.
+Deferred **(operator)**. The conditions, so they are not lost:
 
-The token reaches every privileged credential, not one project's, so this
-split matters more than any single policy rule.
-
-Configuration per project: name, path inside the repository, Terraform
-version, backend config, provider configuration (written as the override
-file), the secret references it resolves, the type allowlist, the secret
-destinations, extra sensitive attributes, and the egress list. Each job runs
-in a fresh directory that is deleted afterward.
-
-## Approver changes
-
-The web approve page and the iOS app (`shoephone-app`) render the new scope
-kind: project, short commit id, counts, the address list with destructive
-actions first, and the agent's reason labeled as the agent's. The binding is
-daemon-side, so the app needs display changes only.
-
-## Security invariants this keeps
-
-- The approver sees scope computed by a trusted party (the runner), never the
-  request's prose as scope.
-- The signature covers the scope and a nonce.
-- Rate cap and cooldown are per approver, not per requester.
-- The daemon holds no credential to what it gates.
-- Every event reaches the approver's devices.
-
-New invariant, for AGENTS.md: **an apply grant applies only the saved plan
-whose digest the approver signed, and the runner never executes anything
-from the repository except Terraform configuration that passed the policy
-check.**
+- A secret installed on a host the agent administers is disclosed to the
+  agent. File mode 0600 does not stop root. The action is a release, and
+  only items meant for that host may be named. Never a protected credential.
+- An immutable definition: item and field, host identity, path, owner and
+  mode, the exact restart. The approval is bound to the definition's
+  digest, not its name.
+- No agent-supplied arguments. Strict host-key checking and no agent
+  forwarding. Installs that do not follow symlinks. Remote output treated
+  as untrusted. Stated semantics for partial failure.
 
 ## Left to the deployment (operator's infrastructure repo)
 
-The runner guest, its firewall, its secrets identity and which store items it
-may read, the provider plugin directory, the project list (the first two are
-the first consumer's Terraform and the infrastructure repo's own), and the
+The runner guest and its firewall, its secrets identity, the plugin
+directory, the project list, the first trust review of each project, and the
 amendment to the vault-split design that records the new identity.
 
 ## Accepted risks
 
-- Plan-time code runs with credentials before any approval. Guarded by the
-  policy check, the process split, the sandbox and the egress firewall, and
-  recorded as `plan started`.
-- A provider bug or an untagged secret field the schema review missed.
+- Plan-time code runs with credentials before the apply approval. It is
+  trusted code with validated input, and `plan started` records it.
+- The reviewer misses something in a trust review. The obligation statement,
+  the warnings, and the rule against truncated diffs are the mitigation.
 - One runner identity reads the whole privileged store, so a compromise of
-  the runner's resolver is a compromise of every credential in it.
+  the resolver is a compromise of every credential in it.
 - A few bits per run leak through counts and success or failure.
 
-## Open questions
+## Review history
 
-None. The builder review of 2026-10-26 raised six; the operator answered
-four (apply-time leakage, diagnostics, store reach, approvals per apply) and
-the rest are settled above as builder's calls (process split, provider
-blocks and type allowlist, plan start as an audit event).
+- **Builder check, 2026-10-26.** Six gaps in the first version: the process
+  split, provider blocks, type allowlists, plan start as an audit event,
+  apply-time leakage, and diagnostics. Answered at the time. Most are moot
+  now that agent code does not run with credentials.
+- **Outside review (Codex), 2026-10-26.** The first version ran agent-written
+  HCL behind a policy check, a sensitivity-tag check, and static tracing of
+  where each secret came from. Bypasses found, each confirmed against
+  Terraform and provider source:
+  a malformed `regex()` echoes its pattern, an encoded secret, in the
+  diagnostic; Terraform accepts a sensitive `count` and drops the tag, so
+  addresses spell out a secret; `proxmox_virtual_environment_file.source_file`
+  reads a local path in the provider, past any `file()` ban; an `import`
+  block can launder a privileged value into `random_password.result`, and a
+  permitted data-source address can be pointed at any item. The review also
+  supplied the protocol rules above and the "more than display changes"
+  correction. The operator then chose trusted code with data-only applies,
+  full errors kept on the runner, and deferral of the secret action.
