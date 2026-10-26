@@ -32,9 +32,12 @@ pub const RUNNER_HEADER: &str = "shoephone-runner";
 const NAMESPACE: &str = "shoephone-runner";
 /// How far a request's timestamp may be from the daemon's clock.
 const MAX_SKEW_SECS: u64 = 60;
-/// How long a nonce is remembered. Longer than twice the skew window, so a
-/// nonce cannot outlive its timestamp's validity and be replayed.
-const NONCE_TTL: Duration = Duration::from_secs(120);
+/// How long a nonce is remembered. A timestamp stays valid for up to
+/// 2 x 60 s of real time (recorded at its early edge, replayed at its late
+/// edge), plus 1 s because the skew check floors the clock to whole
+/// seconds; 130 s leaves slack beyond that, so a nonce cannot be evicted
+/// while its timestamp is still acceptable.
+const NONCE_TTL: Duration = Duration::from_secs(130);
 /// Longest nonce accepted, checked before any cryptography.
 const MAX_NONCE_LEN: usize = 128;
 /// Most nonces held at once; past it the cache refuses rather than grows.
@@ -77,9 +80,10 @@ pub type MessageParts<'a> = (&'a str, &'a str, &'a [u8], Option<u64>, u64, &'a s
 #[derive(Debug, Default)]
 pub struct Verifier {
     keys: BTreeMap<String, PublicKey>,
-    /// (when recorded on the monotonic clock, "runner\nnonce"), oldest
-    /// first. Monotonic so a wall clock that jumps cannot evict early.
-    seen: VecDeque<(Instant, String)>,
+    /// (monotonic and wall time recorded, "runner\nnonce"), oldest first.
+    /// An entry is evicted only when both clocks say it is older than
+    /// `NONCE_TTL`, so a jump of either clock cannot evict it early.
+    seen: VecDeque<(Instant, SystemTime, String)>,
 }
 
 impl Verifier {
@@ -103,11 +107,10 @@ impl Verifier {
     ) -> Result<(), Refusal> {
         let (method, path, body, job, timestamp, nonce) = parts;
         let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
-        while self
-            .seen
-            .front()
-            .is_some_and(|(at, _)| now_mono.saturating_duration_since(*at) > NONCE_TTL)
-        {
+        while self.seen.front().is_some_and(|(mono, wall, _)| {
+            now_mono.saturating_duration_since(*mono) > NONCE_TTL
+                && now.duration_since(*wall).is_ok_and(|age| age > NONCE_TTL)
+        }) {
             self.seen.pop_front();
         }
 
@@ -134,18 +137,16 @@ impl Verifier {
             .map_err(|_| Refusal::WrongRunner)?;
 
         let tag = format!("{runner}\n{nonce}");
-        if self.seen.iter().any(|(_, t)| *t == tag) || self.seen.len() >= MAX_NONCES {
+        if self.seen.iter().any(|(_, _, t)| *t == tag) || self.seen.len() >= MAX_NONCES {
             return Err(Refusal::StaleSignature);
         }
-        self.seen.push_back((now_mono, tag));
+        self.seen.push_back((now_mono, now, tag));
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use ssh_key::Algorithm;
     use ssh_key::rand_core::OsRng;
 
@@ -349,7 +350,8 @@ mod tests {
         assert_eq!(v.seen.len(), 1, "the old nonce is dropped on verify");
 
         for i in v.seen.len()..MAX_NONCES {
-            v.seen.push_back((mono(NOW + 200), format!("r1\nfill{i}")));
+            v.seen
+                .push_back((mono(NOW + 200), at(NOW + 200), format!("r1\nfill{i}")));
         }
         let full = signed(&k, b"{}", NOW + 200, "n3");
         assert_eq!(
@@ -454,5 +456,52 @@ mod tests {
             v.verify(at(NOW), mono(NOW + 2), "r1", &sig, parts(b"{}", NOW, "n1")),
             Err(Refusal::StaleSignature)
         );
+    }
+
+    #[test]
+    fn replay_at_window_edge_with_subsecond_clocks_is_refused() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let ms = |m: u64| Duration::from_millis(m);
+        let base = mono(NOW);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        let first_wall = UNIX_EPOCH + Duration::from_secs(NOW - 60);
+        assert_eq!(
+            v.verify(first_wall, base, "r1", &sig, parts(b"{}", NOW, "n1")),
+            Ok(())
+        );
+        let late_wall = UNIX_EPOCH + Duration::from_secs(NOW + 60) + ms(500);
+        assert_eq!(
+            v.verify(
+                late_wall,
+                base + ms(120_500),
+                "r1",
+                &sig,
+                parts(b"{}", NOW, "n1")
+            ),
+            Err(Refusal::StaleSignature)
+        );
+    }
+
+    #[test]
+    fn wall_clock_step_back_does_not_evict_nonces() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, "n1")),
+            Ok(())
+        );
+        assert_eq!(
+            v.verify(
+                at(NOW - 30),
+                mono(NOW + 140),
+                "r1",
+                &sig,
+                parts(b"{}", NOW, "n1")
+            ),
+            Err(Refusal::StaleSignature)
+        );
+        assert_eq!(v.seen.len(), 1);
     }
 }
