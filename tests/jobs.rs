@@ -715,3 +715,226 @@ async fn refuse_ends_a_working_job_with_the_runners_words() {
     assert_eq!(status.result.as_deref(), Some("refused"));
     assert_eq!(status.failure.unwrap().category, "policy");
 }
+
+use std::os::unix::fs::PermissionsExt;
+
+/// A trust job taken through submit, approval and claim.
+async fn claimed_trust(rig: &Rig, client: &Arc<shoephone::client::Client>) -> u64 {
+    let id = file_trust(client, "net", b"tar").await;
+    rig.poll().await;
+    let (scope, display) = trust_pair("net");
+    assert_eq!(submit(rig, id, scope, display).await.http, 200);
+    approve_job(client.base(), id).await;
+    let claim = rig
+        .post("/api/runner/claim", json!({ "id": id }), Some(id))
+        .await;
+    assert_eq!(claim.http, 200);
+    id
+}
+
+async fn ledger_text(client: &Arc<shoephone::client::Client>) -> String {
+    let base = client.base().to_owned();
+    blocking(move || {
+        ureq::get(format!("{base}/api/ledger"))
+            .call()
+            .unwrap()
+            .into_body()
+            .read_to_string()
+            .unwrap()
+    })
+    .await
+}
+
+fn chmod(path: &std::path::Path, mode: u32) {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_trusted_save_failure_leaves_job_claimed_and_retry_succeeds() {
+    let dir = scratch("jobs-save-fail");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = claimed_trust(&rig, &client).await;
+
+    chmod(&dir, 0o555);
+    let finish = json!({ "id": id, "result": "trusted" });
+    let failed = rig
+        .post("/api/runner/finish", finish.clone(), Some(id))
+        .await;
+    chmod(&dir, 0o755);
+    assert_eq!(
+        (failed.http, failed.code().as_str()),
+        (500, "trust_save_failed")
+    );
+    assert_eq!(status_of(&client, id).await.state, "claimed");
+    assert!(Store::new(&dir).load_trusted().unwrap().is_empty());
+    assert!(!ledger_text(&client).await.contains("\"trusted\""));
+
+    let retry = rig.post("/api/runner/finish", finish, Some(id)).await;
+    assert_eq!(retry.http, 200, "{}", String::from_utf8_lossy(&retry.body));
+    assert_eq!(Store::new(&dir).load_trusted().unwrap().len(), 1);
+    assert_eq!(
+        status_of(&client, id).await.result.as_deref(),
+        Some("trusted")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_trusted_with_broken_ledger_is_refused() {
+    let dir = scratch("jobs-ledger-broken");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = claimed_trust(&rig, &client).await;
+
+    chmod(&dir.join("ledger.jsonl"), 0o000);
+    let unknown = rig
+        .post(
+            "/api/runner/finish",
+            json!({ "id": 9001, "result": "outcome_unknown", "project": "net" }),
+            Some(9001),
+        )
+        .await;
+    assert_eq!(unknown.http, 200, "outcome reports still go through");
+
+    let finish = rig
+        .post(
+            "/api/runner/finish",
+            json!({ "id": id, "result": "trusted" }),
+            Some(id),
+        )
+        .await;
+    chmod(&dir.join("ledger.jsonl"), 0o600);
+    assert_eq!(
+        (finish.http, finish.code().as_str()),
+        (503, "ledger_unavailable")
+    );
+    assert!(Store::new(&dir).load_trusted().unwrap().is_empty());
+    assert_eq!(status_of(&client, id).await.state, "claimed");
+
+    let applied = rig
+        .post(
+            "/api/runner/finish",
+            json!({ "id": id, "result": "applied" }),
+            Some(id),
+        )
+        .await;
+    assert_eq!(applied.http, 400, "a result that does not fit the job kind");
+    assert_eq!(applied.code(), "scope_mismatch");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submit_with_unchecked_display_fields_is_400() {
+    let dir = scratch("jobs-display-fields");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+
+    let id = file_trust(&client, "net", b"tar").await;
+    rig.poll().await;
+    let (scope, good) = trust_pair("net");
+    let cases = [
+        json!({ "external": true, "diff": "x", "verify_command": "v" }),
+        json!({ "external": true }),
+        json!({ "external": true, "verify_command": "" }),
+        json!({ "diff": good["diff"], "manifest": "m" }),
+        json!({ "diff": good["diff"], "baseline_manifest": "m" }),
+        json!({ "diff": good["diff"], "address_text": "" }),
+    ];
+    for display in cases {
+        let reply = submit(&rig, id, scope.clone(), display.clone()).await;
+        assert_eq!(
+            (reply.http, reply.code().as_str()),
+            (400, "inconsistent_scope"),
+            "{display}"
+        );
+    }
+    assert_eq!(status_of(&client, id).await.state, "working");
+    assert_eq!(submit(&rig, id, scope, good).await.http, 200);
+    approve_job(client.base(), id).await;
+    rig.post("/api/runner/claim", json!({ "id": id }), Some(id))
+        .await;
+    rig.post(
+        "/api/runner/finish",
+        json!({ "id": id, "result": "trusted" }),
+        Some(id),
+    )
+    .await;
+
+    let id = file_apply(&client, "net").await;
+    rig.poll().await;
+    let (scope, good) = apply_pair("net", &["create a.b"], [1, 0, 0, 0], false);
+    for (field, value) in [
+        ("diff", json!("x")),
+        ("external", json!(true)),
+        ("verify_command", json!("v")),
+    ] {
+        let mut display = good.clone();
+        display[field] = value;
+        let reply = submit(&rig, id, scope.clone(), display).await;
+        assert_eq!(
+            (reply.http, reply.code().as_str()),
+            (400, "inconsistent_scope"),
+            "{field}"
+        );
+    }
+    assert_eq!(submit(&rig, id, scope, good).await.http, 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn baseline_status_must_match_baseline_manifest() {
+    let dir = scratch("jobs-baseline");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = file_apply(&client, "net").await;
+    rig.poll().await;
+
+    let (mut scope, mut display) = apply_pair("net", &["create a.b"], [1, 0, 0, 0], false);
+    scope["baseline_status"] = json!("applied");
+    let reply = submit(&rig, id, scope.clone(), display.clone()).await;
+    assert_eq!(
+        (reply.http, reply.code().as_str()),
+        (400, "inconsistent_scope")
+    );
+
+    scope["baseline_status"] = json!("none");
+    scope["baseline_manifest"] = json!(sha256_hex("old"));
+    display["baseline_manifest"] = json!("old");
+    assert_eq!(
+        submit(&rig, id, scope.clone(), display.clone()).await.http,
+        400
+    );
+
+    scope["baseline_status"] = json!("uncertain");
+    assert_eq!(submit(&rig, id, scope, display).await.http, 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failure_category_is_restricted() {
+    let dir = scratch("jobs-category");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = file_apply(&client, "net").await;
+    rig.poll().await;
+
+    for bad in ["", "Policy", "has space", "a.b", "x\ny", &"a".repeat(65)] {
+        let reply = rig
+            .post(
+                "/api/runner/refuse",
+                json!({ "id": id, "result": "refused",
+                        "failure": { "category": bad, "addresses": [] } }),
+                Some(id),
+            )
+            .await;
+        assert_eq!(reply.http, 400, "{bad:?}");
+    }
+    assert_eq!(status_of(&client, id).await.state, "working");
+}

@@ -271,8 +271,11 @@ pub struct JobStatus {
 /// Why a job did not complete, in the runner's words.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FailureView {
+    /// `[a-z0-9_]{1,64}`; the daemon refuses anything else.
     pub category: String,
     pub addresses: Vec<String>,
+    /// Runner-vetted text only: `GET /api/job/{id}` serves it without
+    /// authentication.
     #[serde(default)]
     pub detail: Option<String>,
 }

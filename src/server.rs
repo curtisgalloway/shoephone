@@ -1573,9 +1573,16 @@ fn inconsistent(error: impl Into<String>) -> Fail {
     Fail::new(StatusCode::BAD_REQUEST, "inconsistent_scope", error)
 }
 
-fn failure_from_view(v: FailureView) -> Failure {
-    Failure {
-        category: grant::printable(&v.category, 64),
+fn failure_from_view(v: FailureView) -> Result<Failure, Fail> {
+    let category_ok = (1..=64).contains(&v.category.len())
+        && v.category
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if !category_ok {
+        return Err(bad_request("failure category must match [a-z0-9_]{1,64}"));
+    }
+    Ok(Failure {
+        category: v.category,
         addresses: v
             .addresses
             .iter()
@@ -1583,7 +1590,7 @@ fn failure_from_view(v: FailureView) -> Failure {
             .map(|a| grant::printable(a, 512))
             .collect(),
         detail: v.detail.map(|d| grant::printable(&d, 2048)),
-    }
+    })
 }
 
 fn failure_view(f: &Failure) -> FailureView {
@@ -1698,7 +1705,23 @@ fn parse_address_text(text: &str) -> Option<Vec<(Action, String)>> {
 fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), Fail> {
     match scope {
         JobScopeWire::Trust(t) => {
+            if display.manifest.is_some()
+                || display.baseline_manifest.is_some()
+                || display.address_text.is_some()
+            {
+                return Err(inconsistent("a trust display carries apply-only fields"));
+            }
             if display.external {
+                if display.diff.is_some() {
+                    return Err(inconsistent(
+                        "an external trust display must not carry a diff",
+                    ));
+                }
+                if display.verify_command.as_deref().is_none_or(str::is_empty) {
+                    return Err(inconsistent(
+                        "an external trust display needs a verify_command",
+                    ));
+                }
                 return Ok(());
             }
             let diff = display
@@ -1710,6 +1733,9 @@ fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), 
             }
         }
         JobScopeWire::Apply(a) => {
+            if display.diff.is_some() || display.external || display.verify_command.is_some() {
+                return Err(inconsistent("an apply display carries trust-only fields"));
+            }
             let manifest = display
                 .manifest
                 .as_deref()
@@ -1727,6 +1753,11 @@ fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), 
                         "the baseline manifest digest does not match the display",
                     ));
                 }
+            }
+            if (a.baseline_status == "none") != a.baseline_manifest.is_none() {
+                return Err(inconsistent(
+                    "the baseline status does not match the baseline manifest",
+                ));
             }
             let text = display
                 .address_text
@@ -1863,7 +1894,7 @@ async fn runner_refuse(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<
         body_id(&body),
     )?;
     let req: RefuseBody = parse_body(&body)?;
-    let failure = failure_from_view(req.failure);
+    let failure = failure_from_view(req.failure)?;
     let result = match req.result.as_str() {
         "refused" => JobResult::Refused(failure),
         "plan_failed" => JobResult::PlanFailed(failure),
@@ -1910,55 +1941,121 @@ async fn runner_finish(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<
         body_id(&body),
     )?;
     let req: FinishBody = parse_body(&body)?;
-    let result = match (req.result.as_str(), req.failure) {
+    let result = match (req.result.as_str(), req.failure.clone()) {
         ("trusted", _) => JobResult::Trusted,
         ("applied", _) => JobResult::Applied,
         ("outcome_unknown", _) => JobResult::OutcomeUnknown,
-        ("apply_failed", Some(f)) => JobResult::ApplyFailed(failure_from_view(f)),
+        ("apply_failed", Some(f)) => JobResult::ApplyFailed(failure_from_view(f)?),
         ("apply_failed", None) => return Err(bad_request("apply_failed needs a failure")),
         (other, _) => return Err(bad_request(format!("unknown result {other:?}"))),
     };
     let now = now();
-    d.with(|inner| {
-        let project = match inner.jobs.job(now, req.id) {
-            Some(job) => job.project.clone(),
-            None => req.project.clone().ok_or_else(|| {
-                Fail::new(
-                    StatusCode::BAD_REQUEST,
-                    "project_required",
-                    "the daemon does not know that job; say which project it belongs to",
-                )
-            })?,
-        };
+    // Only `trusted` goes through `audited`: it changes what a project may
+    // apply from, so it is refused up front (`ledger_unavailable`, before
+    // any state changes) once the ledger cannot be trusted, and a failed
+    // append is reported as such. Every other outcome stays on `with`, as
+    // `kill` and `decline` do, so a job can always be ended and a runner
+    // can always say what happened to an apply.
+    if result == JobResult::Trusted {
+        d.audited(|inner| finish_in(&d, inner, now, &runner, &req, result))
+    } else {
+        d.with(|inner| finish_in(&d, inner, now, &runner, &req, result))
+    }
+}
+
+fn finish_in(
+    d: &Daemon,
+    inner: &mut Inner,
+    now: SystemTime,
+    runner: &str,
+    req: &FinishBody,
+    result: JobResult,
+) -> Reply<serde_json::Value> {
+    let known = inner.jobs.job(now, req.id).map(|j| {
+        (
+            j.project.clone(),
+            matches!(j.kind, JobKind::Trust { .. }),
+            j.state == JobState::Claimed,
+        )
+    });
+    let project = match &known {
+        Some((project, _, _)) => project.clone(),
+        None => req.project.clone().ok_or_else(|| {
+            Fail::new(
+                StatusCode::BAD_REQUEST,
+                "project_required",
+                "the daemon does not know that job; say which project it belongs to",
+            )
+        })?,
+    };
+    let finished = |e: Refusal| match e {
+        Refusal::ScopeMismatch => Fail::new(
+            StatusCode::BAD_REQUEST,
+            "scope_mismatch",
+            "that result does not fit this kind of job",
+        ),
+        other => other.into(),
+    };
+    if result != JobResult::Trusted {
         inner
             .jobs
-            .finish(now, &runner, &project, req.id, result.clone())?;
-        let claimed = inner.claimed.remove(&req.id);
-        if result == JobResult::Trusted {
-            let scope = claimed.ok_or_else(|| Fail::internal("a trusted job has no scope"))?;
-            let record = TrustRecord {
-                project: project.clone(),
-                digest: scope.candidate,
-                schema: scope.schema,
-                job: req.id,
-                at: store::unix(now),
-            };
-            let mut all = inner.trusted.clone();
-            all.insert(project.clone(), record.clone());
-            let records: Vec<TrustRecord> = all.values().cloned().collect();
-            if let Err(e) = d.store.save_trusted(&records) {
-                eprintln!("shoephoned: trusted: {e}");
-                inner.ledger_failed = Some(e);
-                return Err(Fail::internal("the trust record could not be saved"));
-            }
-            inner
-                .jobs
-                .set_trusted(&project, Some(record.digest.clone()));
-            inner.trusted = all;
-        }
+            .finish(now, runner, &project, req.id, result)
+            .map_err(finished)?;
+        inner.claimed.remove(&req.id);
         prune_jobs(inner, now);
-        Ok(Json(serde_json::json!({})))
-    })
+        return Ok(Json(serde_json::json!({})));
+    }
+
+    // A trust is recorded on disk before the job is marked done, so a failed
+    // write leaves the job Claimed and the runner can retry. Check first
+    // that `Jobs::finish` will accept it.
+    let Some((_, is_trust, claimed)) = known else {
+        return Err(Refusal::NoSuchRequest.into());
+    };
+    let assigned = d.config.projects.get(&project).map(|p| p.runner.as_str());
+    if assigned != Some(runner) {
+        return Err(Refusal::WrongRunner.into());
+    }
+    if !is_trust {
+        return Err(finished(Refusal::ScopeMismatch));
+    }
+    let scope = match inner.claimed.get(&req.id) {
+        Some(scope) if claimed => scope.clone(),
+        _ => return Err(Refusal::NoSuchRequest.into()),
+    };
+    let record = TrustRecord {
+        project: project.clone(),
+        digest: scope.candidate,
+        schema: scope.schema,
+        job: req.id,
+        at: store::unix(now),
+    };
+    let mut all = inner.trusted.clone();
+    all.insert(project.clone(), record.clone());
+    let records: Vec<TrustRecord> = all.values().cloned().collect();
+    // A failed write deliberately does not set `ledger_failed`: that flag
+    // is sticky until restart and would refuse the retry this ordering
+    // exists to allow. Nothing was recorded anywhere, so no audit gap
+    // opened; the job is still Claimed and the runner is told to retry.
+    if let Err(e) = d.store.save_trusted(&records) {
+        eprintln!("shoephoned: trusted: {e}");
+        return Err(Fail::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "trust_save_failed",
+            "the trust record could not be saved; the job is still claimed, retry",
+        ));
+    }
+    inner
+        .jobs
+        .finish(now, runner, &project, req.id, JobResult::Trusted)
+        .map_err(finished)?;
+    inner.claimed.remove(&req.id);
+    inner
+        .jobs
+        .set_trusted(&project, Some(record.digest.clone()));
+    inner.trusted = all;
+    prune_jobs(inner, now);
+    Ok(Json(serde_json::json!({})))
 }
 
 /// Approves the job waiting on the approver, as the approver's device would.
