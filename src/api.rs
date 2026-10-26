@@ -72,9 +72,15 @@ pub struct IssueReply {
 }
 
 /// `POST /api/kill`
+///
+/// Exactly one of `host` (close SSH windows) or `project` (stop a Terraform
+/// job) must be set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KillBody {
-    pub host: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
 }
 
 /// `GET /api/status`
@@ -191,4 +197,97 @@ pub struct PushRegister {
     /// `window_opened`, `window_killed`). Absent means all.
     #[serde(default)]
     pub kinds: Option<Vec<String>>,
+}
+
+/// Largest archive, after base64 decoding, that `POST /api/trust` accepts.
+pub const MAX_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Largest manifest, in bytes, that `POST /api/apply` accepts.
+pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
+
+/// `POST /api/trust`: ask the approver to trust a code change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustBody {
+    pub project: String,
+    /// Base64 of a gzip tar of the candidate code.
+    pub archive: String,
+    /// Why, in a sentence the person can judge. Required; display only.
+    #[serde(default)]
+    pub reason: String,
+    /// The requesting machine's name, display only.
+    #[serde(default)]
+    pub requester: String,
+    /// The agent session's URL. Optional; https only; display only.
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+/// `POST /api/apply`: ask the approver to apply a plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyBody {
+    pub project: String,
+    /// The agent's JSON manifest text, at most 64 KiB.
+    pub manifest: String,
+    #[serde(default)]
+    pub allow_destroy: bool,
+    #[serde(default)]
+    pub reason: String,
+    #[serde(default)]
+    pub requester: String,
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+/// The reply to `trust` and `apply`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobReply {
+    pub id: u64,
+    pub match_code: String,
+    /// Unix seconds: when the daemon gives up on a job that has not been
+    /// planned.
+    pub expires: u64,
+}
+
+/// `GET /api/job/{id}`. Never carries a manifest value or an archive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobStatus {
+    pub id: u64,
+    pub project: String,
+    /// `trust` or `apply`.
+    pub kind: String,
+    /// `queued`, `working`, `waiting`, `approved`, `claimed` or `done`.
+    pub state: String,
+    /// Set when `state` is `done`: `trusted`, `applied`, `refused`,
+    /// `plan_failed`, `apply_failed`, `outcome_unknown`, `declined`,
+    /// `timed_out` or `killed`.
+    #[serde(default)]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub failure: Option<FailureView>,
+    #[serde(default)]
+    pub summary: Option<SummaryView>,
+}
+
+/// Why a job did not complete, in the runner's words.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureView {
+    pub category: String,
+    pub addresses: Vec<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+/// What a plan would do: counts, addresses and names, never values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryView {
+    pub create: u32,
+    pub update: u32,
+    pub replace: u32,
+    pub delete: u32,
+    /// Resource addresses, one line each.
+    pub addresses: Vec<String>,
+    /// Names of the variables whose values changed.
+    pub variables: Vec<String>,
+    /// `none`, `applied` or `uncertain`.
+    pub baseline_status: String,
 }

@@ -30,11 +30,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use webauthn_rs::prelude::*;
 
 use crate::api::*;
@@ -42,7 +43,9 @@ use crate::ca::{self, UserCa};
 use crate::config::Config;
 use crate::exit::VERSION;
 use crate::grant::{self, Approval, Entropy, Event, Grants, Pending, Refusal, Scope};
+use crate::job::{Job, JobKind, JobResult, JobState, Jobs};
 use crate::notify::{Apns, Delivery, Notifier, Push};
+use crate::scope;
 use crate::store::{self, Device, EnrollCode, LedgerEntry, Store};
 
 pub const PAGE: &str = include_str!("../assets/approve.html");
@@ -78,6 +81,24 @@ struct Inner {
     /// window's silent re-request that `Grants::issue` says to reuse gets
     /// back the identical certificate string. See the `issue` handler.
     issued: HashMap<u64, CachedCertificate>,
+    /// Terraform trust and apply jobs.
+    jobs: Jobs,
+    /// The decoded archive of each trust job, by job id, for the runner to
+    /// fetch. Dropped once the job is done.
+    // Task 7: the runner endpoint that serves these reads the field.
+    #[allow(dead_code)]
+    archives: HashMap<u64, Vec<u8>>,
+    /// What the requester said about itself, sanitized, by job id.
+    job_meta: HashMap<u64, JobMeta>,
+}
+
+/// The display-only fields of a job request, already sanitized.
+// Task 8: the approver's pending view reads these.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+struct JobMeta {
+    requester: String,
+    context: Option<String>,
 }
 
 /// A signed certificate cached under its window's id. `Grants::issue`
@@ -150,7 +171,7 @@ impl From<Refusal> for Fail {
             Refusal::ScopeMismatch => (S::FORBIDDEN, "scope_mismatch", None),
             Refusal::NoWindow => (S::NOT_FOUND, "no_window", None),
             Refusal::KeyMismatch => (S::FORBIDDEN, "key_mismatch", None),
-            Refusal::UnknownProject => (S::NOT_FOUND, "unknown_project", None),
+            Refusal::UnknownProject => (S::BAD_REQUEST, "unknown_project", None),
             Refusal::ScopeFrozen => (S::CONFLICT, "scope_frozen", None),
             Refusal::AlreadyClaimed => (S::CONFLICT, "already_claimed", None),
             Refusal::WrongRunner => (S::FORBIDDEN, "wrong_runner", None),
@@ -206,6 +227,13 @@ impl Daemon {
         }
         let next_id = store.load_next_id()?;
         let grants = Grants::new(config.policy(), config.principals.clone(), next_id);
+        let jobs = Jobs::new(
+            config
+                .projects
+                .iter()
+                .map(|(name, p)| (name.clone(), p.runner.clone()))
+                .collect(),
+        );
         let notifier = config.notify.clone().map(|n| Arc::new(Notifier::new(n)));
         let apns = match config.apns.clone() {
             Some(c) => {
@@ -234,6 +262,9 @@ impl Daemon {
                 ledger_failed: None,
                 persisted_next_id: next_id,
                 issued: HashMap::new(),
+                jobs,
+                archives: HashMap::new(),
+                job_meta: HashMap::new(),
             }),
         })
     }
@@ -317,8 +348,15 @@ impl Daemon {
     /// re-deriving it, which is one fewer thing to keep in sync by hand.
     fn drain_and_append(&self, inner: &mut Inner) -> Vec<Event> {
         let events = inner.grants.take_events();
-        if !events.is_empty() {
-            let entries: Vec<LedgerEntry> = events.iter().map(LedgerEntry::from).collect();
+        let job_events = inner.jobs.take_events();
+        // Task 8: job events become pushes here; until then they are
+        // audited in the ledger only.
+        if !events.is_empty() || !job_events.is_empty() {
+            let entries: Vec<LedgerEntry> = events
+                .iter()
+                .map(LedgerEntry::from)
+                .chain(job_events.iter().map(LedgerEntry::from))
+                .collect();
             if let Err(e) = self.store.append_ledger(&entries) {
                 eprintln!("shoephoned: ledger: {e}");
                 inner.ledger_failed = Some(e);
@@ -406,6 +444,15 @@ impl Daemon {
             .route("/api/request", post(request))
             .route("/api/request/{id}", get(poll))
             .route("/api/issue", post(issue))
+            .route(
+                "/api/trust",
+                post(trust).layer(DefaultBodyLimit::max(TRUST_BODY_LIMIT)),
+            )
+            .route(
+                "/api/apply",
+                post(apply).layer(DefaultBodyLimit::max(APPLY_BODY_LIMIT)),
+            )
+            .route("/api/job/{id}", get(job))
             .route("/api/kill", post(kill))
             .route("/api/pending", get(pending))
             .route("/api/approve/start", post(approve_start))
@@ -420,6 +467,13 @@ impl Daemon {
         router.with_state(self)
     }
 }
+
+/// Request body limit for `trust`: the archive's base64 form plus JSON.
+const TRUST_BODY_LIMIT: usize = MAX_ARCHIVE_BYTES / 3 * 4 + 4 * 1024 + 4;
+
+/// Request body limit for `apply`: a manifest of 64 KiB can double in size
+/// once JSON-escaped, so leave room for that and the other fields.
+const APPLY_BODY_LIMIT: usize = MAX_MANIFEST_BYTES * 2 + 16 * 1024;
 
 type App = State<Arc<Daemon>>;
 
@@ -710,15 +764,230 @@ fn prune_issued_cache(inner: &mut Inner, now: SystemTime) {
 
 async fn kill(State(d): App, Json(body): Json<KillBody>) -> Reply<serde_json::Value> {
     let now = now();
-    d.with(|inner| {
-        inner.grants.kill(now, &body.host)?;
-        // A ceremony for the request that kill just declined is stale.
-        if inner.grants.pending(now).is_none() {
-            inner.approve = None;
+    match (body.host, body.project) {
+        (Some(host), None) => {
+            d.with(|inner| {
+                inner.grants.kill(now, &host)?;
+                // A ceremony for the request that kill just declined is stale.
+                if inner.grants.pending(now).is_none() {
+                    inner.approve = None;
+                }
+                Ok::<_, Refusal>(())
+            })?;
+            Ok(Json(serde_json::json!({ "killed": host })))
         }
-        Ok::<_, Refusal>(())
-    })?;
-    Ok(Json(serde_json::json!({ "killed": body.host })))
+        (None, Some(project)) => {
+            let policy = d.config.policy();
+            d.with(|inner| {
+                inner
+                    .jobs
+                    .kill(now, inner.grants.gate_mut(), &policy, &project)
+            })?;
+            Ok(Json(serde_json::json!({ "killed": project })))
+        }
+        _ => Err(Fail::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "kill takes exactly one of host or project",
+        )),
+    }
+}
+
+/// Keep a requester-supplied link only if it is a short https URL without
+/// whitespace, as `Grants::request` does.
+fn clean_context(context: Option<&str>) -> Option<String> {
+    context
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| grant::printable(c, 512))
+        .filter(|c| c.starts_with("https://") && !c.chars().any(char::is_whitespace))
+}
+
+fn too_large(code: &str, what: &str) -> Fail {
+    Fail::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        code,
+        format!("{what} is too large"),
+    )
+}
+
+/// File a job and keep what goes beside it. `archive` is the decoded trust
+/// archive, if any. The id is taken only once the job is accepted, so a
+/// refusal does not burn one.
+fn file_job(
+    d: &Daemon,
+    project: &str,
+    kind: JobKind,
+    archive: Option<Vec<u8>>,
+    reason: &str,
+    requester: &str,
+    context: Option<&str>,
+) -> Result<(Job, u64), Fail> {
+    let now = now();
+    let policy = d.config.policy();
+    let meta = JobMeta {
+        requester: grant::printable(requester, 64),
+        context: clean_context(context),
+    };
+    d.audited(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        prune_jobs(inner, now);
+        let id = inner.grants.next_id();
+        let mut entropy = ca::OsEntropy;
+        let job = inner.jobs.request(
+            now,
+            inner.grants.gate_mut(),
+            &policy,
+            &mut entropy,
+            id,
+            project,
+            kind,
+            reason,
+        )?;
+        let taken = inner.grants.allocate_id();
+        debug_assert_eq!(taken, id, "the id peeked is the id taken");
+        if let Some(bytes) = archive {
+            inner.archives.insert(id, bytes);
+        }
+        inner.job_meta.insert(id, meta);
+        let expires = store::unix(job.created + policy.plan_timeout);
+        Ok((job, expires))
+    })
+}
+
+/// Drop the archive and requester notes of jobs that are over.
+fn prune_jobs(inner: &mut Inner, now: SystemTime) {
+    let done: Vec<u64> = inner
+        .archives
+        .keys()
+        .chain(inner.job_meta.keys())
+        .copied()
+        .filter(|id| {
+            inner
+                .jobs
+                .job(now, *id)
+                .is_none_or(|j| matches!(j.state, JobState::Done(_)))
+        })
+        .collect();
+    for id in done {
+        inner.archives.remove(&id);
+        inner.job_meta.remove(&id);
+    }
+}
+
+async fn trust(State(d): App, Json(body): Json<TrustBody>) -> Reply<JobReply> {
+    // Bound the work before doing any of it: base64 grows data by 4/3.
+    if body.archive.len() > MAX_ARCHIVE_BYTES.div_ceil(3) * 4 {
+        return Err(too_large("archive_too_large", "the archive"));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body.archive.as_bytes())
+        .map_err(|e| Fail::new(StatusCode::BAD_REQUEST, "bad_archive", e.to_string()))?;
+    if bytes.len() > MAX_ARCHIVE_BYTES {
+        return Err(too_large("archive_too_large", "the archive"));
+    }
+    let digest = scope::challenge_of(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let (job, expires) = file_job(
+        &d,
+        &body.project,
+        JobKind::Trust {
+            archive_sha256: digest,
+        },
+        Some(bytes),
+        &body.reason,
+        &body.requester,
+        body.context.as_deref(),
+    )?;
+    Ok(Json(JobReply {
+        id: job.id,
+        match_code: job.match_code,
+        expires,
+    }))
+}
+
+async fn apply(State(d): App, Json(body): Json<ApplyBody>) -> Reply<JobReply> {
+    if body.manifest.len() > MAX_MANIFEST_BYTES {
+        return Err(too_large("manifest_too_large", "the manifest"));
+    }
+    let (job, expires) = file_job(
+        &d,
+        &body.project,
+        JobKind::Apply {
+            manifest: body.manifest,
+            allow_destroy: body.allow_destroy,
+        },
+        None,
+        &body.reason,
+        &body.requester,
+        body.context.as_deref(),
+    )?;
+    Ok(Json(JobReply {
+        id: job.id,
+        match_code: job.match_code,
+        expires,
+    }))
+}
+
+fn result_name(r: &JobResult) -> &'static str {
+    match r {
+        JobResult::Trusted => "trusted",
+        JobResult::Applied => "applied",
+        JobResult::Refused(_) => "refused",
+        JobResult::PlanFailed(_) => "plan_failed",
+        JobResult::ApplyFailed(_) => "apply_failed",
+        JobResult::OutcomeUnknown => "outcome_unknown",
+        JobResult::Declined => "declined",
+        JobResult::TimedOut => "timed_out",
+        JobResult::Killed => "killed",
+    }
+}
+
+/// The agent's view of a job. It names the state and the result and nothing
+/// else about the contents: no manifest, no archive.
+fn job_status(job: &Job) -> JobStatus {
+    let (kind, state, result) = (
+        match job.kind {
+            JobKind::Trust { .. } => "trust",
+            JobKind::Apply { .. } => "apply",
+        },
+        match &job.state {
+            JobState::Queued => "queued",
+            JobState::Working { .. } => "working",
+            JobState::Waiting { .. } => "waiting",
+            JobState::Approved { .. } => "approved",
+            JobState::Claimed => "claimed",
+            JobState::Done(_) => "done",
+        },
+        match &job.state {
+            JobState::Done(r) => Some(result_name(r).to_owned()),
+            _ => None,
+        },
+    );
+    JobStatus {
+        id: job.id,
+        project: job.project.clone(),
+        kind: kind.to_owned(),
+        state: state.to_owned(),
+        result,
+        // Task 7: the runner's report supplies these.
+        failure: None,
+        summary: None,
+    }
+}
+
+async fn job(State(d): App, Path(id): Path<u64>) -> Reply<JobStatus> {
+    let now = now();
+    let policy = d.config.policy();
+    let status = d.with(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        inner.jobs.job(now, id).map(job_status)
+    });
+    status
+        .map(Json)
+        .ok_or_else(|| Fail::new(StatusCode::NOT_FOUND, "no_such_job", "no job with that id"))
 }
 
 async fn pending(State(d): App) -> Reply<ApproverState> {

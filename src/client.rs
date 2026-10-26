@@ -52,7 +52,10 @@ impl Error {
             Error::Ambiguous(_) => Status::RetryUnknown,
             Error::Protocol(_) => Status::RetryUnknown,
             Error::Daemon { http, reply } => match reply.code.as_str() {
-                "unknown_host" | "bad_key" | "reason_required" => Status::Permanent,
+                "unknown_host" | "unknown_project" | "bad_key" | "bad_archive" | "bad_request"
+                | "archive_too_large" | "manifest_too_large" | "reason_required" => {
+                    Status::Permanent
+                }
                 "busy" => Status::RetryClean,
                 "cooldown" | "rate_capped" => Status::RetryLater,
                 "no_window" | "no_such_request" => Status::AuthNeedsHuman,
@@ -164,7 +167,32 @@ impl Client {
         let _: serde_json::Value = self.post(
             "/api/kill",
             &KillBody {
-                host: host.to_owned(),
+                host: Some(host.to_owned()),
+                project: None,
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn trust(&self, body: &TrustBody) -> Result<JobReply, Error> {
+        self.post("/api/trust", body)
+    }
+
+    pub fn apply(&self, body: &ApplyBody) -> Result<JobReply, Error> {
+        self.post("/api/apply", body)
+    }
+
+    pub fn job(&self, id: u64) -> Result<JobStatus, Error> {
+        self.get(&format!("/api/job/{id}"))
+    }
+
+    /// Stop a Terraform project's job; see `POST /api/kill`.
+    pub fn kill_project(&self, project: &str) -> Result<(), Error> {
+        let _: serde_json::Value = self.post(
+            "/api/kill",
+            &KillBody {
+                host: None,
+                project: Some(project.to_owned()),
             },
         )?;
         Ok(())
