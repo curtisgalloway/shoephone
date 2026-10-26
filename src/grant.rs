@@ -395,13 +395,18 @@ impl Grants {
         // The id is only taken once the gate lets the request in, so a
         // refusal does not burn one; `allocate_id` below hands out this same
         // value.
-        self.gate
-            .admit(now, &self.policy, Occupant::Ssh(self.next_id))?;
+        let peeked = Occupant::Ssh(self.next_id);
+        self.gate.admit(now, &self.policy, peeked)?;
 
         let window = wanted
             .unwrap_or(self.policy.default_window)
             .min(self.policy.max_window);
         let id = self.allocate_id();
+        debug_assert_eq!(
+            Occupant::Ssh(id),
+            peeked,
+            "gate occupant matches the id taken"
+        );
         let pending = Pending {
             id,
             scope: Scope {
@@ -477,13 +482,13 @@ impl Grants {
             .pending
             .take_if(|p| p.id == id)
             .ok_or(Refusal::NoSuchRequest)?;
-        self.events.push(Event::Declined {
-            id: pending.id,
-            host: pending.scope.host.clone(),
-            at: now,
-        });
         self.gate.release(Occupant::Ssh(pending.id));
         self.gate.strike_at(now, &self.policy);
+        self.events.push(Event::Declined {
+            id: pending.id,
+            host: pending.scope.host,
+            at: now,
+        });
         Ok(())
     }
 
@@ -1343,6 +1348,85 @@ mod tests {
         approved(&mut g, after);
         assert_eq!(g.gate.strikes, 0);
         assert_eq!(g.gate.cooldown_until, None);
+    }
+
+    #[test]
+    fn cooldown_doubles_per_strike_up_to_the_cap_and_timeouts_count() {
+        let mut g = grants();
+        let mut now = t(0);
+        let mut seen = Vec::new();
+        for strike in 0..6u32 {
+            let p = g
+                .request(
+                    now,
+                    &mut Counter(0),
+                    "web01",
+                    KEY,
+                    "laptop",
+                    "deploy",
+                    None,
+                    None,
+                )
+                .unwrap();
+            if strike % 2 == 0 {
+                g.decline(now, p.id).unwrap();
+            } else {
+                assert!(g.pending(now + 5 * MIN).is_none(), "timed out");
+                now += 5 * MIN;
+            }
+            let until = g.gate.cooldown_until.unwrap();
+            seen.push(until.duration_since(now).unwrap());
+            now = until;
+        }
+        assert_eq!(
+            seen,
+            [5 * MIN, 10 * MIN, 20 * MIN, 40 * MIN, 60 * MIN, 60 * MIN]
+        );
+    }
+
+    #[test]
+    fn the_hourly_cap_counts_every_requester_together() {
+        let mut g = grants();
+        for i in 0..6u64 {
+            let now = t(i * 60);
+            let p = g
+                .request(
+                    now,
+                    &mut Counter(0),
+                    "web01",
+                    KEY,
+                    &format!("laptop-{i}"),
+                    "deploy",
+                    None,
+                    None,
+                )
+                .unwrap();
+            g.approve(now, &approval_for(&p)).unwrap();
+        }
+        let r = g.request(
+            t(400),
+            &mut Counter(0),
+            "db01",
+            OTHER_KEY,
+            "rogue",
+            "deploy",
+            None,
+            None,
+        );
+        assert_eq!(r, Err(Refusal::RateCapped { until: t(3600) }));
+        assert!(
+            g.request(
+                t(3600),
+                &mut Counter(0),
+                "db01",
+                OTHER_KEY,
+                "rogue",
+                "deploy",
+                None,
+                None
+            )
+            .is_ok()
+        );
     }
 
     #[test]
