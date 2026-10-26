@@ -26,12 +26,13 @@
 //! [`Grants::approve`] when the assertion verifies. A request that changed
 //! underneath the ceremony is rejected there too.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
+use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -43,10 +44,11 @@ use crate::ca::{self, UserCa};
 use crate::config::Config;
 use crate::exit::VERSION;
 use crate::grant::{self, Approval, Entropy, Event, Grants, Pending, Refusal, Scope};
-use crate::job::{Job, JobKind, JobResult, JobState, Jobs};
+use crate::job::{Failure, Job, JobKind, JobResult, JobScope, JobState, Jobs};
 use crate::notify::{Apns, Delivery, Notifier, Push};
-use crate::scope;
-use crate::store::{self, Device, EnrollCode, LedgerEntry, Store};
+use crate::runner_auth::{self, Verifier};
+use crate::scope::{self, Action, ApplyScope, BaselineStatus, Counts, TrustScope};
+use crate::store::{self, Device, EnrollCode, LedgerEntry, Store, TrustRecord};
 
 pub const PAGE: &str = include_str!("../assets/approve.html");
 
@@ -84,10 +86,19 @@ struct Inner {
     /// Terraform trust and apply jobs.
     jobs: Jobs,
     /// The decoded archive of each trust job, by job id, for the runner to
-    /// fetch. Dropped once the job is done.
-    // Task 7: the runner endpoint that serves these reads the field.
-    #[allow(dead_code)]
+    /// fetch. Dropped once the job leaves `Queued` and `Working`.
     archives: HashMap<u64, Vec<u8>>,
+    /// What the approver reads to recompute a submitted scope's digests, by
+    /// job id, as the runner sent it. Dropped once the job leaves `Waiting`.
+    // Task 8: the approve page reads these.
+    displays: HashMap<u64, DisplayWire>,
+    /// The trust scope of each claimed trust job, so `finish` can record
+    /// what was trusted. Dropped when the job finishes.
+    claimed: HashMap<u64, TrustScope>,
+    /// What each project currently trusts; mirrors `trusted.json`.
+    trusted: BTreeMap<String, TrustRecord>,
+    /// Checks the runners' signatures and remembers their nonces.
+    verifier: Verifier,
     /// What the requester said about itself, sanitized, by job id.
     job_meta: HashMap<u64, JobMeta>,
 }
@@ -234,6 +245,13 @@ impl Daemon {
                 .map(|(name, p)| (name.clone(), p.runner.clone()))
                 .collect(),
         );
+        let mut jobs = jobs;
+        let mut trusted = BTreeMap::new();
+        for record in store.load_trusted()? {
+            jobs.set_trusted(&record.project, Some(record.digest.clone()));
+            trusted.insert(record.project.clone(), record);
+        }
+        let verifier = Verifier::new(config.runner_keys()?);
         let notifier = config.notify.clone().map(|n| Arc::new(Notifier::new(n)));
         let apns = match config.apns.clone() {
             Some(c) => {
@@ -264,6 +282,10 @@ impl Daemon {
                 issued: HashMap::new(),
                 jobs,
                 archives: HashMap::new(),
+                displays: HashMap::new(),
+                claimed: HashMap::new(),
+                trusted,
+                verifier,
                 job_meta: HashMap::new(),
             }),
         })
@@ -453,6 +475,15 @@ impl Daemon {
                 post(apply).layer(DefaultBodyLimit::max(APPLY_BODY_LIMIT)),
             )
             .route("/api/job/{id}", get(job))
+            .route("/api/runner/poll", post(runner_poll))
+            .route("/api/runner/archive/{id}", get(runner_archive))
+            .route(
+                "/api/runner/submit",
+                post(runner_submit).layer(DefaultBodyLimit::max(SUBMIT_BODY_LIMIT)),
+            )
+            .route("/api/runner/refuse", post(runner_refuse))
+            .route("/api/runner/claim", post(runner_claim))
+            .route("/api/runner/finish", post(runner_finish))
             .route("/api/kill", post(kill))
             .route("/api/pending", get(pending))
             .route("/api/approve/start", post(approve_start))
@@ -463,7 +494,9 @@ impl Daemon {
             .route("/api/push/register", post(push_register))
             .route("/api/ledger", get(ledger));
         #[cfg(feature = "test-hooks")]
-        let router = router.route("/api/test/approve", post(test_approve));
+        let router = router
+            .route("/api/test/approve", post(test_approve))
+            .route("/api/test/approve_job", post(test_approve_job));
         router.with_state(self)
     }
 }
@@ -855,23 +888,41 @@ fn file_job(
     })
 }
 
-/// Drop the archive and requester notes of jobs that are over.
+/// Drop what the daemon keeps beside a job once the job has moved past the
+/// stage that needs it: the archive once the job is neither `Queued` nor
+/// `Working`, the display once it is not `Waiting`, the claimed trust scope
+/// once it is not `Claimed`, and the requester notes once it is over.
 fn prune_jobs(inner: &mut Inner, now: SystemTime) {
-    let done: Vec<u64> = inner
+    let ids: HashSet<u64> = inner
         .archives
         .keys()
         .chain(inner.job_meta.keys())
+        .chain(inner.displays.keys())
+        .chain(inner.claimed.keys())
         .copied()
-        .filter(|id| {
-            inner
-                .jobs
-                .job(now, *id)
-                .is_none_or(|j| matches!(j.state, JobState::Done(_)))
-        })
         .collect();
-    for id in done {
-        inner.archives.remove(&id);
-        inner.job_meta.remove(&id);
+    for id in ids {
+        // (queued or working, waiting, claimed, over)
+        let (early, waiting, claimed, over) = match inner.jobs.job(now, id).map(|j| &j.state) {
+            None => (false, false, false, true),
+            Some(JobState::Queued | JobState::Working { .. }) => (true, false, false, false),
+            Some(JobState::Waiting { .. }) => (false, true, false, false),
+            Some(JobState::Claimed) => (false, false, true, false),
+            Some(JobState::Approved { .. }) => (false, false, false, false),
+            Some(JobState::Done(_)) => (false, false, false, true),
+        };
+        if !early {
+            inner.archives.remove(&id);
+        }
+        if !waiting {
+            inner.displays.remove(&id);
+        }
+        if !claimed {
+            inner.claimed.remove(&id);
+        }
+        if over {
+            inner.job_meta.remove(&id);
+        }
     }
 }
 
@@ -972,8 +1023,13 @@ fn job_status(job: &Job) -> JobStatus {
         kind: kind.to_owned(),
         state: state.to_owned(),
         result,
-        // Task 7: the runner's report supplies these.
-        failure: None,
+        failure: match &job.state {
+            JobState::Done(
+                JobResult::Refused(f) | JobResult::PlanFailed(f) | JobResult::ApplyFailed(f),
+            ) => Some(failure_view(f)),
+            _ => None,
+        },
+        // Task 8: the approver's view of the plan supplies this.
         summary: None,
     }
 }
@@ -1423,6 +1479,507 @@ async fn test_approve(State(d): App, Json(body): Json<ById>) -> Reply<serde_json
             },
         )?;
         Ok(Json(serde_json::json!({ "approved": window.id })))
+    })
+}
+
+// ---------------------------------------------------------------------
+// Runner endpoints
+// ---------------------------------------------------------------------
+
+/// Header carrying the request's Unix time in seconds.
+const TIMESTAMP_HEADER: &str = "shoephone-runner-timestamp";
+/// Header carrying the request's single-use nonce.
+const NONCE_HEADER: &str = "shoephone-runner-nonce";
+
+/// Request body limit for `submit`: a diff and a manifest in JSON.
+const SUBMIT_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+/// A runner refusal is a 401 whichever way the signature failed; the other
+/// meanings of these refusals keep their statuses elsewhere.
+fn runner_refusal(r: Refusal) -> Fail {
+    match r {
+        Refusal::WrongRunner => Fail::new(
+            StatusCode::UNAUTHORIZED,
+            "wrong_runner",
+            "the request is not signed by a known runner",
+        ),
+        Refusal::StaleSignature => Fail::new(
+            StatusCode::UNAUTHORIZED,
+            "stale_signature",
+            "the request is stale or was replayed",
+        ),
+        other => other.into(),
+    }
+}
+
+/// Verify a runner request and return the runner's name. `job` is the id
+/// the signature covers: the body's, the path's, or none.
+fn authenticate(
+    d: &Daemon,
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    job: Option<u64>,
+) -> Result<String, Fail> {
+    let unsigned = || {
+        Fail::new(
+            StatusCode::UNAUTHORIZED,
+            "unsigned",
+            "the request lacks a runner signature, timestamp or nonce",
+        )
+    };
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let runner = get(runner_auth::RUNNER_HEADER).ok_or_else(unsigned)?;
+    let signature = get(runner_auth::SIGNATURE_HEADER).ok_or_else(unsigned)?;
+    let nonce = get(NONCE_HEADER).ok_or_else(unsigned)?;
+    let timestamp: u64 = get(TIMESTAMP_HEADER)
+        .and_then(|t| t.parse().ok())
+        .ok_or_else(unsigned)?;
+    d.with(|inner| {
+        inner.verifier.verify(
+            now(),
+            Instant::now(),
+            runner,
+            signature,
+            (method, path, body, job, timestamp, nonce),
+        )
+    })
+    .map_err(runner_refusal)?;
+    Ok(runner.to_owned())
+}
+
+/// The `id` a runner request body names, read before the signature is
+/// checked only so the signed message can be rebuilt. Nothing else in the
+/// body is looked at until the signature holds.
+fn body_id(body: &[u8]) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        id: Option<u64>,
+    }
+    serde_json::from_slice::<Peek>(body).ok().and_then(|p| p.id)
+}
+
+fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Fail> {
+    serde_json::from_slice(body)
+        .map_err(|e| Fail::new(StatusCode::BAD_REQUEST, "bad_request", e.to_string()))
+}
+
+fn bad_request(error: impl Into<String>) -> Fail {
+    Fail::new(StatusCode::BAD_REQUEST, "bad_request", error)
+}
+
+fn inconsistent(error: impl Into<String>) -> Fail {
+    Fail::new(StatusCode::BAD_REQUEST, "inconsistent_scope", error)
+}
+
+fn failure_from_view(v: FailureView) -> Failure {
+    Failure {
+        category: grant::printable(&v.category, 64),
+        addresses: v
+            .addresses
+            .iter()
+            .take(1000)
+            .map(|a| grant::printable(a, 512))
+            .collect(),
+        detail: v.detail.map(|d| grant::printable(&d, 2048)),
+    }
+}
+
+fn failure_view(f: &Failure) -> FailureView {
+    FailureView {
+        category: f.category.clone(),
+        addresses: f.addresses.clone(),
+        detail: f.detail.clone(),
+    }
+}
+
+fn baseline_name(b: BaselineStatus) -> &'static str {
+    match b {
+        BaselineStatus::None => "none",
+        BaselineStatus::Applied => "applied",
+        BaselineStatus::Uncertain => "uncertain",
+    }
+}
+
+fn scope_from_wire(w: JobScopeWire) -> Result<JobScope, Fail> {
+    Ok(match w {
+        JobScopeWire::Trust(t) => JobScope::Trust(TrustScope {
+            project: t.project,
+            baseline: t.baseline,
+            candidate: t.candidate,
+            diff: t.diff,
+            schema: t.schema,
+            policy_version: t.policy_version,
+            files_changed: t.files_changed,
+            lines_added: t.lines_added,
+            lines_removed: t.lines_removed,
+            schema_changed: t.schema_changed,
+        }),
+        JobScopeWire::Apply(a) => JobScope::Apply(ApplyScope {
+            project: a.project,
+            revision: a.revision,
+            schema: a.schema,
+            manifest: a.manifest,
+            baseline_manifest: a.baseline_manifest,
+            baseline_status: match a.baseline_status.as_str() {
+                "none" => BaselineStatus::None,
+                "applied" => BaselineStatus::Applied,
+                "uncertain" => BaselineStatus::Uncertain,
+                other => return Err(bad_request(format!("unknown baseline_status {other:?}"))),
+            },
+            plan: a.plan,
+            destructive: a.destructive,
+            counts: Counts {
+                create: a.counts.create,
+                update: a.counts.update,
+                replace: a.counts.replace,
+                delete: a.counts.delete,
+            },
+            addresses: a.addresses,
+        }),
+    })
+}
+
+fn scope_to_wire(s: &JobScope) -> JobScopeWire {
+    match s {
+        JobScope::Trust(t) => JobScopeWire::Trust(TrustScopeWire {
+            project: t.project.clone(),
+            baseline: t.baseline.clone(),
+            candidate: t.candidate.clone(),
+            diff: t.diff.clone(),
+            schema: t.schema.clone(),
+            policy_version: t.policy_version,
+            files_changed: t.files_changed,
+            lines_added: t.lines_added,
+            lines_removed: t.lines_removed,
+            schema_changed: t.schema_changed,
+        }),
+        JobScope::Apply(a) => JobScopeWire::Apply(ApplyScopeWire {
+            project: a.project.clone(),
+            revision: a.revision.clone(),
+            schema: a.schema.clone(),
+            manifest: a.manifest.clone(),
+            baseline_manifest: a.baseline_manifest.clone(),
+            baseline_status: baseline_name(a.baseline_status).to_owned(),
+            plan: a.plan.clone(),
+            destructive: a.destructive,
+            counts: CountsWire {
+                create: a.counts.create,
+                update: a.counts.update,
+                replace: a.counts.replace,
+                delete: a.counts.delete,
+            },
+            addresses: a.addresses.clone(),
+        }),
+    }
+}
+
+/// Parse `"{action} {address}\n"` lines; `None` unless the text is exactly
+/// what [`scope::address_text`] would write for the changes it names.
+fn parse_address_text(text: &str) -> Option<Vec<(Action, String)>> {
+    let mut changes = Vec::new();
+    for line in text.split_terminator('\n') {
+        let (action, address) = line.split_once(' ')?;
+        let action = match action {
+            "create" => Action::Create,
+            "update" => Action::Update,
+            "replace" => Action::Replace,
+            "delete" => Action::Delete,
+            _ => return None,
+        };
+        changes.push((action, address.to_owned()));
+    }
+    (scope::address_text(&changes).as_deref() == Some(text)).then_some(changes)
+}
+
+/// Check every digest in a submitted scope against the text the approver
+/// will read, and the counts and destructive flag against the addresses.
+fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), Fail> {
+    match scope {
+        JobScopeWire::Trust(t) => {
+            if display.external {
+                return Ok(());
+            }
+            let diff = display
+                .diff
+                .as_deref()
+                .ok_or_else(|| inconsistent("the display carries no diff"))?;
+            if store::sha256_hex(diff) != t.diff {
+                return Err(inconsistent("the diff digest does not match the display"));
+            }
+        }
+        JobScopeWire::Apply(a) => {
+            let manifest = display
+                .manifest
+                .as_deref()
+                .ok_or_else(|| inconsistent("the display carries no manifest"))?;
+            if store::sha256_hex(manifest) != a.manifest {
+                return Err(inconsistent(
+                    "the manifest digest does not match the display",
+                ));
+            }
+            match (&a.baseline_manifest, &display.baseline_manifest) {
+                (None, None) => {}
+                (Some(digest), Some(text)) if store::sha256_hex(text) == *digest => {}
+                _ => {
+                    return Err(inconsistent(
+                        "the baseline manifest digest does not match the display",
+                    ));
+                }
+            }
+            let text = display
+                .address_text
+                .as_deref()
+                .ok_or_else(|| inconsistent("the display carries no address text"))?;
+            if store::sha256_hex(text) != a.addresses {
+                return Err(inconsistent(
+                    "the address digest does not match the display",
+                ));
+            }
+            let changes = parse_address_text(text)
+                .ok_or_else(|| inconsistent("the address text is not well formed"))?;
+            let count =
+                |want: Action| changes.iter().filter(|(action, _)| *action == want).count() as u64;
+            let counts = &a.counts;
+            if count(Action::Create) != u64::from(counts.create)
+                || count(Action::Update) != u64::from(counts.update)
+                || count(Action::Replace) != u64::from(counts.replace)
+                || count(Action::Delete) != u64::from(counts.delete)
+            {
+                return Err(inconsistent("the counts do not match the addresses"));
+            }
+            if a.destructive != (counts.delete > 0 || counts.replace > 0) {
+                return Err(inconsistent(
+                    "the destructive flag does not match the counts",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn runner_job(job: &Job, trusted: &BTreeMap<String, TrustRecord>) -> RunnerJob {
+    let (kind, manifest, allow_destroy) = match &job.kind {
+        JobKind::Trust { .. } => ("trust", None, false),
+        JobKind::Apply {
+            manifest,
+            allow_destroy,
+        } => ("apply", Some(manifest.clone()), *allow_destroy),
+    };
+    RunnerJob {
+        id: job.id,
+        project: job.project.clone(),
+        kind: kind.to_owned(),
+        state: match job.state {
+            JobState::Approved { .. } => "approved",
+            _ => "working",
+        }
+        .to_owned(),
+        manifest,
+        allow_destroy,
+        trusted: trusted.get(&job.project).cloned(),
+    }
+}
+
+async fn runner_poll(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<Option<RunnerJob>> {
+    let runner = authenticate(&d, &headers, "POST", "/api/runner/poll", &body, None)?;
+    let (now, policy) = (now(), d.config.policy());
+    d.audited(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        prune_jobs(inner, now);
+        let job = inner.jobs.poll(now, inner.grants.gate_mut(), &runner);
+        Ok(Json(job.map(|j| runner_job(&j, &inner.trusted))))
+    })
+}
+
+async fn runner_archive(
+    State(d): App,
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+) -> Result<Response, Fail> {
+    let path = format!("/api/runner/archive/{id}");
+    let runner = authenticate(&d, &headers, "GET", &path, b"", Some(id))?;
+    let (now, policy) = (now(), d.config.policy());
+    let bytes = d.with(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        prune_jobs(inner, now);
+        let working = inner
+            .jobs
+            .job(now, id)
+            .is_some_and(|j| matches!(&j.state, JobState::Working { runner: r } if *r == runner));
+        if working {
+            inner.archives.get(&id).cloned()
+        } else {
+            None
+        }
+    });
+    match bytes {
+        Some(bytes) => Ok(([(header::CONTENT_TYPE, "application/gzip")], bytes).into_response()),
+        None => Err(Fail::new(
+            StatusCode::NOT_FOUND,
+            "no_archive",
+            "no archive is available for that job",
+        )),
+    }
+}
+
+async fn runner_submit(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<serde_json::Value> {
+    let runner = authenticate(
+        &d,
+        &headers,
+        "POST",
+        "/api/runner/submit",
+        &body,
+        body_id(&body),
+    )?;
+    let req: SubmitBody = parse_body(&body)?;
+    check_consistency(&req.scope, &req.display)?;
+    let scope = scope_from_wire(req.scope)?;
+    let now = now();
+    d.audited(|inner| {
+        let mut entropy = ca::OsEntropy;
+        inner.jobs.submit(
+            now,
+            inner.grants.gate_mut(),
+            &runner,
+            req.id,
+            scope,
+            &mut entropy,
+        )?;
+        inner.displays.insert(req.id, req.display);
+        prune_jobs(inner, now);
+        Ok(Json(serde_json::json!({})))
+    })
+}
+
+async fn runner_refuse(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<serde_json::Value> {
+    let runner = authenticate(
+        &d,
+        &headers,
+        "POST",
+        "/api/runner/refuse",
+        &body,
+        body_id(&body),
+    )?;
+    let req: RefuseBody = parse_body(&body)?;
+    let failure = failure_from_view(req.failure);
+    let result = match req.result.as_str() {
+        "refused" => JobResult::Refused(failure),
+        "plan_failed" => JobResult::PlanFailed(failure),
+        other => return Err(bad_request(format!("unknown result {other:?}"))),
+    };
+    let now = now();
+    d.with(|inner| {
+        inner
+            .jobs
+            .refuse(now, inner.grants.gate_mut(), &runner, req.id, result)?;
+        prune_jobs(inner, now);
+        Ok(Json(serde_json::json!({})))
+    })
+}
+
+async fn runner_claim(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<JobScopeWire> {
+    let runner = authenticate(
+        &d,
+        &headers,
+        "POST",
+        "/api/runner/claim",
+        &body,
+        body_id(&body),
+    )?;
+    let req: ById = parse_body(&body)?;
+    let now = now();
+    d.audited(|inner| {
+        let scope = inner.jobs.claim(now, &runner, req.id)?;
+        if let JobScope::Trust(t) = &scope {
+            inner.claimed.insert(req.id, t.clone());
+        }
+        prune_jobs(inner, now);
+        Ok(Json(scope_to_wire(&scope)))
+    })
+}
+
+async fn runner_finish(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<serde_json::Value> {
+    let runner = authenticate(
+        &d,
+        &headers,
+        "POST",
+        "/api/runner/finish",
+        &body,
+        body_id(&body),
+    )?;
+    let req: FinishBody = parse_body(&body)?;
+    let result = match (req.result.as_str(), req.failure) {
+        ("trusted", _) => JobResult::Trusted,
+        ("applied", _) => JobResult::Applied,
+        ("outcome_unknown", _) => JobResult::OutcomeUnknown,
+        ("apply_failed", Some(f)) => JobResult::ApplyFailed(failure_from_view(f)),
+        ("apply_failed", None) => return Err(bad_request("apply_failed needs a failure")),
+        (other, _) => return Err(bad_request(format!("unknown result {other:?}"))),
+    };
+    let now = now();
+    d.with(|inner| {
+        let project = match inner.jobs.job(now, req.id) {
+            Some(job) => job.project.clone(),
+            None => req.project.clone().ok_or_else(|| {
+                Fail::new(
+                    StatusCode::BAD_REQUEST,
+                    "project_required",
+                    "the daemon does not know that job; say which project it belongs to",
+                )
+            })?,
+        };
+        inner
+            .jobs
+            .finish(now, &runner, &project, req.id, result.clone())?;
+        let claimed = inner.claimed.remove(&req.id);
+        if result == JobResult::Trusted {
+            let scope = claimed.ok_or_else(|| Fail::internal("a trusted job has no scope"))?;
+            let record = TrustRecord {
+                project: project.clone(),
+                digest: scope.candidate,
+                schema: scope.schema,
+                job: req.id,
+                at: store::unix(now),
+            };
+            let mut all = inner.trusted.clone();
+            all.insert(project.clone(), record.clone());
+            let records: Vec<TrustRecord> = all.values().cloned().collect();
+            if let Err(e) = d.store.save_trusted(&records) {
+                eprintln!("shoephoned: trusted: {e}");
+                inner.ledger_failed = Some(e);
+                return Err(Fail::internal("the trust record could not be saved"));
+            }
+            inner
+                .jobs
+                .set_trusted(&project, Some(record.digest.clone()));
+            inner.trusted = all;
+        }
+        prune_jobs(inner, now);
+        Ok(Json(serde_json::json!({})))
+    })
+}
+
+/// Approves the job waiting on the approver, as the approver's device would.
+/// Only compiled with `test-hooks`.
+#[cfg(feature = "test-hooks")]
+async fn test_approve_job(State(d): App, Json(body): Json<ById>) -> Reply<serde_json::Value> {
+    let (now, policy) = (now(), d.config.policy());
+    d.audited(|inner| {
+        let (nonce, scope) = match inner.jobs.job(now, body.id).map(|j| j.state.clone()) {
+            Some(JobState::Waiting { scope, nonce, .. }) => (nonce, scope),
+            _ => return Err(Refusal::NoSuchRequest.into()),
+        };
+        inner.jobs.approve(
+            now,
+            inner.grants.gate_mut(),
+            &policy,
+            body.id,
+            &nonce,
+            &scope,
+        )?;
+        Ok(Json(serde_json::json!({ "approved": body.id })))
     })
 }
 

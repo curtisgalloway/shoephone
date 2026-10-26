@@ -291,3 +291,126 @@ pub struct SummaryView {
     /// `none`, `applied` or `uncertain`.
     pub baseline_status: String,
 }
+
+/// The wire form of [`crate::scope::TrustScope`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrustScopeWire {
+    pub project: String,
+    #[serde(default)]
+    pub baseline: Option<String>,
+    pub candidate: String,
+    pub diff: String,
+    pub schema: String,
+    pub policy_version: u32,
+    pub files_changed: u32,
+    pub lines_added: u32,
+    pub lines_removed: u32,
+    pub schema_changed: bool,
+}
+
+/// The four change counts of a plan.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CountsWire {
+    pub create: u32,
+    pub update: u32,
+    pub replace: u32,
+    pub delete: u32,
+}
+
+/// The wire form of [`crate::scope::ApplyScope`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApplyScopeWire {
+    pub project: String,
+    pub revision: String,
+    pub schema: String,
+    pub manifest: String,
+    #[serde(default)]
+    pub baseline_manifest: Option<String>,
+    /// `none`, `applied` or `uncertain`.
+    pub baseline_status: String,
+    pub plan: String,
+    pub destructive: bool,
+    pub counts: CountsWire,
+    pub addresses: String,
+}
+
+/// The wire form of [`crate::job::JobScope`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum JobScopeWire {
+    Trust(TrustScopeWire),
+    Apply(ApplyScopeWire),
+}
+
+/// What the approver needs in order to recompute the digests in a scope.
+/// The daemon checks them before it accepts the scope.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DisplayWire {
+    /// A trust: the diff text whose SHA-256 is the scope's `diff`.
+    #[serde(default)]
+    pub diff: Option<String>,
+    /// A trust whose diff is too large to carry: the approver checks it
+    /// outside the app with `verify_command`.
+    #[serde(default)]
+    pub external: bool,
+    #[serde(default)]
+    pub verify_command: Option<String>,
+    /// An apply: the canonical manifest text.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    /// An apply: the baseline manifest text, if there is a baseline.
+    #[serde(default)]
+    pub baseline_manifest: Option<String>,
+    /// An apply: one `"{action} {address}\n"` line per change.
+    #[serde(default)]
+    pub address_text: Option<String>,
+}
+
+/// What `POST /api/runner/poll` hands a runner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunnerJob {
+    pub id: u64,
+    pub project: String,
+    /// `trust` or `apply`.
+    pub kind: String,
+    /// `working` or `approved`.
+    pub state: String,
+    /// An apply: the agent's manifest text.
+    #[serde(default)]
+    pub manifest: Option<String>,
+    pub allow_destroy: bool,
+    /// The project's currently trusted candidate, if any.
+    #[serde(default)]
+    pub trusted: Option<crate::store::TrustRecord>,
+}
+
+/// `POST /api/runner/submit`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitBody {
+    pub id: u64,
+    pub scope: JobScopeWire,
+    pub display: DisplayWire,
+}
+
+/// `POST /api/runner/refuse`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefuseBody {
+    pub id: u64,
+    /// `refused` or `plan_failed`.
+    pub result: String,
+    pub failure: FailureView,
+}
+
+/// `POST /api/runner/finish`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinishBody {
+    pub id: u64,
+    /// `trusted`, `applied`, `apply_failed` or `outcome_unknown`.
+    pub result: String,
+    #[serde(default)]
+    pub failure: Option<FailureView>,
+    /// Needed only when the daemon no longer knows the job (it restarted
+    /// mid-apply), so an `outcome_unknown` can still be recorded.
+    #[serde(default)]
+    pub project: Option<String>,
+}
