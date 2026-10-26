@@ -122,11 +122,7 @@ impl Scope {
 /// not: there is no separate value a dishonest channel could relay unchanged
 /// while lying about the scope on screen.
 pub fn bound_challenge(scope: &Scope, nonce: &str) -> [u8; 32] {
-    use ssh_key::sha2::{Digest, Sha256};
-    let digest = Sha256::digest(scope.bytes_to_sign(nonce));
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
+    crate::scope::challenge_of(&scope.bytes_to_sign(nonce))
 }
 
 /// A request awaiting a verdict. There is at most one.

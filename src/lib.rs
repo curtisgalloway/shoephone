@@ -18,6 +18,7 @@ pub mod exit;
 pub mod gate;
 pub mod grant;
 pub mod notify;
+pub mod scope;
 pub mod server;
 pub mod session;
 pub mod store;
