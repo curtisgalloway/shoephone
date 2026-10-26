@@ -78,7 +78,9 @@ fn bytes_of(v: &Vector) -> Vec<u8> {
                 schema_changed: b(sc, "schema_changed"),
             };
             assert!(scope.is_well_formed(), "{} is not well formed", v.name);
-            scope.bytes_to_sign(&v.nonce)
+            scope
+                .bytes_to_sign(&v.nonce)
+                .expect("vector is well formed")
         }
         "apply" => {
             let scope = ApplyScope {
@@ -104,7 +106,9 @@ fn bytes_of(v: &Vector) -> Vec<u8> {
                 addresses: s(sc, "addresses"),
             };
             assert!(scope.is_well_formed(), "{} is not well formed", v.name);
-            scope.bytes_to_sign(&v.nonce)
+            scope
+                .bytes_to_sign(&v.nonce)
+                .expect("vector is well formed")
         }
         other => panic!("unknown kind {other}"),
     }
