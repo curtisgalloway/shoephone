@@ -38,7 +38,7 @@ fn doc() -> Doc {
     );
     let text = std::fs::read_to_string(path).expect("vector file");
     let doc: Doc = serde_json::from_str(&text).expect("vector json");
-    assert!(doc.vectors.len() >= 4, "expected at least four vectors");
+    assert!(doc.vectors.len() >= 5, "expected at least five vectors");
     doc
 }
 
@@ -54,7 +54,7 @@ fn opt(v: &serde_json::Value, key: &str) -> Option<String> {
 }
 
 fn n(v: &serde_json::Value, key: &str) -> u32 {
-    v[key].as_u64().unwrap_or_else(|| panic!("{key}")) as u32
+    u32::try_from(v[key].as_u64().unwrap_or_else(|| panic!("{key}"))).expect("fits in u32")
 }
 
 fn b(v: &serde_json::Value, key: &str) -> bool {
@@ -64,42 +64,48 @@ fn b(v: &serde_json::Value, key: &str) -> bool {
 fn bytes_of(v: &Vector) -> Vec<u8> {
     let sc = &v.scope;
     match v.kind.as_str() {
-        "trust" => TrustScope {
-            project: s(sc, "project"),
-            baseline: opt(sc, "baseline"),
-            candidate: s(sc, "candidate"),
-            diff: s(sc, "diff"),
-            schema: s(sc, "schema"),
-            policy_version: n(sc, "policy_version"),
-            files_changed: n(sc, "files_changed"),
-            lines_added: n(sc, "lines_added"),
-            lines_removed: n(sc, "lines_removed"),
-            schema_changed: b(sc, "schema_changed"),
+        "trust" => {
+            let scope = TrustScope {
+                project: s(sc, "project"),
+                baseline: opt(sc, "baseline"),
+                candidate: s(sc, "candidate"),
+                diff: s(sc, "diff"),
+                schema: s(sc, "schema"),
+                policy_version: n(sc, "policy_version"),
+                files_changed: n(sc, "files_changed"),
+                lines_added: n(sc, "lines_added"),
+                lines_removed: n(sc, "lines_removed"),
+                schema_changed: b(sc, "schema_changed"),
+            };
+            assert!(scope.is_well_formed(), "{} is not well formed", v.name);
+            scope.bytes_to_sign(&v.nonce)
         }
-        .bytes_to_sign(&v.nonce),
-        "apply" => ApplyScope {
-            project: s(sc, "project"),
-            revision: s(sc, "revision"),
-            schema: s(sc, "schema"),
-            manifest: s(sc, "manifest"),
-            baseline_manifest: opt(sc, "baseline_manifest"),
-            baseline_status: match s(sc, "baseline_status").as_str() {
-                "none" => BaselineStatus::None,
-                "applied" => BaselineStatus::Applied,
-                "uncertain" => BaselineStatus::Uncertain,
-                other => panic!("unknown baseline_status {other}"),
-            },
-            plan: s(sc, "plan"),
-            destructive: b(sc, "destructive"),
-            counts: Counts {
-                create: n(&sc["counts"], "create"),
-                update: n(&sc["counts"], "update"),
-                replace: n(&sc["counts"], "replace"),
-                delete: n(&sc["counts"], "delete"),
-            },
-            addresses: s(sc, "addresses"),
+        "apply" => {
+            let scope = ApplyScope {
+                project: s(sc, "project"),
+                revision: s(sc, "revision"),
+                schema: s(sc, "schema"),
+                manifest: s(sc, "manifest"),
+                baseline_manifest: opt(sc, "baseline_manifest"),
+                baseline_status: match s(sc, "baseline_status").as_str() {
+                    "none" => BaselineStatus::None,
+                    "applied" => BaselineStatus::Applied,
+                    "uncertain" => BaselineStatus::Uncertain,
+                    other => panic!("unknown baseline_status {other}"),
+                },
+                plan: s(sc, "plan"),
+                destructive: b(sc, "destructive"),
+                counts: Counts {
+                    create: n(&sc["counts"], "create"),
+                    update: n(&sc["counts"], "update"),
+                    replace: n(&sc["counts"], "replace"),
+                    delete: n(&sc["counts"], "delete"),
+                },
+                addresses: s(sc, "addresses"),
+            };
+            assert!(scope.is_well_formed(), "{} is not well formed", v.name);
+            scope.bytes_to_sign(&v.nonce)
         }
-        .bytes_to_sign(&v.nonce),
         other => panic!("unknown kind {other}"),
     }
 }
@@ -146,17 +152,22 @@ fn recorded_address_digests_match_the_recorded_address_texts() {
     let first = address_text(&[
         (Action::Create, "aws_instance.web".into()),
         (Action::Update, "aws_security_group.web".into()),
-    ]);
+    ])
+    .unwrap();
     assert_eq!(first, d.address_texts["apply with baseline_status none"]);
     let second = address_text(&[
         (Action::Delete, "aws_instance.old".into()),
         (Action::Replace, "aws_db_instance.main".into()),
         (Action::Create, "aws_eip.web".into()),
-    ]);
+    ])
+    .unwrap();
     assert_eq!(second, d.address_texts["apply, uncertain and destructive"]);
+    let third = address_text(&[(Action::Update, "aws_instance.web".into())]).unwrap();
+    assert_eq!(third, d.address_texts["apply, applied baseline"]);
     for (text, name) in [
         (first, "apply with baseline_status none"),
         (second, "apply, uncertain and destructive"),
+        (third, "apply with an applied baseline"),
     ] {
         let hex: String = challenge_of(text.as_bytes())
             .iter()

@@ -3,7 +3,8 @@
   "derivation": "challenge = base64url(sha256(bytes_to_sign)), no padding. addresses = lowercase hex sha256 of the address text: one '<action> <address>\\n' line per change, in order.",
   "address_texts": {
     "apply with baseline_status none": "create aws_instance.web\nupdate aws_security_group.web\n",
-    "apply, uncertain and destructive": "delete aws_instance.old\nreplace aws_db_instance.main\ncreate aws_eip.web\n"
+    "apply, uncertain and destructive": "delete aws_instance.old\nreplace aws_db_instance.main\ncreate aws_eip.web\n",
+    "apply, applied baseline": "update aws_instance.web\n"
   },
   "vectors": [
     {
@@ -95,6 +96,31 @@
       "bytes_to_sign": "shoephone-apply-v1\nproject=infra/web\nrevision=5e3cf12147cca0b3d28c67be8bd1c482d2a84c03096cebbb57c83963cef60f46\nschema=f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8\nmanifest=898cf3c5ae4be331b75e97039b1f00229f3452a941bef60aa6b905fd9a81ead5\nbaseline_manifest=70f6cc49a8de8f9668eba173fd3144ca99732ed75587eac25df57edf35b3dd45\nbaseline_status=uncertain\nplan=f64e033e8e95b74ac794e7af80da30a0ff1bd2315a38993c4ece2220096e155b\ndestructive=1\ncreate=1\nupdate=0\nreplace=1\ndelete=1\naddresses=6f6dbf3dd3704c14e5a3fbc6057bf1bc3934847a639adf38917cf9f6b9d9a6de\nnonce=def456\n",
       "challenge_sha256_hex": "85d7d2800d54c2731a16fee8cf3ee554c6d38de8dfe3f1677babc50008204395",
       "challenge_base64url": "hdfSgA1UwnMaFv7ozz7lVMbTjejf4_Fne6vFAAggQ5U"
+    },
+    {
+      "name": "apply with an applied baseline",
+      "kind": "apply",
+      "scope": {
+        "project": "infra/web",
+        "revision": "815aa351ae1e139bfc60fb6730f72989f82ad59671a83785e87f042d83817d77",
+        "schema": "f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8",
+        "manifest": "d4f65f9553d726b6f63cf36b999aa8aeed00fc600f31cbcc2a6230b349ff78ac",
+        "baseline_manifest": "898cf3c5ae4be331b75e97039b1f00229f3452a941bef60aa6b905fd9a81ead5",
+        "baseline_status": "applied",
+        "plan": "086cd9081c8ca8d97cb1a2734bd40f6ca82ac49d29e41ac6bc604f09c9544750",
+        "destructive": false,
+        "counts": {
+          "create": 0,
+          "update": 1,
+          "replace": 0,
+          "delete": 0
+        },
+        "addresses": "4c69040113aa99f8ba0963ac89feef2356af97f4d2f36f11bb100804ad9d6e31"
+      },
+      "nonce": "0a1b2c",
+      "bytes_to_sign": "shoephone-apply-v1\nproject=infra/web\nrevision=815aa351ae1e139bfc60fb6730f72989f82ad59671a83785e87f042d83817d77\nschema=f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8\nmanifest=d4f65f9553d726b6f63cf36b999aa8aeed00fc600f31cbcc2a6230b349ff78ac\nbaseline_manifest=898cf3c5ae4be331b75e97039b1f00229f3452a941bef60aa6b905fd9a81ead5\nbaseline_status=applied\nplan=086cd9081c8ca8d97cb1a2734bd40f6ca82ac49d29e41ac6bc604f09c9544750\ndestructive=0\ncreate=0\nupdate=1\nreplace=0\ndelete=0\naddresses=4c69040113aa99f8ba0963ac89feef2356af97f4d2f36f11bb100804ad9d6e31\nnonce=0a1b2c\n",
+      "challenge_sha256_hex": "e209d834eb02a5e829dcf5a760ef56358cb0ffd1b082133bd91cd89b41d53f2b",
+      "challenge_base64url": "4gnYNOsCpegp3PWnYO9WNYyw_9GwghM72RzYm0HVPys"
     }
   ]
 }
