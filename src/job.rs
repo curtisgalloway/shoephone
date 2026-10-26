@@ -217,8 +217,85 @@ struct Entry {
     job: Job,
     /// When the scope was submitted, i.e. how old the plan is.
     plan_at: Option<SystemTime>,
+    plan_timeout: Duration,
     approval_ttl: Duration,
     max_plan_age: Duration,
+}
+
+/// Fail a `Queued` or `Working` job that outlived `plan_timeout`, dated to
+/// when it lapsed, with no strike. Returns whether it did.
+fn lapse_planning(
+    entry: &mut Entry,
+    events: &mut Vec<JobEvent>,
+    gate: &mut Gate,
+    now: SystemTime,
+) -> bool {
+    if !matches!(entry.job.state, JobState::Queued | JobState::Working { .. }) {
+        return false;
+    }
+    let lapsed = entry.job.created + entry.plan_timeout;
+    if lapsed > now {
+        return false;
+    }
+    entry.job.state = JobState::Done(JobResult::PlanFailed(Failure {
+        category: "plan_timeout".into(),
+        addresses: Vec::new(),
+        detail: None,
+    }));
+    events.push(JobEvent::Refused {
+        id: entry.job.id,
+        project: entry.job.project.clone(),
+        category: "plan_timeout".into(),
+        at: lapsed,
+    });
+    gate.release(Occupant::Job(entry.job.id));
+    true
+}
+
+/// Time out an `Approved` job nobody claimed within `max_plan_age` of its
+/// plan, dated to when it lapsed, with no strike. Returns whether it did.
+fn lapse_approved(entry: &mut Entry, events: &mut Vec<JobEvent>, now: SystemTime) -> bool {
+    if !matches!(entry.job.state, JobState::Approved { .. }) {
+        return false;
+    }
+    let lapsed = entry.plan_at.unwrap_or(entry.job.created) + entry.max_plan_age;
+    if lapsed > now {
+        return false;
+    }
+    entry.job.state = JobState::Done(JobResult::TimedOut);
+    events.push(JobEvent::TimedOut {
+        id: entry.job.id,
+        project: entry.job.project.clone(),
+        at: lapsed,
+    });
+    true
+}
+
+/// End a job as `Refused` without striking: the agent did not cause it.
+fn refuse_unstruck(entry: &mut Entry, events: &mut Vec<JobEvent>, now: SystemTime, category: &str) {
+    entry.job.state = JobState::Done(JobResult::Refused(Failure {
+        category: category.into(),
+        addresses: Vec::new(),
+        detail: None,
+    }));
+    events.push(JobEvent::Refused {
+        id: entry.job.id,
+        project: entry.job.project.clone(),
+        category: category.into(),
+        at: now,
+    });
+}
+
+/// [`refuse_unstruck`] for a job that still holds the slot.
+fn refuse_waiting(
+    entry: &mut Entry,
+    events: &mut Vec<JobEvent>,
+    gate: &mut Gate,
+    now: SystemTime,
+    category: &str,
+) {
+    refuse_unstruck(entry, events, now, category);
+    gate.release(Occupant::Job(entry.job.id));
 }
 
 /// Every job this instance has seen, and the rules for moving them along.
@@ -272,13 +349,6 @@ impl Jobs {
         self.projects.get(project).map(String::as_str)
     }
 
-    fn project_of_runner(&self, runner: &str) -> Option<&str> {
-        self.projects
-            .iter()
-            .find(|(_, r)| r.as_str() == runner)
-            .map(|(p, _)| p.as_str())
-    }
-
     /// File a job. Refuses an unknown project, an empty reason, and, in this
     /// order, a job already active, then the gate's busy, cooldown and cap.
     #[allow(clippy::too_many_arguments)]
@@ -329,32 +399,48 @@ impl Jobs {
         self.entries.push(Entry {
             job: job.clone(),
             plan_at: None,
+            plan_timeout: policy.plan_timeout,
             approval_ttl: policy.approval_ttl,
             max_plan_age: policy.max_plan_age,
         });
         Ok(job)
     }
 
-    /// The runner asks for work. A `Queued` job for its project moves to
-    /// `Working`; an `Approved` one is returned as it is, until claimed.
-    pub fn poll(&mut self, now: SystemTime, runner: &str) -> Option<Job> {
+    /// The runner asks for work, on any project it serves. A `Queued` job
+    /// moves to `Working`; an `Approved` one is returned as it is, until
+    /// claimed. A job past its limit is expired here instead of handed out.
+    pub fn poll(&mut self, now: SystemTime, gate: &mut Gate, runner: &str) -> Option<Job> {
         let now = self.clamp(now);
-        let project = self.project_of_runner(runner)?.to_owned();
-        let entry = self.entries.iter_mut().find(|e| {
-            e.job.project == project
-                && matches!(e.job.state, JobState::Queued | JobState::Approved { .. })
-        })?;
-        if entry.job.state == JobState::Queued {
-            entry.job.state = JobState::Working {
-                runner: runner.to_owned(),
-            };
-            self.events.push(JobEvent::Started {
-                id: entry.job.id,
-                project: project.clone(),
-                at: now,
-            });
+        for i in 0..self.entries.len() {
+            let entry = &mut self.entries[i];
+            if self.projects.get(&entry.job.project).map(String::as_str) != Some(runner) {
+                continue;
+            }
+            if lapse_planning(entry, &mut self.events, gate, now)
+                || lapse_approved(entry, &mut self.events, now)
+            {
+                continue;
+            }
+            match &entry.job.state {
+                JobState::Queued => {
+                    entry.job.state = JobState::Working {
+                        runner: runner.to_owned(),
+                    };
+                    self.events.push(JobEvent::Started {
+                        id: entry.job.id,
+                        project: entry.job.project.clone(),
+                        at: now,
+                    });
+                    return Some(entry.job.clone());
+                }
+                JobState::Approved { .. } => return Some(entry.job.clone()),
+                JobState::Working { .. }
+                | JobState::Waiting { .. }
+                | JobState::Claimed
+                | JobState::Done(_) => {}
+            }
         }
-        Some(entry.job.clone())
+        None
     }
 
     /// The runner hands in the scope it planned. Accepted once, from
@@ -363,6 +449,7 @@ impl Jobs {
     pub fn submit(
         &mut self,
         now: SystemTime,
+        gate: &mut Gate,
         runner: &str,
         id: u64,
         scope: JobScope,
@@ -371,6 +458,9 @@ impl Jobs {
         let now = self.clamp(now);
         let i = self.index(id).ok_or(Refusal::NoSuchRequest)?;
         let entry = &mut self.entries[i];
+        if lapse_planning(entry, &mut self.events, gate, now) {
+            return Err(Refusal::NoSuchRequest);
+        }
         match &entry.job.state {
             JobState::Working { runner: assigned } if assigned == runner => {}
             JobState::Working { .. } => return Err(Refusal::WrongRunner),
@@ -419,10 +509,13 @@ impl Jobs {
             | JobResult::OutcomeUnknown
             | JobResult::Declined
             | JobResult::TimedOut
-            | JobResult::Killed => return Err(Refusal::NoSuchRequest),
+            | JobResult::Killed => return Err(Refusal::ScopeMismatch),
         };
         let i = self.index(id).ok_or(Refusal::NoSuchRequest)?;
         let entry = &mut self.entries[i];
+        if lapse_planning(entry, &mut self.events, gate, now) {
+            return Err(Refusal::NoSuchRequest);
+        }
         match &entry.job.state {
             JobState::Working { runner: assigned } if assigned == runner => {}
             JobState::Working { .. } => return Err(Refusal::WrongRunner),
@@ -480,13 +573,17 @@ impl Jobs {
         }
         match scope {
             JobScope::Apply(_) => {
-                if *since + entry.max_plan_age < now {
+                if *since + entry.max_plan_age <= now {
+                    let entry = &mut self.entries[i];
+                    refuse_waiting(entry, &mut self.events, gate, now, "plan_too_old");
                     return Err(Refusal::PlanTooOld);
                 }
             }
             JobScope::Trust(t) => {
                 let current = self.trusted.get(&t.project).cloned().flatten();
                 if t.baseline != current {
+                    let entry = &mut self.entries[i];
+                    refuse_waiting(entry, &mut self.events, gate, now, "stale_baseline");
                     return Err(Refusal::StaleBaseline);
                 }
             }
@@ -532,16 +629,26 @@ impl Jobs {
     /// The runner takes the approval, once, and gets the scope that was
     /// signed.
     pub fn claim(&mut self, now: SystemTime, runner: &str, id: u64) -> Result<JobScope, Refusal> {
-        self.clamp(now);
+        let now = self.clamp(now);
         let i = self.index(id).ok_or(Refusal::NoSuchRequest)?;
         let assigned = self.runner_of(&self.entries[i].job.project);
         if assigned != Some(runner) {
             return Err(Refusal::WrongRunner);
         }
         let entry = &mut self.entries[i];
+        if lapse_approved(entry, &mut self.events, now) {
+            return Err(Refusal::PlanTooOld);
+        }
         match &entry.job.state {
             JobState::Approved { scope } => {
                 let scope = scope.clone();
+                if let JobScope::Trust(t) = &scope {
+                    let current = self.trusted.get(&t.project).cloned().flatten();
+                    if t.baseline != current {
+                        refuse_unstruck(entry, &mut self.events, now, "stale_baseline");
+                        return Err(Refusal::StaleBaseline);
+                    }
+                }
                 entry.job.state = JobState::Claimed;
                 Ok(scope)
             }
@@ -555,11 +662,13 @@ impl Jobs {
 
     /// The runner reports how a claimed job ended. A result for an id this
     /// instance does not know (the daemon restarted mid-apply) is accepted
-    /// only as `OutcomeUnknown`, and recorded as a bare event.
+    /// only as `OutcomeUnknown`, and recorded as a bare event for `project`, which the runner
+    /// must serve.
     pub fn finish(
         &mut self,
         now: SystemTime,
         runner: &str,
+        project: &str,
         id: u64,
         result: JobResult,
     ) -> Result<(), Refusal> {
@@ -568,10 +677,10 @@ impl Jobs {
             if result != JobResult::OutcomeUnknown {
                 return Err(Refusal::NoSuchRequest);
             }
-            let project = self
-                .project_of_runner(runner)
-                .ok_or(Refusal::WrongRunner)?
-                .to_owned();
+            if self.runner_of(project) != Some(runner) {
+                return Err(Refusal::WrongRunner);
+            }
+            let project = project.to_owned();
             self.events.push(JobEvent::OutcomeUnknown {
                 id,
                 project,
@@ -670,52 +779,26 @@ impl Jobs {
     pub fn tick(&mut self, now: SystemTime, gate: &mut Gate, policy: &Policy) {
         let now = self.clamp(now);
         for entry in &mut self.entries {
-            let id = entry.job.id;
-            let (lapsed, strike) = match &entry.job.state {
-                JobState::Queued | JobState::Working { .. } => {
-                    (entry.job.created + policy.plan_timeout, false)
-                }
-                JobState::Waiting { since, .. } => (*since + entry.approval_ttl, true),
-                JobState::Approved { .. } => (
-                    entry.plan_at.unwrap_or(entry.job.created) + entry.max_plan_age,
-                    false,
-                ),
-                JobState::Claimed | JobState::Done(_) => continue,
+            if lapse_planning(entry, &mut self.events, gate, now)
+                || lapse_approved(entry, &mut self.events, now)
+            {
+                continue;
+            }
+            let JobState::Waiting { since, .. } = &entry.job.state else {
+                continue;
             };
+            let lapsed = *since + entry.approval_ttl;
             if lapsed > now {
                 continue;
             }
-            let project = entry.job.project.clone();
-            match &entry.job.state {
-                JobState::Queued | JobState::Working { .. } => {
-                    let failure = Failure {
-                        category: "plan_timeout".into(),
-                        addresses: Vec::new(),
-                        detail: None,
-                    };
-                    entry.job.state = JobState::Done(JobResult::PlanFailed(failure));
-                    self.events.push(JobEvent::Refused {
-                        id,
-                        project,
-                        category: "plan_timeout".into(),
-                        at: lapsed,
-                    });
-                    gate.release(Occupant::Job(id));
-                }
-                JobState::Waiting { .. } | JobState::Approved { .. } => {
-                    entry.job.state = JobState::Done(JobResult::TimedOut);
-                    self.events.push(JobEvent::TimedOut {
-                        id,
-                        project,
-                        at: lapsed,
-                    });
-                    gate.release(Occupant::Job(id));
-                }
-                JobState::Claimed | JobState::Done(_) => {}
-            }
-            if strike {
-                gate.strike_at(lapsed, policy);
-            }
+            entry.job.state = JobState::Done(JobResult::TimedOut);
+            self.events.push(JobEvent::TimedOut {
+                id: entry.job.id,
+                project: entry.job.project.clone(),
+                at: lapsed,
+            });
+            gate.release(Occupant::Job(entry.job.id));
+            gate.strike_at(lapsed, policy);
         }
     }
 
@@ -844,8 +927,14 @@ mod tests {
         }
 
         fn submit(&mut self, now: SystemTime, id: u64, scope: JobScope) -> Result<(), Refusal> {
-            self.jobs
-                .submit(now, "runner-a", id, scope, &mut self.entropy)
+            self.jobs.submit(
+                now,
+                &mut self.gate,
+                "runner-a",
+                id,
+                scope,
+                &mut self.entropy,
+            )
         }
 
         fn nonce(&mut self, id: u64) -> String {
@@ -858,7 +947,7 @@ mod tests {
         /// Request, poll and submit; leaves the job Waiting.
         fn waiting(&mut self, id: u64, kind: JobKind, scope: JobScope) -> String {
             self.request(t(0), id, kind).unwrap();
-            self.jobs.poll(t(1), "runner-a").unwrap();
+            self.jobs.poll(t(1), &mut self.gate, "runner-a").unwrap();
             self.submit(t(2), id, scope).unwrap();
             self.nonce(id)
         }
@@ -937,17 +1026,20 @@ mod tests {
         let mut r = Rig::new();
         r.request(t(0), 1, trust_kind()).unwrap();
         r.jobs.take_events();
-        assert!(r.jobs.poll(t(1), "runner-b").is_none());
-        assert!(r.jobs.poll(t(1), "stranger").is_none());
+        assert!(r.jobs.poll(t(1), &mut r.gate, "runner-b").is_none());
+        assert!(r.jobs.poll(t(1), &mut r.gate, "stranger").is_none());
         assert_eq!(r.state(1), JobState::Queued);
-        let job = r.jobs.poll(t(2), "runner-a").unwrap();
+        let job = r.jobs.poll(t(2), &mut r.gate, "runner-a").unwrap();
         assert_eq!(
             job.state,
             JobState::Working {
                 runner: "runner-a".into()
             }
         );
-        assert!(r.jobs.poll(t(3), "runner-a").is_none(), "taken once");
+        assert!(
+            r.jobs.poll(t(3), &mut r.gate, "runner-a").is_none(),
+            "taken once"
+        );
         assert_eq!(
             r.jobs.take_events(),
             vec![JobEvent::Started {
@@ -957,8 +1049,14 @@ mod tests {
             }]
         );
         assert_eq!(
-            r.jobs
-                .submit(t(3), "runner-b", 1, trust_scope(), &mut r.entropy),
+            r.jobs.submit(
+                t(3),
+                &mut r.gate,
+                "runner-b",
+                1,
+                trust_scope(),
+                &mut r.entropy
+            ),
             Err(Refusal::WrongRunner)
         );
     }
@@ -972,7 +1070,7 @@ mod tests {
             Err(Refusal::NoSuchRequest),
             "not yet polled"
         );
-        r.jobs.poll(t(1), "runner-a").unwrap();
+        r.jobs.poll(t(1), &mut r.gate, "runner-a").unwrap();
         r.jobs.take_events();
         r.submit(t(2), 1, trust_scope()).unwrap();
         let nonce = r.nonce(1);
@@ -1000,7 +1098,7 @@ mod tests {
     fn malformed_or_mismatched_scope_is_refused_at_submit() {
         let mut r = Rig::new();
         r.request(t(0), 1, trust_kind()).unwrap();
-        r.jobs.poll(t(1), "runner-a").unwrap();
+        r.jobs.poll(t(1), &mut r.gate, "runner-a").unwrap();
         let JobScope::Trust(mut bad) = trust_scope() else {
             unreachable!()
         };
@@ -1100,7 +1198,7 @@ mod tests {
         let nonce = r.waiting(1, trust_kind(), trust_scope());
         r.approve(t(3), 1, &nonce, &trust_scope()).unwrap();
         assert_eq!(r.jobs.claim(t(4), "runner-b", 1), Err(Refusal::WrongRunner));
-        let again = r.jobs.poll(t(4), "runner-a").unwrap();
+        let again = r.jobs.poll(t(4), &mut r.gate, "runner-a").unwrap();
         assert!(matches!(again.state, JobState::Approved { .. }));
         assert_eq!(r.jobs.claim(t(5), "runner-a", 1), Ok(trust_scope()));
         assert_eq!(r.state(1), JobState::Claimed);
@@ -1108,7 +1206,7 @@ mod tests {
             r.jobs.claim(t(6), "runner-a", 1),
             Err(Refusal::AlreadyClaimed)
         );
-        assert!(r.jobs.poll(t(7), "runner-a").is_none());
+        assert!(r.jobs.poll(t(7), &mut r.gate, "runner-a").is_none());
     }
 
     #[test]
@@ -1161,7 +1259,7 @@ mod tests {
         assert!(r.jobs.take_events().is_empty());
         assert_eq!(r.request(t(6), 2, trust_kind()), Err(Refusal::Busy));
         r.jobs
-            .finish(t(7), "runner-a", 1, JobResult::Applied)
+            .finish(t(7), "runner-a", "web", 1, JobResult::Applied)
             .unwrap();
         assert_eq!(r.state(1), JobState::Done(JobResult::Applied));
         assert_eq!(
@@ -1179,7 +1277,7 @@ mod tests {
     fn late_submit_after_kill_is_refused() {
         let mut r = Rig::new();
         r.request(t(0), 1, trust_kind()).unwrap();
-        r.jobs.poll(t(1), "runner-a").unwrap();
+        r.jobs.poll(t(1), &mut r.gate, "runner-a").unwrap();
         r.jobs.kill(t(2), &mut r.gate, &r.policy, "web").unwrap();
         assert_eq!(r.gate.strikes, 0, "nobody was asked yet");
         assert_eq!(r.gate.busy(), None);
@@ -1212,7 +1310,7 @@ mod tests {
     fn refuse_ends_the_job_without_strike() {
         let mut r = Rig::new();
         r.request(t(0), 1, trust_kind()).unwrap();
-        r.jobs.poll(t(1), "runner-a").unwrap();
+        r.jobs.poll(t(1), &mut r.gate, "runner-a").unwrap();
         r.jobs.take_events();
         r.jobs
             .refuse(
@@ -1240,7 +1338,7 @@ mod tests {
     fn planning_timeout_is_plan_failed_without_strike() {
         let mut r = Rig::new();
         r.request(t(0), 1, trust_kind()).unwrap();
-        r.jobs.poll(t(1), "runner-a").unwrap();
+        r.jobs.poll(t(1), &mut r.gate, "runner-a").unwrap();
         r.jobs.take_events();
         r.tick(t(9 * 60));
         assert!(matches!(r.state(1), JobState::Working { .. }));
@@ -1346,7 +1444,12 @@ mod tests {
             r.approve(t(2) + 16 * MIN, 1, &nonce, &apply_scope()),
             Err(Refusal::PlanTooOld)
         );
-        assert!(matches!(r.state(1), JobState::Waiting { .. }));
+        assert_eq!(
+            r.state(1),
+            JobState::Done(JobResult::Refused(failure("plan_too_old")))
+        );
+        assert_eq!(r.gate.busy(), None);
+        assert_eq!(r.gate.strikes, 0);
         let mut r = Rig::new();
         r.policy.approval_ttl = 30 * MIN;
         let nonce = r.waiting(1, apply_kind(), apply_scope());
@@ -1370,7 +1473,7 @@ mod tests {
     fn finish_unknown_id_with_outcome_unknown_is_recorded() {
         let mut r = Rig::new();
         r.jobs
-            .finish(t(1), "runner-a", 99, JobResult::OutcomeUnknown)
+            .finish(t(1), "runner-a", "web", 99, JobResult::OutcomeUnknown)
             .unwrap();
         assert_eq!(
             r.jobs.take_events(),
@@ -1382,12 +1485,13 @@ mod tests {
         );
         assert!(r.jobs.job(t(1), 99).is_none());
         assert_eq!(
-            r.jobs.finish(t(2), "runner-a", 99, JobResult::Applied),
+            r.jobs
+                .finish(t(2), "runner-a", "web", 99, JobResult::Applied),
             Err(Refusal::NoSuchRequest)
         );
         assert_eq!(
             r.jobs
-                .finish(t(2), "stranger", 99, JobResult::OutcomeUnknown),
+                .finish(t(2), "stranger", "web", 99, JobResult::OutcomeUnknown),
             Err(Refusal::WrongRunner)
         );
     }
@@ -1414,25 +1518,183 @@ mod tests {
         let mut r = Rig::new();
         r.jobs.set_trusted("web", Some("9".repeat(64)));
         let nonce = r.waiting(1, trust_kind(), trust_scope());
+        r.jobs.take_events();
         assert_eq!(
             r.approve(t(3), 1, &nonce, &trust_scope()),
             Err(Refusal::StaleBaseline)
         );
-        assert!(matches!(r.state(1), JobState::Waiting { .. }));
+        assert_eq!(
+            r.state(1),
+            JobState::Done(JobResult::Refused(failure("stale_baseline")))
+        );
+        assert_eq!(r.gate.busy(), None);
+        assert_eq!(r.gate.strikes, 0);
+        assert_eq!(
+            r.jobs.take_events(),
+            vec![JobEvent::Refused {
+                id: 1,
+                project: "web".into(),
+                category: "stale_baseline".into(),
+                at: t(3),
+            }]
+        );
         r.jobs.set_trusted("web", None);
-        assert!(r.approve(t(3), 1, &nonce, &trust_scope()).is_ok());
+        let nonce = r.waiting(2, trust_kind(), trust_scope());
+        assert!(r.approve(t(3), 2, &nonce, &trust_scope()).is_ok());
+    }
+
+    #[test]
+    fn trust_claim_after_baseline_change_is_refused() {
+        let mut r = Rig::new();
+        let nonce = r.waiting(1, trust_kind(), trust_scope());
+        r.approve(t(3), 1, &nonce, &trust_scope()).unwrap();
+        r.jobs.set_trusted("web", Some("9".repeat(64)));
+        r.jobs.take_events();
+        assert_eq!(
+            r.jobs.claim(t(4), "runner-a", 1),
+            Err(Refusal::StaleBaseline)
+        );
+        assert_eq!(
+            r.state(1),
+            JobState::Done(JobResult::Refused(failure("stale_baseline")))
+        );
+        assert_eq!(r.gate.strikes, 0);
+        assert_eq!(
+            r.jobs.claim(t(5), "runner-a", 1),
+            Err(Refusal::NoSuchRequest)
+        );
+        assert_eq!(r.jobs.take_events().len(), 1);
+    }
+
+    #[test]
+    fn claim_after_max_plan_age_without_tick_is_refused() {
+        let mut r = Rig::new();
+        let nonce = r.waiting(1, apply_kind(), apply_scope());
+        r.approve(t(3), 1, &nonce, &apply_scope()).unwrap();
+        r.jobs.take_events();
+        assert_eq!(
+            r.jobs.claim(t(2) + 16 * MIN, "runner-a", 1),
+            Err(Refusal::PlanTooOld)
+        );
+        assert_eq!(r.state(1), JobState::Done(JobResult::TimedOut));
+        assert_eq!(r.gate.strikes, 0);
+        assert_eq!(
+            r.jobs.take_events(),
+            vec![JobEvent::TimedOut {
+                id: 1,
+                project: "web".into(),
+                at: t(2) + 15 * MIN,
+            }]
+        );
+        let mut r = Rig::new();
+        let nonce = r.waiting(1, apply_kind(), apply_scope());
+        r.approve(t(3), 1, &nonce, &apply_scope()).unwrap();
+        assert!(
+            r.jobs
+                .poll(t(2) + 16 * MIN, &mut r.gate, "runner-a")
+                .is_none()
+        );
+        assert_eq!(r.state(1), JobState::Done(JobResult::TimedOut));
+    }
+
+    #[test]
+    fn submit_after_plan_timeout_without_tick_is_refused() {
+        let mut r = Rig::new();
+        r.request(t(0), 1, trust_kind()).unwrap();
+        r.jobs.poll(t(1), &mut r.gate, "runner-a").unwrap();
+        r.jobs.take_events();
+        assert_eq!(
+            r.submit(t(11 * 60), 1, trust_scope()),
+            Err(Refusal::NoSuchRequest)
+        );
+        assert_eq!(
+            r.state(1),
+            JobState::Done(JobResult::PlanFailed(failure("plan_timeout")))
+        );
+        assert_eq!(r.gate.busy(), None);
+        assert_eq!(r.gate.strikes, 0);
+        assert_eq!(r.jobs.take_events().len(), 1);
+
+        let mut r = Rig::new();
+        r.request(t(0), 1, trust_kind()).unwrap();
+        assert!(r.jobs.poll(t(11 * 60), &mut r.gate, "runner-a").is_none());
+        assert_eq!(r.gate.busy(), None);
+        assert!(matches!(
+            r.state(1),
+            JobState::Done(JobResult::PlanFailed(_))
+        ));
+    }
+
+    #[test]
+    fn one_runner_serves_two_projects() {
+        let mut projects = BTreeMap::new();
+        projects.insert("web".to_owned(), "shared".to_owned());
+        projects.insert("db".to_owned(), "shared".to_owned());
+        let mut r = Rig::new();
+        r.jobs = Jobs::new(projects);
+        r.jobs
+            .request(
+                t(0),
+                &mut r.gate,
+                &r.policy,
+                &mut r.entropy,
+                1,
+                "web",
+                trust_kind(),
+                "why",
+            )
+            .unwrap();
+        r.jobs.kill(t(1), &mut r.gate, &r.policy, "web").unwrap();
+        r.jobs
+            .request(
+                t(2),
+                &mut r.gate,
+                &r.policy,
+                &mut r.entropy,
+                2,
+                "db",
+                trust_kind(),
+                "why",
+            )
+            .unwrap();
+        assert_eq!(
+            r.jobs.poll(t(3), &mut r.gate, "shared").map(|j| j.id),
+            Some(2)
+        );
+        r.jobs
+            .finish(t(4), "shared", "web", 99, JobResult::OutcomeUnknown)
+            .unwrap();
+        r.jobs
+            .finish(t(4), "shared", "db", 98, JobResult::OutcomeUnknown)
+            .unwrap();
+        assert_eq!(
+            r.jobs
+                .finish(t(4), "shared", "other", 97, JobResult::OutcomeUnknown),
+            Err(Refusal::WrongRunner)
+        );
+    }
+
+    #[test]
+    fn refuse_with_a_non_refusal_result_is_scope_mismatch() {
+        let mut r = Rig::new();
+        r.request(t(0), 1, trust_kind()).unwrap();
+        r.jobs.poll(t(1), &mut r.gate, "runner-a").unwrap();
+        assert_eq!(
+            r.jobs
+                .refuse(t(2), &mut r.gate, "runner-a", 1, JobResult::Applied),
+            Err(Refusal::ScopeMismatch)
+        );
     }
 
     #[test]
     fn clock_stepping_backward_does_not_revive_a_job() {
         let mut r = Rig::new();
-        r.waiting(1, trust_kind(), trust_scope());
-        r.tick(t(2) + 6 * MIN);
-        assert_eq!(r.state(1), JobState::Done(JobResult::TimedOut));
-        let nonce = "0".repeat(64);
+        let nonce = r.waiting(1, trust_kind(), trust_scope());
+        assert!(r.jobs.job(t(2) + 6 * MIN, 1).is_some());
         assert_eq!(
             r.approve(t(3), 1, &nonce, &trust_scope()),
-            Err(Refusal::NoSuchRequest)
+            Err(Refusal::NoSuchRequest),
+            "t(3) is clamped to the late high-water mark, past the window"
         );
     }
 }
