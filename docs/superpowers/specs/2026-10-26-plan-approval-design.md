@@ -171,7 +171,11 @@ in through `.terraform.lock.hcl`.
 
 The runner's egress firewall allows only the endpoints in the project's
 config (hypervisor API, DNS API, secrets store, state database) and the
-daemon. Even a check that misses something then has nowhere to send it.
+daemon. Some providers also need SSH to the hypervisor (the bpg/proxmox
+provider uploads snippets that way), so an endpoint entry may be SSH as well
+as HTTPS. There are no pre-plan hooks: anything a project's own preflight
+script checks either surfaces as a plan or apply error or stays a human
+step. Even a check that misses something then has nowhere to send it.
 
 **(builder's call)** The check parses HCL with a real parser (the `hcl-edit`
 or `hcl-rs` crate), not with regular expressions, and walks every
@@ -199,6 +203,22 @@ values for sibling attributes, for example "a VM's cloud-init user data", or
 "`onepassword_item.password`, only when `vault` is the privileged store's
 id". The same rule covers outputs: a sensitive output is refused unless
 listed.
+
+**Each destination also names the sources allowed into it (operator,
+2026-10-26).** Terraform's tag says a value is secret, not which secret, and
+some legitimate destinations are ones the agent can read later: a
+lower-privilege store vault that VMs read at runtime, or the cloud-init of a
+VM the agent can get admin on. A binary rule would let the hypervisor's
+credential into those as easily as a freshly generated password. So an entry
+reads, for example, "`onepassword_item.password` in the runtime vault, from
+`random_password.*` only", or "the VM's cloud-init user data, from
+`tls_private_key.host_key`, `random_password.*` and
+`data.onepassword_item.connect_access_token`". The runner resolves each
+destination attribute's expression statically, through locals, variables,
+module inputs, `for_each` and conditionals, to the set of sensitive sources
+it references, and refuses the plan if any is not on that entry's list. A
+reference it cannot resolve statically counts as a refusal. Terraform's own
+tag check above stays as the backstop for anything this misses.
 
 Two limits the builder must handle:
 
