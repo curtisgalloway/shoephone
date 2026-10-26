@@ -17,6 +17,7 @@ pub mod config;
 pub mod exit;
 pub mod gate;
 pub mod grant;
+pub mod job;
 pub mod notify;
 pub mod scope;
 pub mod server;

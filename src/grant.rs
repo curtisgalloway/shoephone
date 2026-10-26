@@ -62,6 +62,14 @@ pub struct Policy {
     pub base_cooldown: Duration,
     /// Where the doubling stops.
     pub max_cooldown: Duration,
+    /// How long a Terraform job may sit queued or planning before it fails.
+    pub plan_timeout: Duration,
+    /// How long a job's scope waits on the approver, counted from the moment
+    /// the runner submitted it.
+    pub approval_ttl: Duration,
+    /// The oldest a plan may be when it is approved or claimed. Older plans
+    /// are refused or expire, so an apply never runs a stale plan.
+    pub max_plan_age: Duration,
 }
 
 impl Default for Policy {
@@ -74,6 +82,9 @@ impl Default for Policy {
             max_requests_per_hour: 6,
             base_cooldown: Duration::from_secs(5 * 60),
             max_cooldown: Duration::from_secs(60 * 60),
+            plan_timeout: Duration::from_secs(10 * 60),
+            approval_ttl: Duration::from_secs(5 * 60),
+            max_plan_age: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -231,6 +242,22 @@ pub enum Refusal {
     NoWindow,
     /// A window is open for that host, but for a different key.
     KeyMismatch,
+    /// No Terraform project of that name is configured.
+    UnknownProject,
+    /// The job's scope was already submitted and cannot change.
+    ScopeFrozen,
+    /// The approved job was already claimed.
+    AlreadyClaimed,
+    /// The caller is not the runner assigned to that project.
+    WrongRunner,
+    /// The job's context moved on since it was planned.
+    Stale,
+    /// The trust baseline in the scope is not the currently trusted one.
+    StaleBaseline,
+    /// The plan is older than the daemon allows for an apply.
+    PlanTooOld,
+    /// The scope carries a field that cannot be signed unambiguously.
+    MalformedScope,
 }
 
 impl fmt::Display for Refusal {
@@ -251,6 +278,16 @@ impl fmt::Display for Refusal {
             Refusal::ScopeMismatch => write!(f, "signature does not cover the enforced scope"),
             Refusal::NoWindow => write!(f, "no approved window for that host"),
             Refusal::KeyMismatch => write!(f, "window was approved for a different key"),
+            Refusal::UnknownProject => write!(f, "no Terraform project with that name"),
+            Refusal::ScopeFrozen => write!(f, "the scope was already submitted"),
+            Refusal::AlreadyClaimed => write!(f, "the approval was already claimed"),
+            Refusal::WrongRunner => write!(f, "not the runner assigned to that project"),
+            Refusal::Stale => write!(f, "the job's context changed since it was planned"),
+            Refusal::StaleBaseline => {
+                write!(f, "the trusted baseline moved since the scope was built")
+            }
+            Refusal::PlanTooOld => write!(f, "the plan is too old to approve"),
+            Refusal::MalformedScope => write!(f, "the scope has a field that cannot be signed"),
         }
     }
 }
@@ -677,7 +714,7 @@ fn unix(t: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn hex_nonce(entropy: &mut dyn Entropy) -> String {
+pub(crate) fn hex_nonce(entropy: &mut dyn Entropy) -> String {
     let mut buf = [0u8; 32];
     entropy.fill(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
@@ -685,7 +722,7 @@ fn hex_nonce(entropy: &mut dyn Entropy) -> String {
 
 /// Eight characters from an alphabet without look-alikes, as `XXXX-XXXX`.
 /// The alphabet has 32 symbols so one masked byte maps uniformly.
-fn match_code(entropy: &mut dyn Entropy) -> String {
+pub(crate) fn match_code(entropy: &mut dyn Entropy) -> String {
     const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut buf = [0u8; 8];
     entropy.fill(&mut buf);
@@ -699,11 +736,11 @@ fn match_code(entropy: &mut dyn Entropy) -> String {
     code
 }
 
-fn printable(s: &str, max: usize) -> String {
+pub(crate) fn printable(s: &str, max: usize) -> String {
     s.chars().filter(|c| !c.is_control()).take(max).collect()
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

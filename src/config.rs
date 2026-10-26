@@ -103,6 +103,9 @@ pub struct PolicyConfig {
     pub max_requests_per_hour: Option<usize>,
     pub base_cooldown_minutes: Option<u64>,
     pub max_cooldown_minutes: Option<u64>,
+    pub plan_timeout_minutes: Option<u64>,
+    pub approval_ttl_minutes: Option<u64>,
+    pub max_plan_age_minutes: Option<u64>,
 }
 
 fn default_listen() -> String {
@@ -189,6 +192,9 @@ impl Config {
             max_requests_per_hour: p.max_requests_per_hour.unwrap_or(d.max_requests_per_hour),
             base_cooldown: mins(p.base_cooldown_minutes, d.base_cooldown),
             max_cooldown: mins(p.max_cooldown_minutes, d.max_cooldown),
+            plan_timeout: mins(p.plan_timeout_minutes, d.plan_timeout),
+            approval_ttl: mins(p.approval_ttl_minutes, d.approval_ttl),
+            max_plan_age: mins(p.max_plan_age_minutes, d.max_plan_age),
         }
     }
 }

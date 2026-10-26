@@ -150,6 +150,14 @@ impl From<Refusal> for Fail {
             Refusal::ScopeMismatch => (S::FORBIDDEN, "scope_mismatch", None),
             Refusal::NoWindow => (S::NOT_FOUND, "no_window", None),
             Refusal::KeyMismatch => (S::FORBIDDEN, "key_mismatch", None),
+            Refusal::UnknownProject => (S::NOT_FOUND, "unknown_project", None),
+            Refusal::ScopeFrozen => (S::CONFLICT, "scope_frozen", None),
+            Refusal::AlreadyClaimed => (S::CONFLICT, "already_claimed", None),
+            Refusal::WrongRunner => (S::FORBIDDEN, "wrong_runner", None),
+            Refusal::Stale => (S::CONFLICT, "stale", None),
+            Refusal::StaleBaseline => (S::CONFLICT, "stale_baseline", None),
+            Refusal::PlanTooOld => (S::CONFLICT, "plan_too_old", None),
+            Refusal::MalformedScope => (S::BAD_REQUEST, "malformed_scope", None),
         };
         Fail(
             status,
