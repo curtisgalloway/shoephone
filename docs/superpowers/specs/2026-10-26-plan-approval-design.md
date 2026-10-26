@@ -98,7 +98,7 @@ the operator has reviewed it.
 | Errors the agent sees | **(operator)** Runner-defined categories, resource addresses from the trusted code, and messages the runner explicitly vetted. Never Terraform's or a provider's own text: even its one-line summary can carry a raw API error. |
 | Full errors | **(operator)** Stay on the runner. The operator reads them over their own SSH session. They never pass through the daemon. |
 | Secret-install action | **(operator)** Deferred until after v1. |
-| Where Terraform runs | **(operator)** A dedicated runner with no agent account and no inbound ports. Root on it means every credential it holds. |
+| Where Terraform runs | **(operator)** A dedicated runner with no agent account. Root on it means every credential it holds. **(builder's call)** Its only inbound service is SSH for the operator: the operator's own key, not trusted from shoephone's user CA, and a firewall that admits only the operator's machines. The runner reaches the daemon by polling it. |
 | Runner credentials | **(operator)** Its own secrets-store identity, which can read the privileged store. The token is readable by root only. The agent's identity never gains that store. |
 | Approvals per apply | **(operator)** One. Planning starts as soon as the agent asks; plan start is recorded and pushed silently. |
 | Delete and replace | **(builder's call)** Refused unless the request asks for them. When the runner's plan contains either, the phone shows a distinct, warning-style approval. The runner decides the classification from the plan and binds it into the scope. |
@@ -144,9 +144,13 @@ matched against a secret; `count` or a condition that compares a secret with
 an agent-settable value; an agent-settable VM or disk id that could select
 the runner itself.
 
+Non-local module sources are refused outright in v1, not flagged: Terraform
+would download them at execution time, outside the reviewed digest. A later
+version could instead vendor their exact contents into the execution input.
+
 The review worker flags constructs that make the obligation hard to meet:
 provisioners, `external` and `http` data sources, `import` blocks,
-`nonsensitive()`, provider-defined functions, non-local modules, symlinks,
+`nonsensitive()`, provider-defined functions, symlinks,
 and any schema variable that reaches a secrets-store selector, a file path,
 `count`, `for_each` or a condition. These are warnings for the reviewer, not
 a boundary. **(builder's call)**
@@ -166,10 +170,12 @@ shoephone apply <project> --manifest FILE --reason "..." [--allow-destroy]
    collections. Each agent-settable variable must be given, unless the
    schema states its default. Constraints favor choosing from an
    operator-owned map (an image name, a size class) over free strings. The
-   manifest becomes the only source of variable values. The runner ignores
-   `*.auto.tfvars` and `terraform.tfvars` in the checkout, and it clears
-   `TF_VAR_*` from the environment, except for values it supplies itself
-   from the project's config.
+   manifest becomes the only source of agent-settable values. The runner
+   refuses a checkout containing `terraform.tfvars`, `terraform.tfvars.json`,
+   `*.auto.tfvars` or `*.auto.tfvars.json`, and it clears `TF_VAR_*` from the
+   environment, except for values it supplies itself from the project's
+   config. The schema's variables and the runner-supplied variables must not
+   overlap. Both the trust review and each apply check this.
 3. **Plan.** The daemon records `plan started`, with a silent push. The
    worker runs `terraform plan -out` at the trusted revision with the
    manifest, then runs `terraform show -json` and builds the summary: the
@@ -180,11 +186,15 @@ shoephone apply <project> --manifest FILE --reason "..." [--allow-destroy]
    or unknown-outcome apply, the summary says the baseline is uncertain
    instead of showing a clean diff.
 4. **Approve.** The daemon pushes `apply waiting`. The scope is: project,
-   trusted revision digest, schema digest, manifest digest, plan digest, the
-   destructive classification, the counts and the address list. The
-   signature covers the scope and a nonce, through the existing server-side
-   ceremony snapshot. The screen shows the variable diff first, then deletes
-   and replaces.
+   trusted revision digest, schema digest, manifest digest, **baseline
+   manifest digest and baseline status** (`applied` or `uncertain`), plan
+   digest, the destructive classification, the counts and the address
+   list. The signature covers the scope and a nonce, through the existing
+   server-side ceremony snapshot. The approver clients receive both
+   manifests, check each against its signed digest, and compute the
+   variable diff themselves. That way the diff on screen follows from
+   signed fields and is not a separate claim. The screen shows that diff
+   first, then deletes and replaces.
 5. **Apply.** The runner claims the approval once (atomically, with a durable
    record written before Terraform starts), re-hashes the saved plan, and
    applies it.
@@ -356,4 +366,9 @@ amendment to the vault-split design that records the new identity.
   permitted data-source address can be pointed at any item. The review also
   supplied the protocol rules above and the "more than display changes"
   correction. The operator then chose trusted code with data-only applies,
-  full errors kept on the runner, and deferral of the secret action.
+  full errors kept on the runner, and deferral of the secret action. On the
+  confirm round Codex objected to one blocking gap: the displayed variable
+  diff was not bound into the signed scope. It is now derived by the clients
+  from both signed manifest digests. Three builder-level items were also
+  fixed: non-local modules refused, the `.json` tfvars variants refused, and
+  operator SSH ingress specified.
