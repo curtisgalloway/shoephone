@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
+use ssh_key::{Algorithm, PublicKey};
 
 use crate::grant::Policy;
 use crate::notify::{ApnsConfig, NotifyConfig};
@@ -64,6 +65,29 @@ pub struct Config {
     /// on disk like everything else here.
     #[serde(default)]
     pub access: Option<AccessConfig>,
+    /// Terraform runners that may poll the daemon, by name. Each request a
+    /// runner makes is signed with the key listed here.
+    #[serde(default)]
+    pub runners: BTreeMap<String, RunnerConfig>,
+    /// Terraform projects, each served by exactly one configured runner.
+    #[serde(default)]
+    pub projects: BTreeMap<String, ProjectConfig>,
+}
+
+/// One runner's identity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerConfig {
+    /// `ssh-ed25519 AAAA...`, the public half of the runner's signing key.
+    pub public_key: String,
+}
+
+/// One Terraform project.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectConfig {
+    /// Name of an entry in `[runners]`.
+    pub runner: String,
 }
 
 /// The two headers Cloudflare Access expects from a service token:
@@ -171,11 +195,40 @@ impl Config {
                 "[access] needs exactly one of client_secret and client_secret_file".into(),
             );
         }
+        for (name, project) in &self.projects {
+            if !self.runners.contains_key(&project.runner) {
+                return Err(format!(
+                    "project {name:?} names unknown runner {:?}",
+                    project.runner
+                ));
+            }
+        }
+        self.runner_keys()?;
         let policy = self.policy();
         if policy.cert_ttl > policy.max_window || policy.default_window > policy.max_window {
             return Err("policy: cert_ttl and default_window must not exceed max_window".into());
         }
         Ok(())
+    }
+
+    /// The runners' public keys, parsed. Each must be an ed25519 key and
+    /// each runner name must be non-empty without whitespace.
+    pub fn runner_keys(&self) -> Result<BTreeMap<String, PublicKey>, String> {
+        let mut keys = BTreeMap::new();
+        for (name, runner) in &self.runners {
+            if name.is_empty() || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(format!(
+                    "runner name {name:?} contains whitespace or is empty"
+                ));
+            }
+            let key = PublicKey::from_openssh(runner.public_key.trim())
+                .map_err(|e| format!("runner {name:?} public_key: {e}"))?;
+            if key.algorithm() != Algorithm::Ed25519 {
+                return Err(format!("runner {name:?} public_key must be ssh-ed25519"));
+            }
+            keys.insert(name.clone(), key);
+        }
+        Ok(keys)
     }
 
     pub fn policy(&self) -> Policy {
@@ -254,5 +307,37 @@ web01 = "agent-admin:web01"
             "principal \"agent-admin:web01\" is shared by hosts \"code\" and \"web01\"; \
              one host per principal"
         );
+    }
+
+    #[test]
+    fn config_refuses_project_with_unknown_runner() {
+        let key = ssh_key::PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            ssh_key::Algorithm::Ed25519,
+        )
+        .unwrap()
+        .public_key()
+        .to_openssh()
+        .unwrap();
+        let ok = format!(
+            "{MINIMAL}\n[runners.r1]\npublic_key = \"{key}\"\n\n[projects.net]\nrunner = \"r1\"\n"
+        );
+        let c: Config = toml::from_str(&ok).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.runner_keys().unwrap().len(), 1);
+
+        let bad = ok.replace("runner = \"r1\"", "runner = \"r2\"");
+        let c: Config = toml::from_str(&bad).unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.contains("unknown runner"), "{err}");
+
+        let bad_key = ok.replace(&key, "ssh-ed25519 notbase64");
+        let c: Config = toml::from_str(&bad_key).unwrap();
+        assert!(c.validate().unwrap_err().contains("public_key"));
+
+        let extra = format!("{ok}\nsurprise = 1\n");
+        assert!(toml::from_str::<Config>(&extra).is_err());
+        let extra = ok.replace("runner = \"r1\"", "runner = \"r1\"\nsurprise = 1");
+        assert!(toml::from_str::<Config>(&extra).is_err());
     }
 }

@@ -155,6 +155,7 @@ impl From<Refusal> for Fail {
             Refusal::AlreadyClaimed => (S::CONFLICT, "already_claimed", None),
             Refusal::WrongRunner => (S::FORBIDDEN, "wrong_runner", None),
             Refusal::Stale => (S::CONFLICT, "stale", None),
+            Refusal::StaleSignature => (S::UNAUTHORIZED, "stale_signature", None),
             Refusal::StaleBaseline => (S::CONFLICT, "stale_baseline", None),
             Refusal::PlanTooOld => (S::CONFLICT, "plan_too_old", None),
             Refusal::MalformedScope => (S::BAD_REQUEST, "malformed_scope", None),

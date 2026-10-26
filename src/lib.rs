@@ -19,6 +19,7 @@ pub mod gate;
 pub mod grant;
 pub mod job;
 pub mod notify;
+pub mod runner_auth;
 pub mod scope;
 pub mod server;
 pub mod session;

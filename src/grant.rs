@@ -252,6 +252,9 @@ pub enum Refusal {
     WrongRunner,
     /// The job's context moved on since it was planned.
     Stale,
+    /// A runner request with a timestamp outside the window, a replayed
+    /// nonce, or arriving while the nonce cache is full.
+    StaleSignature,
     /// The trust baseline in the scope is not the currently trusted one.
     StaleBaseline,
     /// The plan is older than the daemon allows for an apply.
@@ -283,6 +286,7 @@ impl fmt::Display for Refusal {
             Refusal::AlreadyClaimed => write!(f, "the approval was already claimed"),
             Refusal::WrongRunner => write!(f, "not the runner assigned to that project"),
             Refusal::Stale => write!(f, "the job's context changed since it was planned"),
+            Refusal::StaleSignature => write!(f, "runner request is stale or replayed"),
             Refusal::StaleBaseline => {
                 write!(f, "the trusted baseline moved since the scope was built")
             }
