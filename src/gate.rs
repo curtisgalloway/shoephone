@@ -68,6 +68,25 @@ impl Gate {
         Ok(())
     }
 
+    /// What [`Gate::admit`] would say at `now`, changing nothing: not even
+    /// the expiry of old acceptances, which are simply not counted.
+    pub fn check(&self, now: SystemTime, policy: &Policy) -> Result<(), Refusal> {
+        if self.occupant.is_some() {
+            return Err(Refusal::Busy);
+        }
+        if let Some(until) = self.cooldown_until.filter(|u| *u > now) {
+            return Err(Refusal::Cooldown { until });
+        }
+        let mut live = self.accepted.iter().filter(|t| **t + HOUR > now);
+        if live.clone().count() >= policy.max_requests_per_hour {
+            let oldest = live.next().copied().unwrap_or(now);
+            return Err(Refusal::RateCapped {
+                until: oldest + HOUR,
+            });
+        }
+        Ok(())
+    }
+
     /// Free the slot, if `occupant` is the one holding it. The acceptance
     /// stays counted against the cap.
     pub fn release(&mut self, occupant: Occupant) {

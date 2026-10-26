@@ -16,8 +16,8 @@
 //!   while the daemon holds the device list in memory. Names are not
 //!   unique, so an ambiguous one is refused rather than resolved.
 //! - `untrust <project> [--json]`: drop the project's trusted candidate, so
-//!   the next trust job starts from no baseline. Console-only, and refuses
-//!   to run while the daemon holds the registry in memory. Exits 0 when a
+//!   the next trust job starts from no baseline. Console-only. Works while
+//!   the daemon runs; it notices on its next runner poll. Exits 0 when a
 //!   record was removed and 1 when there was nothing to remove.
 
 use std::net::{TcpStream, ToSocketAddrs};
@@ -308,21 +308,10 @@ fn forget(config: &Config, target: &str) -> Status {
 
 /// Drop a project's trusted candidate.
 ///
-/// Console-only for the same reason as `forget`: trust decides what an
-/// approval can apply, and the daemon writes `trusted.json` whole from its
-/// own copy, so it must not be running.
+/// Console-only, like `forget`, but safe with the daemon running: the write
+/// takes the same lock the daemon takes, and the daemon reads `trusted.json`
+/// again on its next runner poll and trust approval.
 fn untrust(config: &Config, project: &str, json: bool) -> Status {
-    if daemon_is_listening(&config.listen) {
-        eprintln!(
-            "shoephoned: something is listening on {}, so shoephoned is probably running.",
-            config.listen
-        );
-        eprintln!(
-            "shoephoned: it holds the trust registry in memory and would write this removal back out. Stop it first:"
-        );
-        eprintln!("shoephoned:     systemctl stop shoephoned");
-        return Status::Precondition;
-    }
     let store = Store::new(&config.state_dir);
     match store.untrust(project) {
         Ok(Some(record)) => {
@@ -341,7 +330,6 @@ fn untrust(config: &Config, project: &str, json: bool) -> Status {
             eprintln!(
                 "shoephoned: {project:?} is no longer trusted; the next trust job starts from no baseline."
             );
-            eprintln!("shoephoned: start the daemon again: systemctl start shoephoned");
             Status::Ok
         }
         Ok(None) => {

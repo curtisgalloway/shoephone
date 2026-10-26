@@ -334,6 +334,20 @@ impl Daemon {
     /// result, so nothing further is granted on the strength of a decision
     /// this daemon cannot prove it recorded.
     fn audited<T>(&self, f: impl FnOnce(&mut Inner) -> Result<T, Fail>) -> Result<T, Fail> {
+        self.audited_or_undo(|inner| f(inner).map(|t| (t, ())), |_, ()| ())
+    }
+
+    /// [`Daemon::audited`] for a change the caller can take back. `f` returns
+    /// its result and whatever `undo` needs; if the ledger append then
+    /// fails, `undo` runs under the same lock, before any other caller can
+    /// see the change, and the caller is told `ledger_unavailable`. `undo`
+    /// does not run when `f` itself failed, so `f` must not change state on
+    /// an error path.
+    fn audited_or_undo<T, U>(
+        &self,
+        f: impl FnOnce(&mut Inner) -> Result<(T, U), Fail>,
+        undo: impl FnOnce(&mut Inner, U),
+    ) -> Result<T, Fail> {
         let mut inner = self.inner.lock().expect("daemon lock");
         if inner.ledger_failed.is_some() {
             return Err(Self::ledger_unavailable());
@@ -341,6 +355,14 @@ impl Daemon {
         let out = f(&mut inner);
         let events = self.drain_and_append(&mut inner);
         let append_failed = inner.ledger_failed.is_some();
+        let out = match out {
+            Ok((_, taken)) if append_failed => {
+                undo(&mut inner, taken);
+                Err(Self::ledger_unavailable())
+            }
+            Ok((value, _)) => Ok(value),
+            Err(e) => Err(e),
+        };
         let targets = push_targets(&inner);
         let badge = badge_count(&mut inner, SystemTime::now());
         drop(inner);
@@ -926,7 +948,24 @@ fn prune_jobs(inner: &mut Inner, now: SystemTime) {
     }
 }
 
+/// Refuse a request the daemon would refuse anyway before spending any work
+/// on its payload. Read-only; `file_job` still decides, under the lock.
+fn precheck_job(d: &Daemon, project: &str) -> Result<(), Fail> {
+    let (now, policy) = (now(), d.config.policy());
+    d.audited(|inner| {
+        // Settle anything that has timed out first, as `file_job` does, so a
+        // lapsed job does not make this say `busy`.
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        prune_jobs(inner, now);
+        inner
+            .jobs
+            .precheck(now, inner.grants.gate_mut(), &policy, project)
+            .map_err(Fail::from)
+    })
+}
+
 async fn trust(State(d): App, Json(body): Json<TrustBody>) -> Reply<JobReply> {
+    precheck_job(&d, &body.project)?;
     // Bound the work before doing any of it: base64 grows data by 4/3.
     if body.archive.len() > MAX_ARCHIVE_BYTES.div_ceil(3) * 4 {
         return Err(too_large("archive_too_large", "the archive"));
@@ -960,6 +999,7 @@ async fn trust(State(d): App, Json(body): Json<TrustBody>) -> Reply<JobReply> {
 }
 
 async fn apply(State(d): App, Json(body): Json<ApplyBody>) -> Reply<JobReply> {
+    precheck_job(&d, &body.project)?;
     if body.manifest.len() > MAX_MANIFEST_BYTES {
         return Err(too_large("manifest_too_large", "the manifest"));
     }
@@ -1724,6 +1764,11 @@ fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), 
                 }
                 return Ok(());
             }
+            if display.verify_command.is_some() {
+                return Err(inconsistent(
+                    "a trust display with a diff must not carry a verify_command",
+                ));
+            }
             let diff = display
                 .diff
                 .as_deref()
@@ -1790,6 +1835,36 @@ fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), 
     Ok(())
 }
 
+/// Make `records` what the daemon trusts, in memory and in `Jobs`. A project
+/// with no record is trusted at nothing.
+fn sync_trusted(d: &Daemon, inner: &mut Inner, records: Vec<TrustRecord>) {
+    inner.trusted = records
+        .into_iter()
+        .map(|r| (r.project.clone(), r))
+        .collect();
+    for project in d.config.projects.keys() {
+        let digest = inner.trusted.get(project).map(|r| r.digest.clone());
+        inner.jobs.set_trusted(project, digest);
+    }
+}
+
+/// Read `trusted.json` again, so a `shoephoned untrust` run since the last
+/// look takes effect without a restart. Fails closed: if the file cannot be
+/// read, the caller is refused rather than served from a copy that may be
+/// out of date.
+fn refresh_trusted(d: &Daemon, inner: &mut Inner) -> Result<(), Fail> {
+    let records = d.store.load_trusted().map_err(|e| {
+        eprintln!("shoephoned: trusted: {e}");
+        Fail::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "trust_unreadable",
+            "the trust registry could not be read",
+        )
+    })?;
+    sync_trusted(d, inner, records);
+    Ok(())
+}
+
 fn runner_job(job: &Job, trusted: &BTreeMap<String, TrustRecord>) -> RunnerJob {
     let (kind, manifest, allow_destroy) = match &job.kind {
         JobKind::Trust { .. } => ("trust", None, false),
@@ -1817,6 +1892,7 @@ async fn runner_poll(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<Op
     let runner = authenticate(&d, &headers, "POST", "/api/runner/poll", &body, None)?;
     let (now, policy) = (now(), d.config.policy());
     d.audited(|inner| {
+        refresh_trusted(&d, inner)?;
         inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
         prune_jobs(inner, now);
         let job = inner.jobs.poll(now, inner.grants.gate_mut(), &runner);
@@ -1922,6 +1998,7 @@ async fn runner_claim(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<J
     let req: ById = parse_body(&body)?;
     let now = now();
     d.audited(|inner| {
+        refresh_trusted(&d, inner)?;
         let scope = inner.jobs.claim(now, &runner, req.id)?;
         if let JobScope::Trust(t) = &scope {
             inner.claimed.insert(req.id, t.clone());
@@ -1952,72 +2029,97 @@ async fn runner_finish(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<
     let now = now();
     // Only `trusted` goes through `audited`: it changes what a project may
     // apply from, so it is refused up front (`ledger_unavailable`, before
-    // any state changes) once the ledger cannot be trusted, and a failed
-    // append is reported as such. Every other outcome stays on `with`, as
-    // `kill` and `decline` do, so a job can always be ended and a runner
-    // can always say what happened to an apply.
+    // any state changes) once the ledger cannot be trusted, and if the
+    // append of its own event fails the trust is taken back (see
+    // `undo_trust`). Every other outcome stays on `with`, as `kill` and
+    // `decline` do, so a job can always be ended and a runner can always say
+    // what happened to an apply.
     if result == JobResult::Trusted {
-        d.audited(|inner| finish_in(&d, inner, now, &runner, &req, result))
+        d.audited_or_undo(
+            |inner| finish_trusted(&d, inner, now, &runner, &req),
+            |inner, undo| undo_trust(&d, inner, undo),
+        )
     } else {
-        d.with(|inner| finish_in(&d, inner, now, &runner, &req, result))
+        d.with(|inner| finish_other(inner, now, &runner, &req, result))
     }
 }
 
-fn finish_in(
-    d: &Daemon,
-    inner: &mut Inner,
-    now: SystemTime,
-    runner: &str,
-    req: &FinishBody,
-    result: JobResult,
-) -> Reply<serde_json::Value> {
-    let known = inner.jobs.job(now, req.id).map(|j| {
-        (
-            j.project.clone(),
-            matches!(j.kind, JobKind::Trust { .. }),
-            j.state == JobState::Claimed,
-        )
-    });
-    let project = match &known {
-        Some((project, _, _)) => project.clone(),
-        None => req.project.clone().ok_or_else(|| {
-            Fail::new(
-                StatusCode::BAD_REQUEST,
-                "project_required",
-                "the daemon does not know that job; say which project it belongs to",
-            )
-        })?,
-    };
-    let finished = |e: Refusal| match e {
+fn finish_failure(e: Refusal) -> Fail {
+    match e {
         Refusal::ScopeMismatch => Fail::new(
             StatusCode::BAD_REQUEST,
             "scope_mismatch",
             "that result does not fit this kind of job",
         ),
         other => other.into(),
-    };
-    if result != JobResult::Trusted {
-        inner
-            .jobs
-            .finish(now, runner, &project, req.id, result)
-            .map_err(finished)?;
-        inner.claimed.remove(&req.id);
-        prune_jobs(inner, now);
-        return Ok(Json(serde_json::json!({})));
     }
+}
 
-    // A trust is recorded on disk before the job is marked done, so a failed
-    // write leaves the job Claimed and the runner can retry. Check first
-    // that `Jobs::finish` will accept it.
-    let Some((_, is_trust, claimed)) = known else {
-        return Err(Refusal::NoSuchRequest.into());
+/// The project a finish names: the job's, or, for a job the daemon does not
+/// know, the one the runner says.
+fn finish_project(inner: &mut Inner, now: SystemTime, req: &FinishBody) -> Result<String, Fail> {
+    match inner.jobs.job(now, req.id) {
+        Some(job) => Ok(job.project.clone()),
+        None => req.project.clone().ok_or_else(|| {
+            Fail::new(
+                StatusCode::BAD_REQUEST,
+                "project_required",
+                "the daemon does not know that job; say which project it belongs to",
+            )
+        }),
+    }
+}
+
+fn finish_other(
+    inner: &mut Inner,
+    now: SystemTime,
+    runner: &str,
+    req: &FinishBody,
+    result: JobResult,
+) -> Reply<serde_json::Value> {
+    let project = finish_project(inner, now, req)?;
+    inner
+        .jobs
+        .finish(now, runner, &project, req.id, result)
+        .map_err(finish_failure)?;
+    inner.claimed.remove(&req.id);
+    prune_jobs(inner, now);
+    Ok(Json(serde_json::json!({})))
+}
+
+/// What it takes to put a trust back as it was.
+struct TrustUndo {
+    id: u64,
+    record: TrustRecord,
+    previous: Option<TrustRecord>,
+    scope: TrustScope,
+}
+
+/// Record a trust. It goes on disk before the job is marked done, so a
+/// failed write leaves the job Claimed and the runner can retry; the caller
+/// takes it back with [`undo_trust`] if the ledger then cannot record it.
+fn finish_trusted(
+    d: &Daemon,
+    inner: &mut Inner,
+    now: SystemTime,
+    runner: &str,
+    req: &FinishBody,
+) -> Result<(Json<serde_json::Value>, TrustUndo), Fail> {
+    refresh_trusted(d, inner)?;
+    let project = finish_project(inner, now, req)?;
+    // Check first that `Jobs::finish` will accept it.
+    let (is_trust, claimed) = match inner.jobs.job(now, req.id) {
+        Some(job) => (
+            matches!(job.kind, JobKind::Trust { .. }),
+            job.state == JobState::Claimed,
+        ),
+        None => return Err(Refusal::NoSuchRequest.into()),
     };
-    let assigned = d.config.projects.get(&project).map(|p| p.runner.as_str());
-    if assigned != Some(runner) {
+    if inner.jobs.runner_of(&project) != Some(runner) {
         return Err(Refusal::WrongRunner.into());
     }
     if !is_trust {
-        return Err(finished(Refusal::ScopeMismatch));
+        return Err(finish_failure(Refusal::ScopeMismatch));
     }
     let scope = match inner.claimed.get(&req.id) {
         Some(scope) if claimed => scope.clone(),
@@ -2025,37 +2127,83 @@ fn finish_in(
     };
     let record = TrustRecord {
         project: project.clone(),
-        digest: scope.candidate,
-        schema: scope.schema,
+        digest: scope.candidate.clone(),
+        schema: scope.schema.clone(),
         job: req.id,
         at: store::unix(now),
     };
-    let mut all = inner.trusted.clone();
-    all.insert(project.clone(), record.clone());
-    let records: Vec<TrustRecord> = all.values().cloned().collect();
+    let mut previous = None;
     // A failed write deliberately does not set `ledger_failed`: that flag
     // is sticky until restart and would refuse the retry this ordering
     // exists to allow. Nothing was recorded anywhere, so no audit gap
     // opened; the job is still Claimed and the runner is told to retry.
-    if let Err(e) = d.store.save_trusted(&records) {
+    let written = d.store.update_trusted(|mut records| {
+        previous = records.iter().find(|r| r.project == project).cloned();
+        records.retain(|r| r.project != project);
+        records.push(record.clone());
+        records.sort_by(|a, b| a.project.cmp(&b.project));
+        (Some(records.clone()), records)
+    });
+    let records = written.map_err(|e| {
         eprintln!("shoephoned: trusted: {e}");
-        return Err(Fail::new(
+        Fail::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "trust_save_failed",
             "the trust record could not be saved; the job is still claimed, retry",
-        ));
-    }
-    inner
+        )
+    })?;
+    let undo = TrustUndo {
+        id: req.id,
+        record: record.clone(),
+        previous,
+        scope,
+    };
+    if let Err(e) = inner
         .jobs
         .finish(now, runner, &project, req.id, JobResult::Trusted)
-        .map_err(finished)?;
+    {
+        restore_trusted_file(d, &undo);
+        return Err(finish_failure(e));
+    }
     inner.claimed.remove(&req.id);
-    inner
-        .jobs
-        .set_trusted(&project, Some(record.digest.clone()));
-    inner.trusted = all;
+    sync_trusted(d, inner, records);
     prune_jobs(inner, now);
-    Ok(Json(serde_json::json!({})))
+    Ok((Json(serde_json::json!({})), undo))
+}
+
+/// Put the project's record in `trusted.json` back as it was, unless
+/// something else (an `untrust`, a later trust) has changed it since.
+fn restore_trusted_file(d: &Daemon, undo: &TrustUndo) {
+    let project = &undo.record.project;
+    let restored = d.store.update_trusted(|mut records| {
+        if records.iter().find(|r| &r.project == project) != Some(&undo.record) {
+            return (None, ());
+        }
+        records.retain(|r| &r.project != project);
+        records.extend(undo.previous.clone());
+        records.sort_by(|a, b| a.project.cmp(&b.project));
+        (Some(records), ())
+    });
+    if let Err(e) = restored {
+        eprintln!("shoephoned: trusted: rolling back: {e}");
+    }
+}
+
+/// The ledger could not record a trust: take it back on disk and in memory,
+/// and leave the job Claimed. The ledger is now marked failed, so the daemon
+/// refuses further approvals until it restarts with a writable one.
+fn undo_trust(d: &Daemon, inner: &mut Inner, undo: TrustUndo) {
+    restore_trusted_file(d, &undo);
+    inner.jobs.reopen_trusted(undo.id);
+    inner.claimed.insert(undo.id, undo.scope);
+    match d.store.load_trusted() {
+        Ok(records) => sync_trusted(d, inner, records),
+        Err(e) => {
+            eprintln!("shoephoned: trusted: {e}");
+            // Fail closed: trust nothing until the next refresh succeeds.
+            sync_trusted(d, inner, Vec::new());
+        }
+    }
 }
 
 /// Approves the job waiting on the approver, as the approver's device would.
@@ -2064,6 +2212,7 @@ fn finish_in(
 async fn test_approve_job(State(d): App, Json(body): Json<ById>) -> Reply<serde_json::Value> {
     let (now, policy) = (now(), d.config.policy());
     d.audited(|inner| {
+        refresh_trusted(&d, inner)?;
         let (nonce, scope) = match inner.jobs.job(now, body.id).map(|j| j.state.clone()) {
             Some(JobState::Waiting { scope, nonce, .. }) => (nonce, scope),
             _ => return Err(Refusal::NoSuchRequest.into()),

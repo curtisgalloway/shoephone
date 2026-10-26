@@ -418,20 +418,49 @@ impl Store {
         write_atomic_private(&self.trusted_path(), &json)
     }
 
+    /// Read-modify-write `trusted.json` under an exclusive advisory lock on
+    /// `trusted.lock`, so the daemon and `shoephoned untrust` cannot lose
+    /// each other's change. `f` gets the records on disk and returns the
+    /// records to write, or `None` to leave the file alone, with a value to
+    /// hand back. The lock is held until this returns.
+    pub fn update_trusted<T>(
+        &self,
+        f: impl FnOnce(Vec<TrustRecord>) -> (Option<Vec<TrustRecord>>, T),
+    ) -> Result<T, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.dir.join("trusted.lock");
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("opening {}: {e}", path.display()))?;
+        lock.lock()
+            .map_err(|e| format!("locking {}: {e}", path.display()))?;
+        // Closing the file on drop releases the lock.
+        let (write, out) = f(self.load_trusted()?);
+        if let Some(records) = write {
+            self.save_trusted(&records)?;
+        }
+        Ok(out)
+    }
+
     /// Remove the trust record for `project`, returning it, or `None` when
-    /// the project had none. Other projects' records are untouched. Like
-    /// [`Store::forget_device`], the caller makes sure no daemon is running.
+    /// the project had none. Other projects' records are untouched. Safe
+    /// while the daemon runs: it takes the same lock, and the daemon reads
+    /// the file again on its next runner poll.
     pub fn untrust(&self, project: &str) -> Result<Option<TrustRecord>, String> {
-        let records = self.load_trusted()?;
-        let Some(found) = records.iter().find(|r| r.project == project).cloned() else {
-            return Ok(None);
-        };
-        let kept: Vec<TrustRecord> = records
-            .into_iter()
-            .filter(|r| r.project != project)
-            .collect();
-        self.save_trusted(&kept)?;
-        Ok(Some(found))
+        self.update_trusted(|records| {
+            let Some(found) = records.iter().find(|r| r.project == project).cloned() else {
+                return (None, None);
+            };
+            let kept: Vec<TrustRecord> = records
+                .into_iter()
+                .filter(|r| r.project != project)
+                .collect();
+            (Some(kept), Some(found))
+        })
     }
 
     pub fn load_enroll_code(&self) -> Result<Option<EnrollCode>, String> {
@@ -557,10 +586,15 @@ fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     let write = || -> std::io::Result<()> {
+        // A stale temp file may have been left with wider permissions; never
+        // write through it.
+        match fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         let mut f = OpenOptions::new()
             .write(true)
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
         f.write_all(bytes)?;
@@ -811,6 +845,53 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn stale_temp_file_is_replaced_not_reused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("trusted-stale-tmp");
+        let store = Store::new(&dir);
+        let stale = dir.join(format!("trusted.tmp.{}", std::process::id()));
+        fs::write(&stale, "old").unwrap();
+        fs::set_permissions(&stale, fs::Permissions::from_mode(0o644)).unwrap();
+        store.save_trusted(&[record("web", "d")]).unwrap();
+        let mode = fs::metadata(dir.join("trusted.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn concurrent_updates_to_trusted_do_not_lose_either() {
+        let dir = tmp("trusted-race");
+        let store = Store::new(&dir);
+        store
+            .save_trusted(&[record("web", "dw"), record("db", "dd")])
+            .unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let store = Store::new(&dir);
+                std::thread::spawn(move || {
+                    for n in 0..20 {
+                        let name = format!("p{i}-{n}");
+                        store
+                            .update_trusted(|mut records| {
+                                std::thread::sleep(Duration::from_millis(1));
+                                records.push(record(&name, "x"));
+                                (Some(records), ())
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(store.load_trusted().unwrap().len(), 2 + 8 * 20);
     }
 
     #[test]

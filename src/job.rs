@@ -222,7 +222,24 @@ struct Entry {
     plan_timeout: Duration,
     approval_ttl: Duration,
     max_plan_age: Duration,
+    /// When the job reached `Done`, for [`Jobs::prune`].
+    done_at: Option<SystemTime>,
 }
+
+impl Entry {
+    /// End the job as of `at`. An apply job's manifest text is dropped here:
+    /// it can hold values nobody needs once the job is over.
+    fn settle(&mut self, result: JobResult, at: SystemTime) {
+        self.job.state = JobState::Done(result);
+        self.done_at = Some(at);
+        if let JobKind::Apply { manifest, .. } = &mut self.job.kind {
+            *manifest = String::new();
+        }
+    }
+}
+
+/// How long a finished job stays visible to its requester.
+const DONE_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 /// Fail a `Queued` or `Working` job that outlived `plan_timeout`, dated to
 /// when it lapsed, with no strike. Returns whether it did.
@@ -239,11 +256,14 @@ fn lapse_planning(
     if lapsed > now {
         return false;
     }
-    entry.job.state = JobState::Done(JobResult::PlanFailed(Failure {
-        category: "plan_timeout".into(),
-        addresses: Vec::new(),
-        detail: None,
-    }));
+    entry.settle(
+        JobResult::PlanFailed(Failure {
+            category: "plan_timeout".into(),
+            addresses: Vec::new(),
+            detail: None,
+        }),
+        now,
+    );
     events.push(JobEvent::Refused {
         id: entry.job.id,
         project: entry.job.project.clone(),
@@ -264,7 +284,7 @@ fn lapse_approved(entry: &mut Entry, events: &mut Vec<JobEvent>, now: SystemTime
     if lapsed > now {
         return false;
     }
-    entry.job.state = JobState::Done(JobResult::TimedOut);
+    entry.settle(JobResult::TimedOut, now);
     events.push(JobEvent::TimedOut {
         id: entry.job.id,
         project: entry.job.project.clone(),
@@ -289,7 +309,7 @@ fn lapse_waiting(
     if lapsed > now {
         return false;
     }
-    entry.job.state = JobState::Done(JobResult::TimedOut);
+    entry.settle(JobResult::TimedOut, now);
     events.push(JobEvent::TimedOut {
         id: entry.job.id,
         project: entry.job.project.clone(),
@@ -302,11 +322,14 @@ fn lapse_waiting(
 
 /// End a job as `Refused` without striking: the agent did not cause it.
 fn refuse_unstruck(entry: &mut Entry, events: &mut Vec<JobEvent>, now: SystemTime, category: &str) {
-    entry.job.state = JobState::Done(JobResult::Refused(Failure {
-        category: category.into(),
-        addresses: Vec::new(),
-        detail: None,
-    }));
+    entry.settle(
+        JobResult::Refused(Failure {
+            category: category.into(),
+            addresses: Vec::new(),
+            detail: None,
+        }),
+        now,
+    );
     events.push(JobEvent::Refused {
         id: entry.job.id,
         project: entry.job.project.clone(),
@@ -374,8 +397,39 @@ impl Jobs {
         self.entries.iter().position(|e| e.job.id == id)
     }
 
-    fn runner_of(&self, project: &str) -> Option<&str> {
+    /// The name of the runner that serves `project`, if the project is known.
+    pub fn runner_of(&self, project: &str) -> Option<&str> {
         self.projects.get(project).map(String::as_str)
+    }
+
+    /// What [`Jobs::request`] would refuse for `project` at `now`, in the same
+    /// order, without changing anything. A cheap check to run before the
+    /// agent's payload is decoded or hashed; `request` still decides.
+    pub fn precheck(
+        &self,
+        now: SystemTime,
+        gate: &Gate,
+        policy: &Policy,
+        project: &str,
+    ) -> Result<(), Refusal> {
+        let now = now.max(self.high_water);
+        if !self.projects.contains_key(project) {
+            return Err(Refusal::UnknownProject);
+        }
+        if self
+            .entries
+            .iter()
+            .any(|e| !matches!(e.job.state, JobState::Done(_)))
+        {
+            return Err(Refusal::Busy);
+        }
+        gate.check(now, policy)
+    }
+
+    /// Forget jobs that finished more than an hour before `now`.
+    fn prune(&mut self, now: SystemTime) {
+        self.entries
+            .retain(|e| e.done_at.is_none_or(|at| at + DONE_RETENTION > now));
     }
 
     /// File a job. Refuses an unknown project, an empty reason, and, in this
@@ -393,6 +447,7 @@ impl Jobs {
         reason: &str,
     ) -> Result<Job, Refusal> {
         let now = self.clamp(now);
+        self.prune(now);
         if !self.projects.contains_key(project) {
             return Err(Refusal::UnknownProject);
         }
@@ -431,6 +486,7 @@ impl Jobs {
             plan_timeout: policy.plan_timeout,
             approval_ttl: policy.approval_ttl,
             max_plan_age: policy.max_plan_age,
+            done_at: None,
         });
         Ok(job)
     }
@@ -556,7 +612,7 @@ impl Jobs {
             | JobState::Claimed
             | JobState::Done(_) => return Err(Refusal::NoSuchRequest),
         }
-        entry.job.state = JobState::Done(result);
+        entry.settle(result, now);
         self.events.push(JobEvent::Refused {
             id,
             project: entry.job.project.clone(),
@@ -647,7 +703,7 @@ impl Jobs {
         if !matches!(entry.job.state, JobState::Waiting { .. }) {
             return Err(Refusal::NoSuchRequest);
         }
-        entry.job.state = JobState::Done(JobResult::Declined);
+        entry.settle(JobResult::Declined, now);
         self.events.push(JobEvent::Declined {
             id,
             project: entry.job.project.clone(),
@@ -760,9 +816,25 @@ impl Jobs {
             | (JobResult::TimedOut, _)
             | (JobResult::Killed, _) => return Err(Refusal::ScopeMismatch),
         };
-        entry.job.state = JobState::Done(result);
+        entry.settle(result, now);
         self.events.push(event);
         Ok(())
+    }
+
+    /// Put a job that [`Jobs::finish`] just ended as `Trusted` back to
+    /// `Claimed`. For the daemon's rollback when it cannot record the
+    /// outcome; returns whether there was such a job.
+    pub fn reopen_trusted(&mut self, id: u64) -> bool {
+        let Some(i) = self.index(id) else {
+            return false;
+        };
+        let entry = &mut self.entries[i];
+        if entry.job.state != JobState::Done(JobResult::Trusted) {
+            return false;
+        }
+        entry.job.state = JobState::Claimed;
+        entry.done_at = None;
+        true
     }
 
     /// The kill switch for one project. A job still waiting on a person is
@@ -791,7 +863,7 @@ impl Jobs {
                 JobState::Approved { .. } => {}
                 JobState::Claimed | JobState::Done(_) => continue,
             }
-            entry.job.state = JobState::Done(JobResult::Killed);
+            entry.settle(JobResult::Killed, now);
             self.events.push(JobEvent::Killed {
                 id,
                 project: entry.job.project.clone(),
@@ -810,6 +882,7 @@ impl Jobs {
     /// - `Waiting` past the approval window times out, with a strike.
     /// - `Approved` and unclaimed past `max_plan_age` from the plan times
     ///   out, with no strike: the approver did answer.
+    /// - A job that finished more than an hour ago is forgotten.
     pub fn tick(&mut self, now: SystemTime, gate: &mut Gate, policy: &Policy) {
         let now = self.clamp(now);
         for entry in &mut self.entries {
@@ -820,6 +893,7 @@ impl Jobs {
             }
             lapse_waiting(entry, &mut self.events, gate, policy, now);
         }
+        self.prune(now);
     }
 
     pub fn job(&mut self, now: SystemTime, id: u64) -> Option<&Job> {
@@ -1752,5 +1826,133 @@ mod tests {
             Err(Refusal::NoSuchRequest),
             "t(3) is clamped to the late high-water mark, past the window"
         );
+    }
+
+    #[test]
+    fn done_apply_job_drops_manifest() {
+        let mut r = Rig::new();
+        let kind = JobKind::Apply {
+            manifest: r#"{"k":"VALUE123"}"#.into(),
+            allow_destroy: false,
+        };
+        r.request(t(0), 1, kind).unwrap();
+        r.jobs.poll(t(1), &mut r.gate, "runner-a").unwrap();
+        r.jobs
+            .refuse(
+                t(2),
+                &mut r.gate,
+                "runner-a",
+                1,
+                JobResult::PlanFailed(failure("tf_error")),
+            )
+            .unwrap();
+        let job = r.jobs.job(t(3), 1).unwrap();
+        assert!(matches!(job.state, JobState::Done(_)));
+        assert!(
+            matches!(&job.kind, JobKind::Apply { manifest, .. } if manifest.is_empty()),
+            "{:?}",
+            job.kind
+        );
+    }
+
+    #[test]
+    fn done_jobs_pruned_after_an_hour() {
+        let mut r = Rig::new();
+        r.request(t(0), 1, trust_kind()).unwrap();
+        r.jobs.poll(t(1), &mut r.gate, "runner-a").unwrap();
+        r.jobs
+            .refuse(
+                t(2),
+                &mut r.gate,
+                "runner-a",
+                1,
+                JobResult::PlanFailed(failure("tf_error")),
+            )
+            .unwrap();
+        r.tick(t(2 + 3599));
+        assert!(r.jobs.job(t(2 + 3599), 1).is_some());
+        r.tick(t(2 + 3600));
+        assert!(r.jobs.job(t(2 + 3600), 1).is_none());
+
+        r.request(t(2 + 3601), 2, trust_kind()).unwrap();
+        r.jobs.poll(t(2 + 3602), &mut r.gate, "runner-a").unwrap();
+        let lapsed = 2 + 3601 + r.policy.plan_timeout.as_secs();
+        r.tick(t(lapsed));
+        assert!(matches!(
+            r.jobs.job(t(lapsed), 2).unwrap().state,
+            JobState::Done(_)
+        ));
+        r.tick(t(lapsed + 3600));
+        assert!(
+            r.jobs.job(t(lapsed + 3600), 2).is_none(),
+            "a planning timeout is a Done job too"
+        );
+    }
+
+    #[test]
+    fn precheck_matches_request_and_changes_nothing() {
+        let mut r = Rig::new();
+        let p = r.policy.clone();
+        assert_eq!(r.jobs.precheck(t(0), &r.gate, &p, "web"), Ok(()));
+        assert_eq!(
+            r.jobs.precheck(t(0), &r.gate, &p, "nope"),
+            Err(Refusal::UnknownProject)
+        );
+        assert_eq!(r.gate.busy(), None);
+        assert!(r.gate.accepted.is_empty());
+        r.request(t(0), 1, trust_kind()).unwrap();
+        assert_eq!(
+            r.jobs.precheck(t(1), &r.gate, &p, "web"),
+            Err(Refusal::Busy)
+        );
+        r.jobs.kill(t(2), &mut r.gate, &p, "web").unwrap();
+        assert_eq!(r.jobs.precheck(t(3), &r.gate, &p, "web"), Ok(()));
+        r.request(t(4), 2, trust_kind()).unwrap();
+        r.jobs.poll(t(5), &mut r.gate, "runner-a").unwrap();
+        let nonce = {
+            r.submit(t(6), 2, trust_scope()).unwrap();
+            r.nonce(2)
+        };
+        r.jobs
+            .decline(t(7), &mut r.gate, &p, 2)
+            .map(|()| nonce)
+            .unwrap();
+        assert!(matches!(
+            r.jobs.precheck(t(8), &r.gate, &p, "web"),
+            Err(Refusal::Cooldown { .. })
+        ));
+    }
+
+    #[test]
+    fn precheck_sees_the_rate_cap() {
+        let mut r = Rig::new();
+        let p = r.policy.clone();
+        for i in 0..p.max_requests_per_hour {
+            let at = t(i as u64);
+            r.request(at, i as u64 + 1, trust_kind()).unwrap();
+            r.jobs.kill(at, &mut r.gate, &p, "web").unwrap();
+            r.gate.cooldown_until = None;
+        }
+        let now = t(p.max_requests_per_hour as u64);
+        assert!(matches!(
+            r.jobs.precheck(now, &r.gate, &p, "web"),
+            Err(Refusal::RateCapped { .. })
+        ));
+        assert_eq!(r.jobs.precheck(t(3600 + 100), &r.gate, &p, "web"), Ok(()));
+    }
+
+    #[test]
+    fn reopen_trusted_puts_a_finished_trust_back_to_claimed() {
+        let mut r = Rig::new();
+        let scope = trust_scope();
+        let nonce = r.waiting(1, trust_kind(), scope.clone());
+        r.approve(t(3), 1, &nonce, &scope).unwrap();
+        r.jobs.claim(t(4), "runner-a", 1).unwrap();
+        r.jobs
+            .finish(t(5), "runner-a", "web", 1, JobResult::Trusted)
+            .unwrap();
+        assert!(r.jobs.reopen_trusted(1));
+        assert_eq!(r.state(1), JobState::Claimed);
+        assert!(!r.jobs.reopen_trusted(1));
     }
 }

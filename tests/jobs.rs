@@ -173,6 +173,19 @@ async fn job_status_never_contains_manifest_values() {
     let mut seen = vec![serde_json::to_string(&reply).unwrap()];
 
     let c = client.clone();
+    blocking(move || c.kill_project("net")).await.unwrap();
+    let c = client.clone();
+    let mut body = trust_body("net", b"tar bytes holding VALUE123");
+    body.reason = "jobs test: secret".into();
+    let trust_reply = blocking(move || c.trust(&body)).await.unwrap();
+    seen.push(serde_json::to_string(&trust_reply).unwrap());
+    let tid = trust_reply.id;
+    let c = client.clone();
+    seen.push(serde_json::to_string(&blocking(move || c.job(tid)).await.unwrap()).unwrap());
+    let c = client.clone();
+    blocking(move || c.kill_project("net")).await.unwrap();
+
+    let c = client.clone();
     seen.push(serde_json::to_string(&blocking(move || c.job(id)).await.unwrap()).unwrap());
 
     seen.push(
@@ -844,6 +857,7 @@ async fn submit_with_unchecked_display_fields_is_400() {
         json!({ "diff": good["diff"], "manifest": "m" }),
         json!({ "diff": good["diff"], "baseline_manifest": "m" }),
         json!({ "diff": good["diff"], "address_text": "" }),
+        json!({ "diff": good["diff"], "verify_command": "v" }),
     ];
     for display in cases {
         let reply = submit(&rig, id, scope.clone(), display.clone()).await;
@@ -937,4 +951,157 @@ async fn failure_category_is_restricted() {
         assert_eq!(reply.http, 400, "{bad:?}");
     }
     assert_eq!(status_of(&client, id).await.state, "working");
+}
+
+async fn finish_trusted(rig: &Rig, id: u64) -> RunnerReply {
+    rig.post(
+        "/api/runner/finish",
+        json!({ "id": id, "result": "trusted" }),
+        Some(id),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untrust_takes_effect_without_restart() {
+    let dir = scratch("jobs-untrust-live");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = claimed_trust(&rig, &client).await;
+    assert_eq!(finish_trusted(&rig, id).await.http, 200);
+
+    let removed = Store::new(&dir).untrust("net").unwrap();
+    assert_eq!(removed.map(|r| r.digest), Some(hex('c')));
+
+    let second = file_trust(&client, "net", b"tar again").await;
+    let polled = rig.poll().await;
+    assert_eq!(polled["id"], second);
+    assert!(polled["trusted"].is_null(), "{polled}");
+    let (scope, display) = trust_pair("net");
+    assert_eq!(scope["baseline"], Value::Null);
+    assert_eq!(submit(&rig, second, scope, display).await.http, 200);
+    approve_job(client.base(), second).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_untrust_and_trust_finish_do_not_lose_either() {
+    let dir = scratch("jobs-untrust-race");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1"), ("db", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let seeded = shoephone::store::TrustRecord {
+        project: "db".into(),
+        digest: hex('9'),
+        schema: hex('8'),
+        job: 1,
+        at: 1,
+    };
+    Store::new(&dir).save_trusted(&[seeded]).unwrap();
+    let id = claimed_trust(&rig, &client).await;
+
+    let store_dir = dir.clone();
+    let untrust = blocking(move || {
+        let store = Store::new(&store_dir);
+        std::thread::spawn(move || store.untrust("db").unwrap())
+    });
+    let (finish, untrust) = tokio::join!(finish_trusted(&rig, id), untrust);
+    assert_eq!(
+        finish.http,
+        200,
+        "{}",
+        String::from_utf8_lossy(&finish.body)
+    );
+    let removed = blocking(move || untrust.join().unwrap()).await;
+    assert!(removed.is_some());
+
+    let records = Store::new(&dir).load_trusted().unwrap();
+    let names: Vec<&str> = records.iter().map(|r| r.project.as_str()).collect();
+    assert_eq!(names, vec!["net"], "{records:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_and_apply_refusals_come_before_the_payload_is_read() {
+    let dir = scratch("jobs-cheap");
+    let (client, _d) = start_projects(&dir, &[("net", "r1")]).await;
+    let client = Arc::new(client);
+
+    let c = client.clone();
+    let mut body = trust_body("nope", b"x");
+    body.archive = "!!not base64!!".into();
+    let err = blocking(move || c.trust(&body)).await.unwrap_err();
+    assert_eq!(code(&err), (400, "unknown_project".to_owned()));
+
+    let c = client.clone();
+    let body = apply_body("nope", &"x".repeat(64 * 1024 + 1));
+    let err = blocking(move || c.apply(&body)).await.unwrap_err();
+    assert_eq!(code(&err), (400, "unknown_project".to_owned()));
+
+    file_trust(&client, "net", b"one").await;
+    let c = client.clone();
+    let mut body = trust_body("net", b"x");
+    body.archive = "!!not base64!!".into();
+    let err = blocking(move || c.trust(&body)).await.unwrap_err();
+    assert_eq!(code(&err), (409, "busy".to_owned()));
+
+    let c = client.clone();
+    let body = apply_body("net", &"x".repeat(64 * 1024 + 1));
+    let err = blocking(move || c.apply(&body)).await.unwrap_err();
+    assert_eq!(code(&err), (409, "busy".to_owned()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_trusted_with_failing_ledger_rolls_the_trust_back() {
+    let dir = scratch("jobs-rollback");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let first = claimed_trust(&rig, &client).await;
+    assert_eq!(finish_trusted(&rig, first).await.http, 200);
+    let before = std::fs::read(dir.join("trusted.json")).unwrap();
+
+    let second = file_trust(&client, "net", b"tar two").await;
+    rig.poll().await;
+    let (mut scope, display) = trust_pair("net");
+    scope["baseline"] = json!(hex('c'));
+    scope["candidate"] = json!(hex('d'));
+    assert_eq!(submit(&rig, second, scope, display).await.http, 200);
+    approve_job(client.base(), second).await;
+    let claim = rig
+        .post("/api/runner/claim", json!({ "id": second }), Some(second))
+        .await;
+    assert_eq!(claim.http, 200);
+
+    chmod(&dir.join("ledger.jsonl"), 0o000);
+    let failed = finish_trusted(&rig, second).await;
+    chmod(&dir.join("ledger.jsonl"), 0o600);
+    assert_eq!(
+        (failed.http, failed.code().as_str()),
+        (503, "ledger_unavailable")
+    );
+    assert_eq!(std::fs::read(dir.join("trusted.json")).unwrap(), before);
+    assert_eq!(status_of(&client, second).await.state, "claimed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rollback_without_a_previous_record_removes_the_file_entry() {
+    let dir = scratch("jobs-rollback-none");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = claimed_trust(&rig, &client).await;
+
+    chmod(&dir.join("ledger.jsonl"), 0o000);
+    let failed = finish_trusted(&rig, id).await;
+    chmod(&dir.join("ledger.jsonl"), 0o600);
+    assert_eq!(
+        (failed.http, failed.code().as_str()),
+        (503, "ledger_unavailable")
+    );
+    assert!(Store::new(&dir).load_trusted().unwrap().is_empty());
+    assert_eq!(status_of(&client, id).await.state, "claimed");
 }
