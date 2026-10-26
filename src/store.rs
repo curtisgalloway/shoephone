@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use webauthn_rs::prelude::SecurityKey;
 
 use crate::grant::Event;
+use crate::job::JobEvent;
 
 /// One enrolled approver device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +99,9 @@ pub struct LedgerEntry {
     /// The requester's session link, on the `requested` line only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    /// Why a job ended without a scope, on the `plan_refused` line only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 impl From<&Event> for LedgerEntry {
@@ -144,8 +148,103 @@ impl From<&Event> for LedgerEntry {
                 Event::Requested { context, .. } => context.clone(),
                 _ => None,
             },
+            category: None,
         }
     }
+}
+
+impl From<&JobEvent> for LedgerEntry {
+    /// `host` carries the project name. Only ids, kinds, times, the stated
+    /// reason and the refusal category are copied; nothing that could hold
+    /// a credential reaches the ledger.
+    fn from(e: &JobEvent) -> Self {
+        let (kind, project, at, id) = match e {
+            JobEvent::Requested {
+                id,
+                project,
+                kind,
+                at,
+                ..
+            } => (
+                match *kind {
+                    "trust" => "trust_requested",
+                    _ => "apply_requested",
+                },
+                project,
+                at,
+                id,
+            ),
+            JobEvent::Started {
+                id,
+                project,
+                kind,
+                at,
+            } => (
+                match *kind {
+                    "trust" => "review_started",
+                    _ => "plan_started",
+                },
+                project,
+                at,
+                id,
+            ),
+            JobEvent::Waiting {
+                id,
+                project,
+                kind,
+                at,
+            } => (
+                match *kind {
+                    "trust" => "trust_waiting",
+                    _ => "apply_waiting",
+                },
+                project,
+                at,
+                id,
+            ),
+            JobEvent::Refused {
+                id, project, at, ..
+            } => ("plan_refused", project, at, id),
+            JobEvent::Approved { id, project, at } => ("approved", project, at, id),
+            JobEvent::Trusted { id, project, at } => ("trusted", project, at, id),
+            JobEvent::Applied { id, project, at } => ("applied", project, at, id),
+            JobEvent::ApplyFailed { id, project, at } => ("apply_failed", project, at, id),
+            JobEvent::OutcomeUnknown { id, project, at } => ("outcome_unknown", project, at, id),
+            JobEvent::Declined { id, project, at } => ("declined", project, at, id),
+            JobEvent::TimedOut { id, project, at } => ("timed_out", project, at, id),
+            JobEvent::Killed { id, project, at } => ("killed", project, at, id),
+        };
+        LedgerEntry {
+            seq: None,
+            at: unix(*at),
+            kind: kind.to_owned(),
+            host: project.clone(),
+            id: Some(*id),
+            serial: None,
+            until: None,
+            reason: match e {
+                JobEvent::Requested { reason, .. } => Some(reason.clone()),
+                _ => None,
+            },
+            context: None,
+            category: match e {
+                JobEvent::Refused { category, .. } => Some(category.clone()),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// A trusted candidate, durable across restarts: the digest the project's
+/// runner may apply from, and the schema it was trusted under.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrustRecord {
+    pub project: String,
+    pub digest: String,
+    pub schema: String,
+    /// The job that established the trust.
+    pub job: u64,
+    pub at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +261,10 @@ impl Store {
 
     fn devices_path(&self) -> PathBuf {
         self.dir.join("devices.json")
+    }
+
+    fn trusted_path(&self) -> PathBuf {
+        self.dir.join("trusted.json")
     }
 
     fn enroll_path(&self) -> PathBuf {
@@ -298,6 +401,39 @@ impl Store {
         write_atomic(&self.devices_path(), &json)
     }
 
+    pub fn load_trusted(&self) -> Result<Vec<TrustRecord>, String> {
+        let path = self.trusted_path();
+        match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| format!("parsing {}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(format!("reading {}: {e}", path.display())),
+        }
+    }
+
+    /// Written whole, atomically, mode 0600: what is trusted decides what an
+    /// approval can apply, so only the daemon's user may read or change it.
+    pub fn save_trusted(&self, records: &[TrustRecord]) -> Result<(), String> {
+        let json = serde_json::to_vec_pretty(records).map_err(|e| e.to_string())?;
+        write_atomic_private(&self.trusted_path(), &json)
+    }
+
+    /// Remove the trust record for `project`, returning it, or `None` when
+    /// the project had none. Other projects' records are untouched. Like
+    /// [`Store::forget_device`], the caller makes sure no daemon is running.
+    pub fn untrust(&self, project: &str) -> Result<Option<TrustRecord>, String> {
+        let records = self.load_trusted()?;
+        let Some(found) = records.iter().find(|r| r.project == project).cloned() else {
+            return Ok(None);
+        };
+        let kept: Vec<TrustRecord> = records
+            .into_iter()
+            .filter(|r| r.project != project)
+            .collect();
+        self.save_trusted(&kept)?;
+        Ok(Some(found))
+    }
+
     pub fn load_enroll_code(&self) -> Result<Option<EnrollCode>, String> {
         let path = self.enroll_path();
         match fs::read(&path) {
@@ -412,6 +548,25 @@ impl Store {
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     fs::write(&tmp, bytes).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+    fs::rename(&tmp, path).map_err(|e| format!("renaming into {}: {e}", path.display()))
+}
+
+/// [`write_atomic`] with the temp file created 0600, so the final file never
+/// exists with wider permissions.
+fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    };
+    write().map_err(|e| format!("writing {}: {e}", tmp.display()))?;
     fs::rename(&tmp, path).map_err(|e| format!("renaming into {}: {e}", path.display()))
 }
 
@@ -617,5 +772,206 @@ mod tests {
         assert!(store.load_enroll_code().unwrap().is_none());
         assert!(store.load_devices().unwrap().is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn record(project: &str, digest: &str) -> TrustRecord {
+        TrustRecord {
+            project: project.into(),
+            digest: digest.into(),
+            schema: "s".repeat(64),
+            job: 3,
+            at: 1_800_000_000,
+        }
+    }
+
+    #[test]
+    fn trusted_round_trips() {
+        let dir = tmp("trusted-rt");
+        let store = Store::new(&dir);
+        assert!(store.load_trusted().unwrap().is_empty());
+        let records = vec![
+            record("web", &"a".repeat(64)),
+            record("db", &"b".repeat(64)),
+        ];
+        store.save_trusted(&records).unwrap();
+        assert_eq!(store.load_trusted().unwrap(), records);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn trusted_file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("trusted-mode");
+        let store = Store::new(&dir);
+        store.save_trusted(&[record("web", "d")]).unwrap();
+        store.save_trusted(&[record("web", "e")]).unwrap();
+        let mode = fs::metadata(dir.join("trusted.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn untrust_removes_only_that_project() {
+        let dir = tmp("untrust");
+        let store = Store::new(&dir);
+        store
+            .save_trusted(&[record("web", "dw"), record("db", "dd")])
+            .unwrap();
+        let gone = store.untrust("web").unwrap().unwrap();
+        assert_eq!(gone.digest, "dw");
+        assert_eq!(store.load_trusted().unwrap(), vec![record("db", "dd")]);
+        assert_eq!(store.untrust("web").unwrap(), None);
+        assert_eq!(store.load_trusted().unwrap().len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn job_events_map_to_ledger_kinds() {
+        let at = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let p = || "web".to_owned();
+        let cases: Vec<(JobEvent, &str)> = vec![
+            (
+                JobEvent::Requested {
+                    id: 1,
+                    project: p(),
+                    kind: "trust",
+                    reason: "why".into(),
+                    at,
+                },
+                "trust_requested",
+            ),
+            (
+                JobEvent::Requested {
+                    id: 1,
+                    project: p(),
+                    kind: "apply",
+                    reason: "why".into(),
+                    at,
+                },
+                "apply_requested",
+            ),
+            (
+                JobEvent::Started {
+                    id: 1,
+                    project: p(),
+                    kind: "trust",
+                    at,
+                },
+                "review_started",
+            ),
+            (
+                JobEvent::Started {
+                    id: 1,
+                    project: p(),
+                    kind: "apply",
+                    at,
+                },
+                "plan_started",
+            ),
+            (
+                JobEvent::Waiting {
+                    id: 1,
+                    project: p(),
+                    kind: "trust",
+                    at,
+                },
+                "trust_waiting",
+            ),
+            (
+                JobEvent::Waiting {
+                    id: 1,
+                    project: p(),
+                    kind: "apply",
+                    at,
+                },
+                "apply_waiting",
+            ),
+            (
+                JobEvent::Refused {
+                    id: 1,
+                    project: p(),
+                    category: "tf_error".into(),
+                    at,
+                },
+                "plan_refused",
+            ),
+            (
+                JobEvent::Approved {
+                    id: 1,
+                    project: p(),
+                    at,
+                },
+                "approved",
+            ),
+            (
+                JobEvent::Trusted {
+                    id: 1,
+                    project: p(),
+                    at,
+                },
+                "trusted",
+            ),
+            (
+                JobEvent::Applied {
+                    id: 1,
+                    project: p(),
+                    at,
+                },
+                "applied",
+            ),
+            (
+                JobEvent::ApplyFailed {
+                    id: 1,
+                    project: p(),
+                    at,
+                },
+                "apply_failed",
+            ),
+            (
+                JobEvent::OutcomeUnknown {
+                    id: 1,
+                    project: p(),
+                    at,
+                },
+                "outcome_unknown",
+            ),
+            (
+                JobEvent::Declined {
+                    id: 1,
+                    project: p(),
+                    at,
+                },
+                "declined",
+            ),
+            (
+                JobEvent::TimedOut {
+                    id: 1,
+                    project: p(),
+                    at,
+                },
+                "timed_out",
+            ),
+            (
+                JobEvent::Killed {
+                    id: 1,
+                    project: p(),
+                    at,
+                },
+                "killed",
+            ),
+        ];
+        for (event, kind) in &cases {
+            let entry = LedgerEntry::from(event);
+            assert_eq!(entry.kind, *kind);
+            assert_eq!(entry.host, "web");
+            assert_eq!(entry.id, Some(1));
+            assert_eq!(entry.at, 1_800_000_000);
+            let wants_reason = kind.ends_with("_requested");
+            assert_eq!(entry.reason.is_some(), wants_reason, "{kind}");
+            assert_eq!(entry.category.is_some(), *kind == "plan_refused", "{kind}");
+        }
     }
 }

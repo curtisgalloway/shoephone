@@ -153,11 +153,13 @@ pub enum JobEvent {
     Started {
         id: u64,
         project: String,
+        kind: &'static str,
         at: SystemTime,
     },
     Waiting {
         id: u64,
         project: String,
+        kind: &'static str,
         at: SystemTime,
     },
     Approved {
@@ -456,6 +458,7 @@ impl Jobs {
                     self.events.push(JobEvent::Started {
                         id: entry.job.id,
                         project: entry.job.project.clone(),
+                        kind: entry.job.kind.name(),
                         at: now,
                     });
                     return Some(entry.job.clone());
@@ -511,6 +514,7 @@ impl Jobs {
         self.events.push(JobEvent::Waiting {
             id,
             project: entry.job.project.clone(),
+            kind: entry.job.kind.name(),
             at: now,
         });
         Ok(())
@@ -1062,6 +1066,7 @@ mod tests {
             vec![JobEvent::Started {
                 id: 1,
                 project: "web".into(),
+                kind: "trust",
                 at: t(2),
             }]
         );
@@ -1105,6 +1110,7 @@ mod tests {
             vec![JobEvent::Waiting {
                 id: 1,
                 project: "web".into(),
+                kind: "trust",
                 at: t(2),
             }]
         );
