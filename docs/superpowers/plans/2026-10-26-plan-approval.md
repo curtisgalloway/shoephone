@@ -122,7 +122,7 @@ shoephone-apply-v1\nproject=P\nrevision=D\nschema=D\nmanifest=D\nbaseline_manife
   - `pub fn tick(&mut self, now, gate: &mut Gate, policy: &Policy)`: `Queued` or `Working` past `plan_timeout` from `created` becomes `PlanFailed(category "plan_timeout")`, with no strike. `Waiting` past `approval_ttl` from `since` becomes `TimedOut`, with a strike. An `Approved` job older than `max_plan_age` without a claim becomes `TimedOut`, with no strike.
   - `pub fn job(&mut self, now, id: u64) -> Option<&Job>`, `pub fn waiting(&mut self, now) -> Option<&Job>`, `pub fn take_events(&mut self) -> Vec<JobEvent>`
   - `pub enum JobEvent { Requested{id,project,kind,reason,at}, Started{id,project,at}, Waiting{id,project,at}, Approved{id,project,at}, Refused{id,project,category,at}, Applied{id,project,at}, Trusted{id,project,at}, ApplyFailed{id,project,at}, OutcomeUnknown{id,project,at}, Declined{id,project,at}, TimedOut{id,project,at}, Killed{id,project,at} }`, where `kind` is `"trust"` or `"apply"`
-  - `Refusal` gains `UnknownProject`, `ScopeFrozen`, `AlreadyClaimed`, `WrongRunner`, `StaleBaseline` and `PlanTooOld`, each with a `Display` line.
+  - `Refusal` gains `UnknownProject`, `ScopeFrozen`, `AlreadyClaimed`, `WrongRunner`, `Stale` (used by Task 5), `StaleBaseline` and `PlanTooOld`, each with a `Display` line.
 - `Jobs` clamps `now` to its own high-water mark, as `Grants::tick` does.
 
 - [ ] **Step 1:** Write the unit tests in `job.rs`, each asserting the state and the events drained:
@@ -239,6 +239,7 @@ shoephone-apply-v1\nproject=P\nrevision=D\nschema=D\nmanifest=D\nbaseline_manife
   - `POST /api/runner/refuse` with body `{ id, result: "refused"|"plan_failed", failure: FailureView }`
   - `POST /api/runner/claim` with body `{ id }` replies with `JobScopeWire`.
   - `POST /api/runner/finish` with body `{ id, result: "trusted"|"applied"|"apply_failed"|"outcome_unknown", failure: Option<FailureView> }`. On `trusted` the daemon writes the `TrustRecord` (Task 4) and calls `Jobs::set_trusted`.
+  - The daemon loads `trusted.json` into `Jobs` at startup, and re-reads it on every `poll` and every trust `approve`, so `shoephoned untrust` takes effect without a restart. Test: `untrust_takes_effect_without_restart`.
 
 - [ ] **Step 1:** Tests in `tests/jobs.rs`, with a test runner key generated in the harness:
   - `unsigned_poll_is_401`
@@ -459,6 +460,7 @@ What the page does. Rendering follows spec "Approver changes" and "Apply" step 4
   - `pub fn apply(cfg, job_dir, plan_file: &Path, expected_sha256: &str, resolved) -> Result<(), Failure>`. It re-hashes the plan file (category `plan_changed` on a mismatch) and then runs `apply -json -input=false plan.tfplan`.
   - `Journal` provides `begin(job) -> io::Result<()>` (phase `applying`, written before Terraform starts), `end(job, result)`, and `pending_unknown() -> Option<u64>`, which returns a job journaled `applying` with no `end`.
   - Log pruning: `fn prune_logs(log_dir: &Path, days: u32)`, called at startup.
+  - Pinned context (spec "Protocol rules"): `pub fn context_digest(cfg: &RunnerConfig, project: &ProjectConfig) -> String`, the SHA-256 over the runner's policy version, the terraform binary's hash, every file hash in `plugin_dir`, and the project's config as canonical TOML. It is recorded with the plan and recomputed at claim. A mismatch fails the job with `context_changed` before `apply` runs. Test: `context_change_between_plan_and_claim_is_refused`.
 - [ ] **Step 1:** Tests. The executor runs a **fake terraform**, a shell script at `tests/fixtures/fake-terraform.sh` that records its argv and environment to a file and emits canned `-json` lines. They also run with `bwrap` replaced by a pass-through stub when `SHOEPHONE_TEST_NO_SANDBOX=1`, which only `cfg(test)` code honors.
   - `resolver_output_never_reaches_review_worker`
   - `terraform_env_has_only_resolved_values`
