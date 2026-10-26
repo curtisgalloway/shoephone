@@ -271,6 +271,33 @@ fn lapse_approved(entry: &mut Entry, events: &mut Vec<JobEvent>, now: SystemTime
     true
 }
 
+/// Time out a `Waiting` job whose approval window has closed, dated to when
+/// it lapsed, with a strike as of that moment. Returns whether it did.
+fn lapse_waiting(
+    entry: &mut Entry,
+    events: &mut Vec<JobEvent>,
+    gate: &mut Gate,
+    policy: &Policy,
+    now: SystemTime,
+) -> bool {
+    let JobState::Waiting { since, .. } = &entry.job.state else {
+        return false;
+    };
+    let lapsed = *since + entry.approval_ttl;
+    if lapsed > now {
+        return false;
+    }
+    entry.job.state = JobState::Done(JobResult::TimedOut);
+    events.push(JobEvent::TimedOut {
+        id: entry.job.id,
+        project: entry.job.project.clone(),
+        at: lapsed,
+    });
+    gate.release(Occupant::Job(entry.job.id));
+    gate.strike_at(lapsed, policy);
+    true
+}
+
 /// End a job as `Refused` without striking: the agent did not cause it.
 fn refuse_unstruck(entry: &mut Entry, events: &mut Vec<JobEvent>, now: SystemTime, category: &str) {
     entry.job.state = JobState::Done(JobResult::Refused(Failure {
@@ -547,12 +574,16 @@ impl Jobs {
         &mut self,
         now: SystemTime,
         gate: &mut Gate,
+        policy: &Policy,
         id: u64,
         nonce: &str,
         scope: &JobScope,
     ) -> Result<(), Refusal> {
         let now = self.clamp(now);
         let i = self.index(id).ok_or(Refusal::NoSuchRequest)?;
+        if lapse_waiting(&mut self.entries[i], &mut self.events, gate, policy, now) {
+            return Err(Refusal::NoSuchRequest);
+        }
         let entry = &self.entries[i];
         let JobState::Waiting {
             scope: frozen,
@@ -562,9 +593,6 @@ impl Jobs {
         else {
             return Err(Refusal::NoSuchRequest);
         };
-        if *since + entry.approval_ttl <= now {
-            return Err(Refusal::NoSuchRequest);
-        }
         if !constant_time_eq(nonce.as_bytes(), expected.as_bytes()) {
             return Err(Refusal::NonceMismatch);
         }
@@ -688,7 +716,9 @@ impl Jobs {
             });
             return Ok(());
         };
-        if self.runner_of(&self.entries[i].job.project) != Some(runner) {
+        if self.entries[i].job.project != project
+            || self.runner_of(&self.entries[i].job.project) != Some(runner)
+        {
             return Err(Refusal::WrongRunner);
         }
         let entry = &mut self.entries[i];
@@ -784,21 +814,7 @@ impl Jobs {
             {
                 continue;
             }
-            let JobState::Waiting { since, .. } = &entry.job.state else {
-                continue;
-            };
-            let lapsed = *since + entry.approval_ttl;
-            if lapsed > now {
-                continue;
-            }
-            entry.job.state = JobState::Done(JobResult::TimedOut);
-            self.events.push(JobEvent::TimedOut {
-                id: entry.job.id,
-                project: entry.job.project.clone(),
-                at: lapsed,
-            });
-            gate.release(Occupant::Job(entry.job.id));
-            gate.strike_at(lapsed, policy);
+            lapse_waiting(entry, &mut self.events, gate, policy, now);
         }
     }
 
@@ -959,7 +975,8 @@ mod tests {
             nonce: &str,
             s: &JobScope,
         ) -> Result<(), Refusal> {
-            self.jobs.approve(now, &mut self.gate, id, nonce, s)
+            self.jobs
+                .approve(now, &mut self.gate, &self.policy, id, nonce, s)
         }
 
         fn tick(&mut self, now: SystemTime) {
@@ -1627,36 +1644,30 @@ mod tests {
 
     #[test]
     fn one_runner_serves_two_projects() {
+        // "db" sorts first, so a lookup that takes only the runner's first
+        // project would serve "db" jobs and miss "web" ones.
         let mut projects = BTreeMap::new();
         projects.insert("web".to_owned(), "shared".to_owned());
         projects.insert("db".to_owned(), "shared".to_owned());
         let mut r = Rig::new();
         r.jobs = Jobs::new(projects);
-        r.jobs
-            .request(
-                t(0),
-                &mut r.gate,
-                &r.policy,
-                &mut r.entropy,
-                1,
-                "web",
-                trust_kind(),
-                "why",
-            )
-            .unwrap();
-        r.jobs.kill(t(1), &mut r.gate, &r.policy, "web").unwrap();
-        r.jobs
-            .request(
-                t(2),
-                &mut r.gate,
-                &r.policy,
-                &mut r.entropy,
-                2,
-                "db",
-                trust_kind(),
-                "why",
-            )
-            .unwrap();
+        for (now, id, project) in [(0, 1, "db"), (2, 2, "web")] {
+            r.jobs
+                .request(
+                    t(now),
+                    &mut r.gate,
+                    &r.policy,
+                    &mut r.entropy,
+                    id,
+                    project,
+                    trust_kind(),
+                    "why",
+                )
+                .unwrap();
+            if id == 1 {
+                r.jobs.kill(t(1), &mut r.gate, &r.policy, "db").unwrap();
+            }
+        }
         assert_eq!(
             r.jobs.poll(t(3), &mut r.gate, "shared").map(|j| j.id),
             Some(2)
@@ -1672,6 +1683,45 @@ mod tests {
                 .finish(t(4), "shared", "other", 97, JobResult::OutcomeUnknown),
             Err(Refusal::WrongRunner)
         );
+    }
+
+    #[test]
+    fn finish_for_another_projects_job_is_wrong_runner() {
+        let mut r = Rig::new();
+        let nonce = r.waiting(1, apply_kind(), apply_scope());
+        r.approve(t(3), 1, &nonce, &apply_scope()).unwrap();
+        r.jobs.claim(t(4), "runner-a", 1).unwrap();
+        assert_eq!(
+            r.jobs.finish(t(5), "runner-a", "db", 1, JobResult::Applied),
+            Err(Refusal::WrongRunner)
+        );
+        assert_eq!(r.state(1), JobState::Claimed);
+    }
+
+    #[test]
+    fn approve_past_the_window_expires_the_job_like_tick() {
+        let mut r = Rig::new();
+        let nonce = r.waiting(1, trust_kind(), trust_scope());
+        r.jobs.take_events();
+        assert_eq!(
+            r.approve(t(2) + 7 * MIN, 1, &nonce, &trust_scope()),
+            Err(Refusal::NoSuchRequest)
+        );
+        assert_eq!(r.state(1), JobState::Done(JobResult::TimedOut));
+        assert_eq!(r.gate.busy(), None);
+        assert_eq!(r.gate.strikes, 1);
+        assert_eq!(r.gate.cooldown_until, Some(t(2) + 10 * MIN));
+        assert_eq!(
+            r.jobs.take_events(),
+            vec![JobEvent::TimedOut {
+                id: 1,
+                project: "web".into(),
+                at: t(2) + 5 * MIN,
+            }]
+        );
+        r.tick(t(2) + 8 * MIN);
+        assert!(r.jobs.take_events().is_empty(), "no second event");
+        assert_eq!(r.gate.strikes, 1);
     }
 
     #[test]
