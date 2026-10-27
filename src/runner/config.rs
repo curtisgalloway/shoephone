@@ -61,6 +61,10 @@ pub struct RunnerConfig {
     /// Run with each reference appended as its last argument; the resolved
     /// value is its stdout, trimmed.
     pub secret_command: Vec<String>,
+    /// Names of runner environment variables passed through to
+    /// `secret_command`. It otherwise gets only `PATH=/usr/bin:/bin`.
+    #[serde(default)]
+    pub secret_env: Vec<String>,
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectConfig>,
 }

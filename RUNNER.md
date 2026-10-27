@@ -56,15 +56,17 @@ of the digest. A `.git` directory at the checkout root is ignored.
 
 One TOML file, unknown fields refused. Top level: `name`, `daemon`, `key`,
 `state_dir`, `log_dir`, `log_days` (default 30), `terraform`, `plugin_dir`,
-`bwrap`, `review_user`, `terraform_user`, `secret_command`. Each
+`bwrap`, `review_user`, `terraform_user`, `secret_command`, `secret_env`. Each
 `[projects.<name>]` has `path`, `terraform_version`, `schema_file` (default
 `shoephone-schema.toml`) and the tables `backend_config`, `env` and
 `variables`. Project names match `^[A-Za-z0-9._-]{1,64}$`; paths are
 relative with no `..`.
 
 Every value in those tables is `{ value = "..." }` or `{ secret = "ref" }`.
-`secret_command` is run with the reference appended as its last argument; its
-stdout, trimmed, is the secret. Runner-supplied `variables` must not overlap
+`secret_command` is run with the reference appended as its last argument, in
+an environment holding only `PATH=/usr/bin:/bin` and the runner variables
+named in `secret_env` (default empty), with no stdin and a 30 s limit; its
+stdout, at most 64 KiB with one trailing newline removed, is the secret. Runner-supplied `variables` must not overlap
 the project's schema; that is checked when the project is trusted.
 
 ## State

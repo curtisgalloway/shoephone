@@ -18,6 +18,9 @@ terraform_user = "shoephone-terraform"
 # Run with each reference appended as the last argument; stdout, trimmed,
 # is the secret.
 secret_command = ["/usr/local/bin/secret-tool", "read"]
+# Runner environment variables passed through to secret_command, which
+# otherwise gets only PATH=/usr/bin:/bin.
+secret_env = []
 
 [projects.example]
 path = "infra/example"
