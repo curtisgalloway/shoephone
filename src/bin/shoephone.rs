@@ -878,12 +878,18 @@ fn wait_for_job(opts: &Opts, client: &Client, reply: &JobReply, kind: &str) -> S
     let deadline = Instant::now() + Duration::from_secs(8 * 3600);
     let mut hinted = false;
     let mut failures = 0;
+    // Whether the job got far enough that something may have run: an
+    // approval the runner may have claimed, or a claim.
+    let mut may_have_run = false;
     let done = loop {
         match client.job(reply.id) {
             Ok(job) => {
                 failures = 0;
                 if job.state == "done" {
                     break job;
+                }
+                if matches!(job.state.as_str(), "approved" | "claimed") {
+                    may_have_run = true;
                 }
                 if job.state == "waiting" && !hinted {
                     hinted = true;
@@ -898,6 +904,14 @@ fn wait_for_job(opts: &Opts, client: &Client, reply: &JobReply, kind: &str) -> S
                 http: 404,
                 reply: r,
             }) if r.code == "no_such_job" => {
+                if !may_have_run {
+                    // Never approved here, so nothing ran on its strength.
+                    eprintln!(
+                        "shoephone: the daemon no longer knows job {} (it restarted before the job was approved); nothing ran. Check `shoephone status`, then file it again",
+                        reply.id
+                    );
+                    return Status::RetryUnknown;
+                }
                 eprintln!(
                     "shoephone: the daemon no longer knows job {}; its outcome is unknown. Check the real state before anything else",
                     reply.id
@@ -950,9 +964,21 @@ fn report_job(opts: &Opts, job: &JobStatus) -> Status {
         }
         "refused" => Status::Permanent,
         "plan_failed" => Status::PlanFailed,
+        "apply_failed" if job.kind == "trust" => {
+            eprintln!(
+                "shoephone: the code change was not trusted: the runner could not install it. The previous trust stands"
+            );
+            Status::ApplyFailed
+        }
         "apply_failed" => {
             eprintln!("shoephone: the apply failed part way; check the real state before retrying");
             Status::ApplyFailed
+        }
+        "outcome_unknown" if job.kind == "trust" => {
+            eprintln!(
+                "shoephone: the daemon cannot say whether the code change was trusted. Check `shoephone status` before anything else; do not retry"
+            );
+            Status::OutcomeUnknown
         }
         "outcome_unknown" => {
             eprintln!(

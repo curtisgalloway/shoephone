@@ -485,3 +485,141 @@ fn apply_json_carries_counts_and_changed_variables() {
     assert_eq!(r["changed_variables"], json!(["region"]));
     assert!(!text(&out.stdout).contains("us-east-1"));
 }
+
+/// A scripted daemon: answers a job filing with job 7, and each
+/// `GET /api/job/7` with the next `(status, body)` from `polls`, repeating
+/// the last one.
+fn scripted_daemon(polls: Vec<(u16, serde_json::Value)>) -> String {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        let mut polls = polls.into_iter().peekable();
+        let mut last = (500, json!({}));
+        for sock in listener.incoming() {
+            let mut sock = sock.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 4096];
+            let head = loop {
+                let n = sock.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let t = String::from_utf8_lossy(&raw).into_owned();
+                if let Some(end) = t.find("\r\n\r\n") {
+                    let len = t[..end]
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if raw.len() >= end + 4 + len || n == 0 {
+                        break t[..end].to_string();
+                    }
+                }
+            };
+            let (status, body) = if head.starts_with("POST /api/") {
+                (
+                    200,
+                    json!({ "id": 7, "match_code": "ABCD-EFGH", "expires": 0 }),
+                )
+            } else {
+                if let Some(next) = polls.next() {
+                    last = next;
+                }
+                last.clone()
+            };
+            let body = body.to_string();
+            let _ = write!(
+                sock,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    base
+}
+
+fn job_state(kind: &str, state: &str) -> (u16, serde_json::Value) {
+    (
+        200,
+        json!({ "id": 7, "project": "net", "kind": kind, "state": state }),
+    )
+}
+
+fn forgotten() -> (u16, serde_json::Value) {
+    (
+        404,
+        json!({ "code": "no_such_job", "error": "no job with that id" }),
+    )
+}
+
+fn apply_against(base: &str, name: &str) -> Output {
+    let dir = scratch(name);
+    std::fs::write(dir.join("m.json"), "{}").unwrap();
+    shoephone(
+        &[
+            "apply",
+            "net",
+            "--manifest",
+            "m.json",
+            "--reason",
+            "r",
+            "--daemon",
+            base,
+        ],
+        &dir,
+    )
+    .output()
+    .unwrap()
+}
+
+#[test]
+fn a_job_forgotten_before_its_approval_exits_22() {
+    let base = scripted_daemon(vec![job_state("apply", "working"), forgotten()]);
+    let out = apply_against(&base, "forgotten-early");
+    assert_eq!(out.status.code(), Some(22), "stderr: {}", text(&out.stderr));
+    assert!(!text(&out.stderr).contains("outcome is unknown"));
+}
+
+#[test]
+fn a_job_forgotten_after_its_claim_exits_102() {
+    for state in ["approved", "claimed"] {
+        let base = scripted_daemon(vec![job_state("apply", state), forgotten()]);
+        let out = apply_against(&base, &format!("forgotten-{state}"));
+        assert_eq!(
+            out.status.code(),
+            Some(102),
+            "{state}: {}",
+            text(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn a_failed_trust_is_reported_as_a_trust() {
+    let repo = scratch("trust-failed");
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("main.tf"), "# one\n").unwrap();
+    git(&repo, &["add", "main.tf"]);
+    git(&repo, &["commit", "-q", "-m", "one"]);
+    let done = json!({
+        "id": 7, "project": "net", "kind": "trust", "state": "done",
+        "result": "apply_failed",
+        "failure": { "category": "plan_lost", "addresses": [], "detail": null },
+    });
+    let base = scripted_daemon(vec![(200, done)]);
+    let out = shoephone(&["trust", "net", "--reason", "r", "--daemon", &base], &repo)
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(101),
+        "stderr: {}",
+        text(&out.stderr)
+    );
+    let err = text(&out.stderr);
+    assert!(err.contains("plan_lost"), "{err}");
+    assert!(err.contains("not trusted"), "{err}");
+    assert!(!err.contains("the apply"), "{err}");
+}

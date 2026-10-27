@@ -125,12 +125,12 @@ the archived form, and modules that live in submodules are absent.
 | 11 | a person must act (no open window; the request needs approval) | run `shoephone request <host>` if the task still needs admin |
 | 12 | denied: declined, timed out, or the key does not match the window; for `trust`/`apply` also `killed` | do not retry; the person saw the request and chose |
 | 20 | another request is pending | wait for it; a retry is free |
-| 22 | the daemon answered with an error or nonsense, or the connection failed after the request may have been sent; outcome unknown; for `trust`/`apply` also an unknown result, or no result after the CLI's 8 hour backstop | run `shoephone status` before retrying |
+| 22 | the daemon answered with an error or nonsense, or the connection failed after the request may have been sent; outcome unknown; for `trust`/`apply` also an unknown result, no result after the CLI's 8 hour backstop, or the daemon forgot the job before it was ever approved (nothing ran) | run `shoephone status` before retrying |
 | 23 | cooldown or hourly cap; stderr says until when | come back after that time |
 | 30 | permanent: unknown host or project, a malformed key, a manifest or archive the runner or daemon refused | the request itself must change; stderr names the category |
 | 100 | `plan_failed`: the Terraform plan failed; nothing was applied | read the category on stderr, fix the code or manifest, then file again |
-| 101 | `apply_failed`: the apply started and failed; infrastructure may be partly changed | check the real state; do not blindly file the same apply again |
-| 102 | `outcome_unknown`: the runner cannot say whether the apply took effect, or the daemon no longer knows the job (pruned, or the daemon restarted) | check the real state before anything else; do not retry |
+| 101 | `apply_failed`: the apply started and failed; infrastructure may be partly changed. For `trust`, the runner could not install the change and the previous trust stands | check the real state; do not blindly file the same apply again |
+| 102 | `outcome_unknown`: the runner cannot say whether the apply took effect, or the daemon no longer knows a job it had approved (it restarted) | check the real state before anything else; do not retry |
 
 ## Output
 
