@@ -940,7 +940,13 @@ async fn apply_manifests_must_be_json_objects() {
     rig.poll().await;
 
     let (mut scope, mut display) = apply_pair("net", &["create a.b"], [1, 0, 0, 0], false);
-    for text in ["plain text", "[1]", "null"] {
+    for text in [
+        "plain text",
+        "[1]",
+        "null",
+        r#"{"a":1,"a":2}"#,
+        r#"{"a":{"b":1,"b":2}}"#,
+    ] {
         scope["manifest"] = json!(sha256_hex(text));
         display["manifest"] = json!(text);
         let reply = submit(&rig, id, scope.clone(), display.clone()).await;

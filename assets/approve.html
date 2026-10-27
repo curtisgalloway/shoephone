@@ -137,9 +137,9 @@ async function refresh() {
     const p = s.pending;
     $('scope').textContent = `admin on ${p.host} until ${when(p.ends_at)}`;
     $('match').textContent = p.match_code;
-    $('reason').textContent = p.reason;
+    $('reason').textContent = visible(p.reason);
     setLink($('context'), p.context);
-    $('requester').textContent = p.requester || '(unnamed)';
+    $('requester').textContent = visible(p.requester || '(unnamed)');
     $('fingerprint').textContent = p.fingerprint;
     $('principal').textContent = p.principal;
     $('expires').textContent = `request expires ${when(p.expires)}`;
@@ -220,17 +220,21 @@ const MISMATCH = "the daemon's challenge does not match the request on screen";
 const OBLIGATION = 'For every manifest the schema accepts, protected credentials may reach only their provider authentication and the approved destinations, and nothing the agent can see (results, addresses, which actions run) may reveal them.';
 const ACTIONS = ['create', 'update', 'replace', 'delete'];
 const BAD_ADDRESS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
-const HIDDEN_ANY = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
-const HIDDEN_KEEP_LINES = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+const HIDDEN_ANY = /[\\\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069\u061c\u200b\u2060\ufeff\u00ad\u{e0000}-\u{e007f}]/gu;
+const HIDDEN_KEEP_LINES = /[\\\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069\u061c\u200b\u2060\ufeff\u00ad\u{e0000}-\u{e007f}]/gu;
 const SLUG = /^[A-Za-z0-9._-]{1,64}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
 
-// Shows control, line-separator and bidirectional characters as \uXXXX so
-// they cannot reorder or hide what the approver reads. keepLines leaves
-// newline and tab alone, for a multi-line block.
-function visible(text, keepLines) {
-  return String(text).replace(keepLines ? HIDDEN_KEEP_LINES : HIDDEN_ANY,
-    c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+// Shows control, zero-width, line-separator, bidirectional and tag characters
+// as \uXXXX, and a literal backslash as two, so no text can pass for an
+// escape. keepLines leaves newline and tab alone, for a multi-line block.
+// keepBackslash is for JSON text, whose backslashes are already escapes.
+function visible(text, keepLines, keepBackslash) {
+  return String(text).replace(keepLines ? HIDDEN_KEEP_LINES : HIDDEN_ANY, c => {
+    if (c === '\\') return keepBackslash ? c : '\\\\';
+    const n = c.codePointAt(0).toString(16).padStart(4, '0');
+    return n.length > 4 ? '\\u{' + n + '}' : '\\u' + n;
+  });
 }
 
 async function sha256Hex(text) {
@@ -301,7 +305,11 @@ function assertNumbersExact(text) {
         if (BigInt(Number(tok)) !== BigInt(tok)) throw new Error('number not exact: ' + tok);
       } else {
         const digits = tok.replace(/[eE].*$/, '').replace(/[-.]/g, '').replace(/^0+/, '').replace(/0+$/, '');
-        if (digits.length > 15) throw new Error('number not exact: ' + tok);
+        const n = Number(tok);
+        if (digits.length > 15 || !Number.isFinite(n) || (n === 0 && digits.length > 0) ||
+            (n !== 0 && Math.abs(n) < 2.2250738585072014e-308)) {
+          throw new Error('number not exact: ' + tok);
+        }
       }
       i += tok.length;
     } else {
@@ -310,9 +318,55 @@ function assertNumbersExact(text) {
   }
 }
 
+// Throws on a duplicate key at any level of valid JSON text; JSON.parse would
+// silently keep the last one.
+function assertNoDuplicateKeys(text) {
+  let i = 0;
+  const ws = () => { while (i < text.length && ' \t\n\r'.includes(text[i])) i += 1; };
+  const str = () => {
+    const start = i;
+    i += 1;
+    while (text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
+    i += 1;
+    return JSON.parse(text.slice(start, i));
+  };
+  const val = () => {
+    ws();
+    const c = text[i];
+    if (c === '{') {
+      i += 1; ws();
+      if (text[i] === '}') { i += 1; return; }
+      const seen = new Set();
+      for (;;) {
+        ws();
+        const k = str();
+        if (seen.has(k)) throw new Error('duplicate key');
+        seen.add(k);
+        ws(); i += 1; val(); ws();
+        if (text[i] === ',') { i += 1; continue; }
+        i += 1; return;
+      }
+    } else if (c === '[') {
+      i += 1; ws();
+      if (text[i] === ']') { i += 1; return; }
+      for (;;) {
+        val(); ws();
+        if (text[i] === ',') { i += 1; continue; }
+        i += 1; return;
+      }
+    } else if (c === '"') {
+      str();
+    } else {
+      while (i < text.length && !',]} \t\n\r'.includes(text[i])) i += 1;
+    }
+  };
+  val();
+}
+
 function parseManifest(text) {
   assertNumbersExact(text);
   const v = JSON.parse(text);
+  assertNoDuplicateKeys(text);
   if (v === null || typeof v !== 'object' || Array.isArray(v)) throw new Error('manifest is not an object');
   return v;
 }
@@ -406,9 +460,9 @@ function setLink(a, url) {
   if (ok) a.href = url;
 }
 
-function el(tag, text, cls) {
+function el(tag, text, cls, escaped) {
   const e = document.createElement(tag);
-  if (text !== undefined) e.textContent = visible(text);
+  if (text !== undefined) e.textContent = escaped ? text : visible(text);
   if (cls) e.className = cls;
   return e;
 }
@@ -429,7 +483,7 @@ function kv(pairs) {
 }
 function lineList(items) {
   const ul = el('ul');
-  for (const [text, cls] of items) ul.append(el('li', text, cls));
+  for (const [text, cls, escaped] of items) ul.append(el('li', text, cls, escaped));
   return ul;
 }
 
@@ -452,6 +506,18 @@ function renderTrust(j) {
   return nodes;
 }
 
+// The variable diff as display lines, already escaped: keys escape every
+// backslash, while JSON values keep theirs (they are JSON escapes already).
+function variableRows(v) {
+  const k = x => visible(x.key);
+  const j = t => visible(t, false, true);
+  const rows = [];
+  for (const x of v.added) rows.push('+ ' + k(x) + ' = ' + j(x.new));
+  for (const x of v.removed) rows.push('- ' + k(x) + ' (was ' + j(x.old) + ')');
+  for (const x of v.changed) rows.push('~ ' + k(x) + ': ' + j(x.old) + ' -> ' + j(x.new));
+  return rows;
+}
+
 function renderApply(j) {
   const s = j.scope, d = j.display;
   const nodes = [];
@@ -459,10 +525,7 @@ function renderApply(j) {
   if (s.baseline_status === 'uncertain') nodes.push(el('p', 'last apply did not finish cleanly; this diff may be incomplete', 'warn'));
   try {
     const v = variableDiff(d.baseline_manifest ?? null, d.manifest);
-    const rows = [];
-    for (const x of v.added) rows.push(['+ ' + x.key + ' = ' + x.new]);
-    for (const x of v.removed) rows.push(['- ' + x.key + ' (was ' + x.old + ')']);
-    for (const x of v.changed) rows.push(['~ ' + x.key + ': ' + x.old + ' -> ' + x.new]);
+    const rows = variableRows(v).map(t => [t, undefined, true]);
     nodes.push(section('variables', rows.length ? lineList(rows) : el('p', 'no variable changes', 'muted')));
   } catch (e) {
     nodes.push(el('p', 'The manifest is missing or malformed. Do not approve.', 'warn'));
@@ -515,6 +578,10 @@ function showJob(j) {
   try { body.push(...(trust ? renderTrust(j) : renderApply(j))); }
   catch (e) { body.push(el('p', 'This request cannot be displayed. Do not approve.', 'warn')); }
   $('jobbody').replaceChildren(...body);
+  $('jobapprove').disabled = $('jobdecline').disabled = true;
+  setTimeout(() => {
+    if (shownJob && shownJob.key === key && !busy) $('jobapprove').disabled = $('jobdecline').disabled = false;
+  }, 1500);
   if (navigator.vibrate) navigator.vibrate(60);
 }
 

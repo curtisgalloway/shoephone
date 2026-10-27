@@ -1875,13 +1875,64 @@ fn parse_address_text(text: &str) -> Option<Vec<(Action, String)>> {
     (scope::address_text(&changes).as_deref() == Some(text)).then_some(changes)
 }
 
-/// True when `text` parses as a JSON object, which the approve page needs in
-/// order to list the variable changes.
+/// A JSON value that deserializes only when no object in it repeats a key.
+/// `serde_json::Value` keeps the last duplicate, which would let the approve
+/// page and the runner read different values.
+struct NoDuplicateKeys;
+
+impl<'de> serde::Deserialize<'de> for NoDuplicateKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = NoDuplicateKeys;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("JSON with no duplicate keys")
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<NoDuplicateKeys>()?.is_some() {}
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut seen = std::collections::HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key) {
+                        return Err(serde::de::Error::custom("duplicate key"));
+                    }
+                    map.next_value::<NoDuplicateKeys>()?;
+                }
+                Ok(NoDuplicateKeys)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// True when `text` parses as a JSON object with no duplicate key at any
+/// level, which the approve page needs in order to list the variable changes.
 fn is_json_object(text: &str) -> bool {
     matches!(
         serde_json::from_str::<serde_json::Value>(text),
         Ok(serde_json::Value::Object(_))
-    )
+    ) && serde_json::from_str::<NoDuplicateKeys>(text).is_ok()
 }
 
 /// Check every digest in a submitted scope against the text the approver

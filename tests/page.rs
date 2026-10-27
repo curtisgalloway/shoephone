@@ -161,6 +161,50 @@ const withChallenge = async (job, bytes) => {
   j = {id: 9, kind: 'apply', project: 'p', nonce: 'n4', scope: {kind: 'apply', ...emptyScope}, display: {manifest: next, baseline_manifest: base, address_text: ''}};
   assert.ok(await verifyJob(await withChallenge(j, applyBytes(j.scope, j.nonce))), 'empty change list is consistent');
 
+  assert.throws(() => variableDiff('{"a":0}', '{"a":1e-400}'));
+  assert.throws(() => variableDiff(null, '{"a":1e400}'));
+  assert.throws(() => variableDiff(null, '{"a":1e-310}'));
+  assert.throws(() => variableDiff('{"a":0}', '{"a":-1e-400}'));
+  assert.equal(variableDiff('{"a":0.0}', '{"a":1.5e3}').changed.length, 1);
+  assert.equal(variableDiff('{"a":0}', '{"a":0.0e5}').changed.length, 0);
+
+  const bs = String.fromCharCode(92);
+  assert.equal(visible(bs + 'u202e'), bs + bs + 'u202e', 'a literal backslash is escaped');
+  assert.equal(visible(bs + 'u202e', false, true), bs + 'u202e');
+  const hidden = [0x61c, 0x200b, 0x2060, 0xfeff, 0xad].map(c => String.fromCharCode(c)).join('') + String.fromCodePoint(0xe0001, 0xe007f);
+  assert.equal(visible(hidden), bs + 'u061c' + bs + 'u200b' + bs + 'u2060' + bs + 'ufeff' + bs + 'u00ad' + bs + 'u{e0001}' + bs + 'u{e007f}');
+  const rows = variableRows(variableDiff('{"k":"a' + bs + bs + 'b"}', '{"k' + bs + 'u202e":"v' + bs + '"q"}'.replace(bs + '"', bs + '"')));
+  assert.deepEqual(rows[0], '+ k' + bs + 'u202e = "v' + bs + '"q"', 'a real U+202E key shows as one escape');
+  const lit = variableRows(variableDiff(null, '{"k' + bs + bs + 'u202e":1}'));
+  assert.equal(lit[0], '+ k' + bs + bs + 'u202e = 1', 'typed backslash-u text is told apart from the real character');
+  const one = variableRows(variableDiff('{"k":"x"}', '{"k":"a' + bs + bs + 'b"}'));
+  assert.equal(one[0], '~ k: "x" -> "a' + bs + bs + 'b"', 'JSON values are not escaped twice');
+
+  assert.throws(() => variableDiff(null, '{"a":1,"a":2}'));
+  assert.throws(() => variableDiff(null, '{"a":{"b":1,"c":[{"d":1,"d":2}]}}'));
+  assert.throws(() => variableDiff('{"a":1,"a":1}', '{"a":1}'));
+  assert.equal(variableDiff(null, '{"a":{"b":1},"c":{"b":2},"s":"{\\"x\\":1,\\"x\\":2}"}').added.length, 3);
+  j = {id: 10, kind: 'apply', project: 'p', nonce: 'n5', scope: {kind: 'apply', ...scope}, display: {manifest: '{"b":1,"b":1}', baseline_manifest: base, address_text: text}};
+  j.scope.manifest = await sha('{"b":1,"b":1}');
+  await refused(await withChallenge(j, applyBytes(j.scope, j.nonce)), 'duplicate key in manifest');
+
+  const timers = [];
+  globalThis.setTimeout = fn => { timers.push(fn); return 0; };
+  showJob(null);
+  const first = await mkApply();
+  showJob(first);
+  assert.equal(els.jobapprove.disabled, true, 'buttons are held right after a render');
+  assert.equal(els.jobdecline.disabled, true);
+  timers.shift()();
+  assert.equal(els.jobapprove.disabled, false, 'and released after the hold');
+  const changed = await mkApply();
+  changed.display.address_text = 'create z\n';
+  showJob(changed);
+  assert.equal(els.jobapprove.disabled, true, 'a content change holds them again');
+  timers.shift()();
+  assert.equal(els.jobapprove.disabled, false);
+  timers.length = 0;
+
   const shown = await mkApply();
   const later = await mkApply();
   later.display.manifest = '{"b":"z"}';
