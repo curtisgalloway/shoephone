@@ -53,7 +53,11 @@ webauthn-rs = { version = "0.5.5", features = [
     # the daemon reads to refuse synced passkeys.
     "danger-credential-internals",
 ] }
+tar = { version = "0.4.46", default-features = false }
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+hcl-rs = { version = "0.19.9", default-features = false }
 
 [dev-dependencies]
 ring = "0.17.14"
 shoephone = { path = ".", features = ["test-hooks"] }
+tempfile = "3.27.0"
