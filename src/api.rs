@@ -400,6 +400,10 @@ pub struct DisplayWire {
     /// They are not part of the signed scope and not in the ledger.
     #[serde(default)]
     pub warnings: Vec<WarningView>,
+    /// A trust: how many warnings the runner cut to stay within
+    /// [`MAX_WARNINGS`]. Non-zero only with exactly that many present.
+    #[serde(default)]
+    pub warnings_omitted: u32,
 }
 
 /// One reviewer warning as the approver sees it. `kind` is one of

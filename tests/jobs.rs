@@ -942,6 +942,30 @@ async fn trust_warnings_are_checked_field_by_field() {
             "{w}"
         );
     }
+    let steer = |variable: serde_json::Value, into: serde_json::Value, kind: &str| {
+        ok(json!({"kind": kind, "variable": variable, "into": into}))
+    };
+    for w in [
+        steer(json!("v"), json!(null), "schema_variable_steers"),
+        steer(json!(null), json!("count"), "schema_variable_steers"),
+        steer(json!(null), json!(null), "schema_variable_steers"),
+        steer(json!("v"), json!("count"), "provisioner"),
+        steer(json!("v"), json!(null), "import"),
+        steer(json!(null), json!("count"), "import"),
+    ] {
+        let mut display = good.clone();
+        display["warnings"] = json!([w]);
+        let reply = submit(&rig, id, scope.clone(), display).await;
+        assert_eq!(
+            (reply.http, reply.code().as_str()),
+            (400, "inconsistent_scope"),
+            "{w}"
+        );
+    }
+    let mut display = good.clone();
+    display["warnings"] = json!([ok(json!({})), ok(json!({}))]);
+    display["warnings_omitted"] = json!(3);
+    assert_eq!(submit(&rig, id, scope.clone(), display).await.http, 400);
     let mut display = good.clone();
     display["warnings"] = json!(many);
     let reply = submit(&rig, id, scope.clone(), display).await;
@@ -958,6 +982,7 @@ async fn trust_warnings_are_checked_field_by_field() {
         "kind": "schema_variable_steers", "variable": "_r1", "into": "for_each", "file": "a".repeat(255)
     }));
     display["warnings"] = json!(all);
+    display["warnings_omitted"] = json!(50);
     assert_eq!(submit(&rig, id, scope, display).await.http, 200);
 }
 
@@ -971,12 +996,16 @@ async fn apply_display_with_warnings_is_refused() {
     let id = file_apply(&client, "net").await;
     rig.poll().await;
     let (scope, mut display) = apply_pair("net", &["create a.b"], [1, 0, 0, 0], false);
+    let mut omitted = display.clone();
+    omitted["warnings_omitted"] = json!(1);
     display["warnings"] = json!([{"kind": "provisioner", "file": "a.tf", "line": 1}]);
-    let reply = submit(&rig, id, scope, display).await;
-    assert_eq!(
-        (reply.http, reply.code().as_str()),
-        (400, "inconsistent_scope")
-    );
+    for d in [display, omitted] {
+        let reply = submit(&rig, id, scope.clone(), d).await;
+        assert_eq!(
+            (reply.http, reply.code().as_str()),
+            (400, "inconsistent_scope")
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -516,10 +516,11 @@ function warningLine(w) {
   return label + ' ' + String(w.file) + ':' + String(w.line);
 }
 // Advisory only: the runner's review warnings are not in the signed bytes.
-function warningsSection(list) {
+function warningsSection(list, omitted) {
   const items = Array.isArray(list) ? list : [];
-  return section('Runner warnings (not covered by your signature)',
-    items.length ? lineList(items.map(w => [warningLine(w)])) : el('p', 'No warnings', 'muted'));
+  const nodes = [items.length ? lineList(items.map(w => [warningLine(w)])) : el('p', 'No warnings', 'muted')];
+  if (Number.isInteger(omitted) && omitted > 0) nodes.push(el('p', omitted + ' more warnings not shown', 'muted'));
+  return section('Runner warnings (not covered by your signature)', ...nodes);
 }
 
 function renderTrust(j) {
@@ -529,7 +530,7 @@ function renderTrust(j) {
     ['files changed', String(s.files_changed)], ['lines added', String(s.lines_added)],
     ['lines removed', String(s.lines_removed)], ['schema changed', s.schema_changed ? 'yes' : 'no'],
   ]));
-  nodes.push(warningsSection(d.warnings));
+  nodes.push(warningsSection(d.warnings, d.warnings_omitted));
   if (d.external) {
     nodes.push(el('p', 'This diff is too large to show here. Run this command against your own clean exports of both revisions (git worktree add, or git archive | tar x; no .terraform directory, no untracked files). It must print the candidate digest and the diff digest below, and both must match.', 'warn'));
     nodes.push(section('verification command', block(verifyCommand(s))));

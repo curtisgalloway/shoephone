@@ -344,6 +344,9 @@ const withChallenge = async (job, bytes) => {
     const i = out.findIndex(t => t.startsWith(header));
     assert.ok(i > 0 && out[i].endsWith('No warnings'), JSON.stringify(display));
   }
+  const more = await rendered({diff, warnings: [w('import')], warnings_omitted: 50});
+  assert.ok(more.find(t => t.startsWith(header)).endsWith('50 more warnings not shown'));
+  assert.ok(!withDiff[wi].includes('more warnings'));
   const hostileOut = await rendered({diff, warnings: [w('provisioner', {file: 'a' + bidi + 'b.tf'}), w('bogus<b>')]});
   const hi = hostileOut.find(t => t.startsWith(header));
   assert.ok(hi.includes('a\\u202eb.tf') && !hi.includes(bidi), 'hidden characters are escaped');

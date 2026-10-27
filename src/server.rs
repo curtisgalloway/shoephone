@@ -1938,9 +1938,12 @@ fn is_json_object(text: &str) -> bool {
 /// Check the reviewer warnings a trust display carries. They are shown to the
 /// approver but signed over by nothing, so each field is held to the rules for
 /// text the approver reads: a fixed kind, a clean path, a plain identifier.
-fn check_warnings(warnings: &[WarningView]) -> Result<(), Fail> {
+fn check_warnings(warnings: &[WarningView], omitted: u32) -> Result<(), Fail> {
     if warnings.len() > MAX_WARNINGS {
         return Err(inconsistent("a trust display carries too many warnings"));
+    }
+    if omitted > 0 && warnings.len() != MAX_WARNINGS {
+        return Err(inconsistent("warnings were omitted below the limit"));
     }
     for w in warnings {
         if !WARNING_KINDS.contains(&w.kind.as_str()) {
@@ -1959,6 +1962,12 @@ fn check_warnings(warnings: &[WarningView]) -> Result<(), Fail> {
                 && b.iter()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
         };
+        let steers = w.kind == "schema_variable_steers";
+        if steers != (w.variable.is_some() && w.into.is_some())
+            || (!steers && (w.variable.is_some() || w.into.is_some()))
+        {
+            return Err(inconsistent("a warning has the wrong variable fields"));
+        }
         if w.variable.as_deref().is_some_and(|v| !identifier(v)) {
             return Err(inconsistent("a warning has an unusable variable name"));
         }
@@ -1983,7 +1992,7 @@ fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), 
             {
                 return Err(inconsistent("a trust display carries apply-only fields"));
             }
-            check_warnings(&display.warnings)?;
+            check_warnings(&display.warnings, display.warnings_omitted)?;
             if display.external {
                 if display.diff.is_some() {
                     return Err(inconsistent(
@@ -2015,6 +2024,7 @@ fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), 
                 || display.external
                 || display.verify_command.is_some()
                 || !display.warnings.is_empty()
+                || display.warnings_omitted != 0
             {
                 return Err(inconsistent("an apply display carries trust-only fields"));
             }

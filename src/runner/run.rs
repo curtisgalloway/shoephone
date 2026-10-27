@@ -45,8 +45,8 @@ use serde::{Deserialize, Serialize};
 use ssh_key::PrivateKey;
 
 use crate::api::{
-    ApplyScopeWire, CountsWire, DisplayWire, FailureView, FinishBody, JobScopeWire, RefuseBody,
-    RunnerJob, SubmitBody, TrustScopeWire, WarningView,
+    ApplyScopeWire, CountsWire, DisplayWire, FailureView, FinishBody, JobScopeWire, MAX_WARNINGS,
+    RefuseBody, RunnerJob, SubmitBody, TrustScopeWire, WarningView,
 };
 use crate::client::Error;
 use crate::exit::Status;
@@ -195,6 +195,26 @@ struct ReviewFile {
 #[derive(Debug, Serialize, Deserialize)]
 struct InstallMarker {
     had_old: bool,
+}
+
+/// The warnings to show: duplicates collapsed, sorted by file and line, and
+/// cut to the daemon's limit. Advisory warnings must never block a trust, so
+/// the surplus is counted, not sent.
+fn display_warnings(warnings: &[Warning]) -> (Vec<WarningView>, u32) {
+    let mut views: Vec<WarningView> = warnings.iter().map(Warning::view).collect();
+    views.sort_by(|a, b| {
+        (&a.file, a.line, &a.kind, &a.variable, &a.into).cmp(&(
+            &b.file,
+            b.line,
+            &b.kind,
+            &b.variable,
+            &b.into,
+        ))
+    });
+    views.dedup();
+    let omitted = views.len().saturating_sub(MAX_WARNINGS);
+    views.truncate(MAX_WARNINGS);
+    (views, u32::try_from(omitted).unwrap_or(u32::MAX))
 }
 
 /// The poll loop's state. [`run`] drives it; the tests drive
@@ -1020,7 +1040,7 @@ impl Runner {
         let (root, _) = root.map_err(|_| inconsistent())?;
         // The approver is shown root's own warnings. The worker's list is
         // only logged; a forged one changes nothing that is sent.
-        let warnings: Vec<WarningView> = root.warnings.iter().map(Warning::view).collect();
+        let (warnings, warnings_omitted) = display_warnings(&root.warnings);
         let display_ok = match (&review.diff, &root.diff) {
             (Some(text), Some(_)) => sha256_hex(text) == root.scope.diff,
             (None, None) => review.verify_command.as_deref() == Some(root.verify_command.as_str()),
@@ -1040,12 +1060,14 @@ impl Runner {
             Some(diff) => DisplayWire {
                 diff: Some(diff),
                 warnings,
+                warnings_omitted,
                 ..DisplayWire::default()
             },
             None => DisplayWire {
                 external: true,
                 verify_command: review.verify_command,
                 warnings,
+                warnings_omitted,
                 ..DisplayWire::default()
             },
         };
@@ -1380,6 +1402,40 @@ pub fn run(cfg: RunnerConfig) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn provisioner(file: &str, line: u32) -> Warning {
+        Warning::Provisioner {
+            file: file.into(),
+            line,
+        }
+    }
+
+    #[test]
+    fn display_warnings_cut_at_the_limit_and_count_the_rest() {
+        let many: Vec<Warning> = (0..250).map(|i| provisioner("a.tf", i)).collect();
+        let (sent, omitted) = display_warnings(&many);
+        assert_eq!((sent.len(), omitted), (200, 50));
+        assert_eq!(sent[0].line, 0);
+        assert_eq!(sent[199].line, 199);
+    }
+
+    #[test]
+    fn display_warnings_collapse_duplicates_and_sort() {
+        let same: Vec<Warning> = (0..200).map(|_| provisioner("a.tf", 1)).collect();
+        assert_eq!(
+            display_warnings(&same),
+            (vec![provisioner("a.tf", 1).view()], 0)
+        );
+        let mixed = [
+            provisioner("b.tf", 1),
+            provisioner("a.tf", 9),
+            provisioner("a.tf", 2),
+        ];
+        let (sent, omitted) = display_warnings(&mixed);
+        let order: Vec<_> = sent.iter().map(|w| (w.file.as_str(), w.line)).collect();
+        assert_eq!(order, [("a.tf", 2), ("a.tf", 9), ("b.tf", 1)]);
+        assert_eq!(omitted, 0);
+    }
 
     #[test]
     fn under_joins_relative_components() {
