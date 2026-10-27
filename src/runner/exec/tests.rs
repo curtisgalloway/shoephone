@@ -303,6 +303,9 @@ fn reserved_and_malformed_names_are_refused() {
         "TF_LOG_PATH",
         "TF_LOG_CORE",
         "TF_LOG_PROVIDER",
+        "TF_LOG_SDK",
+        "TF_LOG_SDK_PROTO",
+        "TF_LOG_SDK_PROTO_DATA_DIR",
         "TF_PLUGIN_CACHE_DIR",
         "TF_DATA_DIR",
         "A=B",
@@ -831,6 +834,18 @@ fn stdout_kept_in_memory_is_capped() {
 }
 
 #[test]
+fn plan_fd_is_moved_above_stdio() {
+    let fx = fixture();
+    fs::write(fx.path("p"), b"x").unwrap();
+    let f = fs::File::open(fx.path("p")).unwrap();
+    let dup = fd_above_stdio(&f).unwrap();
+    assert!(dup.as_raw_fd() > 2);
+    // SAFETY: F_GETFD on a descriptor we own.
+    let flags = unsafe { libc::fcntl(dup.as_raw_fd(), libc::F_GETFD) };
+    assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+}
+
+#[test]
 fn bwrap_version_gates_disable_userns() {
     use super::sandbox::version_has_disable_userns as has;
     assert!(has("bubblewrap 0.8.0"));
@@ -948,7 +963,7 @@ fn bwrap_hides_runner_secrets() {
     let dir = fx.job_dir();
     fs::write(dir.join("visible.txt"), b"job file").unwrap();
     fs::write(fx.path("runner.toml"), b"name = \"runner-1\"\n").unwrap();
-    let run = |path: &Path| {
+    let run_with = |path: &Path, plan_fd: Option<std::os::fd::RawFd>| {
         let out = command(
             &fx.cfg,
             Launch::BwrapAsSelf,
@@ -956,7 +971,7 @@ fn bwrap_hides_runner_secrets() {
             Path::new("/usr/bin/cat"),
             &[path.as_os_str().to_owned()],
             &[],
-            None,
+            plan_fd,
         )
         .output()
         .unwrap();
@@ -968,6 +983,7 @@ fn bwrap_hides_runner_secrets() {
         );
         out
     };
+    let run = |path: &Path| run_with(path, None);
     let visible = run(&dir.join("visible.txt"));
     assert!(visible.status.success(), "positive control failed");
     assert_eq!(visible.stdout, b"job file");
@@ -975,4 +991,17 @@ fn bwrap_hides_runner_secrets() {
         let out = run(&hidden);
         assert!(!out.status.success(), "{} is visible", hidden.display());
     }
+
+    // The verified plan is what the sandbox sees at job_dir/plan.tfplan,
+    // whatever terraform_user left in the job directory.
+    let verified_bytes = b"verified plan bytes".to_vec();
+    let copy = fx.path("state/verified.tfplan");
+    fs::write(&copy, &verified_bytes).unwrap();
+    fs::write(dir.join(PLAN_FILE), b"evil plan").unwrap();
+    let sha = sha256_file(&copy);
+    let verified = open_verified(&copy, &sha).unwrap();
+    let fd = fd_above_stdio(&verified).unwrap();
+    let out = run_with(&dir.join(PLAN_FILE), Some(fd.as_raw_fd()));
+    assert!(out.status.success());
+    assert_eq!(out.stdout, verified_bytes);
 }

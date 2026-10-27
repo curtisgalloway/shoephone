@@ -33,7 +33,29 @@ use shoephone::grant::Entropy;
 use shoephone::server::Daemon;
 use shoephone::store::{self, EnrollCode, Store};
 
+/// Set only by this repository's tests.
+const ALLOW_TEST_HOOKS: &str = "SHOEPHONED_ALLOW_TEST_HOOKS";
+
+/// A build with `test-hooks` serves `POST /api/test/approve`, which opens
+/// a window with no security key, so it refuses to start unless a test
+/// says otherwise.
+fn test_hooks_refusal() -> Option<Status> {
+    let allowed = std::env::var_os(ALLOW_TEST_HOOKS).is_some_and(|v| v == "1");
+    if cfg!(feature = "test-hooks") && !allowed {
+        eprintln!(
+            "shoephoned: this build has the test-hooks feature, which serves an approval \
+             endpoint needing no security key; refusing to start. Build without --features \
+             test-hooks."
+        );
+        return Some(Status::Precondition);
+    }
+    None
+}
+
 fn main() -> ExitCode {
+    if let Some(status) = test_hooks_refusal() {
+        return status.into();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("shoephoned {VERSION}");

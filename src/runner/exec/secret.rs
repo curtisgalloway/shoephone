@@ -22,19 +22,17 @@ const SECRET_PATH: &str = "/usr/bin:/bin";
 
 /// Names a project's `env` may not set: the executor sets them, or they
 /// would change where Terraform reads config or writes logs.
-const RESERVED_ENV: [&str; 10] = [
+const RESERVED_ENV: [&str; 6] = [
     "HOME",
     "TF_IN_AUTOMATION",
     "TF_INPUT",
     "TF_CLI_CONFIG_FILE",
-    "TF_LOG",
-    "TF_LOG_PATH",
-    "TF_LOG_CORE",
-    "TF_LOG_PROVIDER",
     "TF_PLUGIN_CACHE_DIR",
     "TF_DATA_DIR",
 ];
-const RESERVED_ENV_PREFIXES: [&str; 2] = ["TF_CLI_ARGS", "TF_VAR_"];
+/// Every `TF_LOG*` (including the provider SDK's `TF_LOG_SDK*`), every
+/// `TF_CLI_ARGS*` and every `TF_VAR_*`.
+const RESERVED_ENV_PREFIXES: [&str; 3] = ["TF_CLI_ARGS", "TF_VAR_", "TF_LOG"];
 
 /// A resolved value. `Debug` prints `[redacted]`; there is no `Display`
 /// and no `Serialize`, so a value leaves only through [`Secret::expose`].

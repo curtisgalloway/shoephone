@@ -34,7 +34,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -233,6 +233,9 @@ fn run(
     let mut log =
         open_log(&cfg.log_dir, job.project, job.id).map_err(|_| refuse("log_unavailable"))?;
     writeln!(log, "== terraform {}", args.join(" ")).map_err(|_| refuse("log_unavailable"))?;
+    let plan_fd = plan
+        .map(|f| fd_above_stdio(f).map_err(|_| refuse("plan_unreadable")))
+        .transpose()?;
     let env = terraform_env(cfg, job, resolved);
     let cmd = command(
         cfg,
@@ -241,10 +244,24 @@ fn run(
         &cfg.terraform,
         &argv,
         &env,
-        plan.map(|f| f.as_raw_fd()),
+        plan_fd.as_ref().map(|f| f.as_raw_fd()),
     );
     drop(env);
     run_streaming(cmd, &mut log, timeout)
+}
+
+/// A close-on-exec duplicate of `f` numbered 3 or above. If the runner
+/// started with one of fds 0-2 closed, the plan could otherwise sit on a
+/// standard stream number, which the child's stdio setup would replace.
+fn fd_above_stdio(f: &File) -> io::Result<OwnedFd> {
+    // SAFETY: fcntl on a descriptor we hold open; the result is a new
+    // descriptor that nothing else owns.
+    let fd = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fd was just created and is owned only here.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(any(test, feature = "test-hooks"))]

@@ -383,7 +383,9 @@ pub(super) fn run_streaming(
         match rx.recv_timeout(left) {
             Ok((is_stdout, Some(chunk))) => {
                 log_ok = log_ok && log.write_all(&chunk).is_ok();
-                if is_stdout {
+                // Once one chunk is dropped, keep none after it, so the
+                // kept text is a prefix of the stream with no gap.
+                if is_stdout && !truncated {
                     if stdout.len() + chunk.len() <= MAX_STDOUT_BYTES {
                         stdout.extend_from_slice(&chunk);
                     } else {
