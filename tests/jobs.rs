@@ -946,6 +946,9 @@ async fn apply_manifests_must_be_json_objects() {
         "null",
         r#"{"a":1,"a":2}"#,
         r#"{"a":{"b":1,"b":2}}"#,
+        r#"{"a":1,"\u0061":2}"#,
+        r#"{"\u0061":1,"a":2}"#,
+        r#"{"x":{"b\u00e9":1,"b\u00E9":2}}"#,
     ] {
         scope["manifest"] = json!(sha256_hex(text));
         display["manifest"] = json!(text);

@@ -147,8 +147,12 @@ const withChallenge = async (job, bytes) => {
   assert.equal(visible('x\ny', true), 'x\ny');
   assert.equal(visible('x\ny'), 'x\\u000ay');
 
-  assert.throws(() => variableDiff('{"a":9007199254740992}', '{"a":9007199254740993}'));
-  assert.throws(() => variableDiff(null, '{"a":[1.2345678901234567890]}'));
+  const big = variableDiff('{"a":9007199254740992}', '{"a":9007199254740993}');
+  assert.deepEqual(big.changed, [{key: 'a', old: '9007199254740992', new: '9007199254740993'}], 'integers a double cannot tell apart');
+  assert.equal(variableDiff(null, '{"a":[1.2345678901234567890]}').added[0].new, '[1.2345678901234567890]');
+  const tenth = variableDiff(null, '{"a":0.30000000000000004}');
+  assert.equal(tenth.added[0].new, '0.30000000000000004');
+  assert.equal(variableRows(tenth)[0], '+ a = 0.30000000000000004');
   assert.equal(variableDiff('{"a":1.5,"s":"9007199254740993"}', '{"a":2.5,"s":"9007199254740993"}').changed.length, 1);
 
   j = await mkApply(); j.kind = 'trust'; await refused(j, 'kind differs from scope');
@@ -161,12 +165,18 @@ const withChallenge = async (job, bytes) => {
   j = {id: 9, kind: 'apply', project: 'p', nonce: 'n4', scope: {kind: 'apply', ...emptyScope}, display: {manifest: next, baseline_manifest: base, address_text: ''}};
   assert.ok(await verifyJob(await withChallenge(j, applyBytes(j.scope, j.nonce))), 'empty change list is consistent');
 
-  assert.throws(() => variableDiff('{"a":0}', '{"a":1e-400}'));
+  assert.deepEqual(variableDiff('{"a":0}', '{"a":1e-400}').changed, [{key: 'a', old: '0', new: '1e-400'}], 'underflow is still a change');
   assert.throws(() => variableDiff(null, '{"a":1e400}'));
-  assert.throws(() => variableDiff(null, '{"a":1e-310}'));
-  assert.throws(() => variableDiff('{"a":0}', '{"a":-1e-400}'));
+  assert.throws(() => variableDiff(null, '{"a":[-1e400]}'));
+  assert.throws(() => variableDiff('{"a":{"b":1e999}}', '{"a":1}'));
+  assert.equal(variableDiff(null, '{"a":1e-310}').added.length, 1);
+  assert.equal(variableDiff('{"a":0}', '{"a":-1e-400}').changed.length, 1);
   assert.equal(variableDiff('{"a":0.0}', '{"a":1.5e3}').changed.length, 1);
-  assert.equal(variableDiff('{"a":0}', '{"a":0.0e5}').changed.length, 0);
+  assert.equal(variableDiff('{"a":0}', '{"a":0.0e5}').changed.length, 1, 'compared as written');
+  assert.equal(variableDiff('{"a":{"x":[1,true]},"b":null}', '{"a":{"x":[1,true]},"b":null}').changed.length, 0);
+  assert.deepEqual(variableDiff(null, '{"__proto__":1,"constructor":2}').added.map(x => x.key), ['__proto__', 'constructor']);
+  j = await mkApply(); j.display.manifest = '{"b":1e400}'; j.scope.manifest = await sha(j.display.manifest);
+  await refused(await withChallenge(j, applyBytes(j.scope, j.nonce)), 'infinite number in manifest');
 
   const bs = String.fromCharCode(92);
   assert.equal(visible(bs + 'u202e'), bs + bs + 'u202e', 'a literal backslash is escaped');
@@ -204,11 +214,38 @@ const withChallenge = async (job, bytes) => {
   timers.shift()();
   assert.equal(els.jobapprove.disabled, false);
   timers.length = 0;
+  showJob(first);
+  showJob(changed);
+  showJob(first);
+  assert.equal(timers.length, 3);
+  timers.shift()();
+  assert.equal(els.jobapprove.disabled, true, 'an older render does not release the hold, even for the same content');
+  timers.shift()();
+  assert.equal(els.jobapprove.disabled, true);
+  timers.shift()();
+  assert.equal(els.jobapprove.disabled, false, 'the current render releases it');
+  showJob(changed);
+  busy = true;
+  timers.shift()();
+  assert.equal(els.jobapprove.disabled, true, 'not released while an approval is in progress');
+  busy = false;
+  timers.length = 0;
 
   const line = 'x = "a' + bs + 'nb" y = ' + bs + '"q' + bs + '" ' + bs + 'u202e ' + bs + 'U{1} p' + bs + bs + 'u';
-  assert.equal(visibleDiff(line), 'x = "a' + bs + 'nb" y = ' + bs + '"q' + bs + '" ' + bs + bs + 'u202e ' + bs + bs + 'U{1} p' + bs + bs + bs + 'u');
+  assert.equal(visibleDiff(line), 'x = "a' + bs + 'nb" y = ' + bs + '"q' + bs + '" ' + bs + bs + 'u202e ' + bs + bs + 'U{1} p' + bs + bs + bs + bs + 'u');
   assert.equal(visibleDiff('a' + bs + 'nb' + bidi), 'a' + bs + 'nb' + bs + 'u202e');
   assert.equal(visibleDiff('c:' + bs + 'temp' + bs + 'new'), 'c:' + bs + 'temp' + bs + 'new');
+  const typedBidi = bs + 'u202e', typedTag = bs + 'u{e0001}', tag = String.fromCodePoint(0xe0001);
+  assert.notEqual(visibleDiff(bs + bidi), visibleDiff(typedBidi), 'backslash before a real U+202E differs from typed text');
+  assert.notEqual(visibleDiff(bs + tag), visibleDiff(typedTag), 'backslash before a real tag differs from typed text');
+  assert.notEqual(visibleDiff(bs + bidi), visibleDiff(bs + typedBidi), 'and from a typed backslash before typed text');
+  assert.notEqual(visibleDiff(bs + tag), visibleDiff(bs + typedTag));
+  assert.equal(visibleDiff(bs + bidi), bs + bs + bs + 'u202e');
+  assert.equal(visibleDiff(bs + bs + bidi), bs.repeat(5) + 'u202e');
+  assert.equal(visibleDiff(bs + bs + 'u202e'), bs.repeat(4) + 'u202e');
+  assert.equal(visibleDiff(bs + tag), bs + bs + bs + 'u{e0001}');
+  assert.equal(visibleDiff(bs + String.fromCharCode(1)), bs + bs + bs + 'u0001');
+  assert.equal(visibleDiff(bs + '\n' + bs + '\t'), bs + '\n' + bs + '\t', 'newline and tab are not escaped, so their backslash stays');
 
   const shown = await mkApply();
   const later = await mkApply();

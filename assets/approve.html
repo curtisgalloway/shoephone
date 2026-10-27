@@ -221,6 +221,10 @@ const OBLIGATION = 'For every manifest the schema accepts, protected credentials
 const ACTIONS = ['create', 'update', 'replace', 'delete'];
 const BAD_ADDRESS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
 const HIDDEN_ANY = /[\\\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069\u061c\u200b\u2060\ufeff\u00ad\u{e0000}-\u{e007f}]/gu;
+// The characters visible() escapes in a multi-line block, other than the
+// backslash itself.
+const ESCAPED_IN_BLOCK = String.raw`\u0000-\u0008\u000b-\u001f\u007f-\u009f  ‎‏‪-‮⁦-⁩؜​⁠﻿­\u{e0000}-\u{e007f}`;
+const BLOCK_BACKSLASHES = new RegExp(String.raw`\\+(?=[uU` + ESCAPED_IN_BLOCK + '])', 'gu');
 const HIDDEN_KEEP_LINES = /[\\\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069\u061c\u200b\u2060\ufeff\u00ad\u{e0000}-\u{e007f}]/gu;
 const SLUG = /^[A-Za-z0-9._-]{1,64}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -237,10 +241,13 @@ function visible(text, keepLines, keepBackslash) {
   });
 }
 
-// For a multi-line code block: a backslash is shown as written unless a u or
-// U follows, the one place typed text could pass for this page's own escapes.
+// For a multi-line code block: backslashes are shown as written, so \n and
+// \" in source read as typed, except a run of them right before a u, a U, or
+// a character this page escapes. That run is doubled, so typed text can never
+// pass for one of the page's own \u escapes: before an escape the count of
+// backslashes is odd, before a typed u it is even.
 function visibleDiff(text) {
-  return visible(String(text).replace(/\\(?=[uU])/g, '\\\\'), true, true);
+  return visible(String(text).replace(BLOCK_BACKSLASHES, m => m + m), true, true);
 }
 
 async function sha256Hex(text) {
@@ -292,41 +299,14 @@ function countActions(changes) {
   return c;
 }
 
-// Throws unless every number in the JSON text survives a trip through a
-// double exactly. Otherwise two different numbers could compare equal and a
-// changed value would be hidden from the variable diff.
-function assertNumbersExact(text) {
-  let i = 0;
-  while (i < text.length) {
-    const ch = text[i];
-    if (ch === '"') {
-      i += 1;
-      while (i < text.length && text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
-      i += 1;
-    } else if (ch === '-' || (ch >= '0' && ch <= '9')) {
-      const m = /^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?/.exec(text.slice(i));
-      if (!m) throw new Error('bad number');
-      const tok = m[0];
-      if (!m[1] && !m[2]) {
-        if (BigInt(Number(tok)) !== BigInt(tok)) throw new Error('number not exact: ' + tok);
-      } else {
-        const digits = tok.replace(/[eE].*$/, '').replace(/[-.]/g, '').replace(/^0+/, '').replace(/0+$/, '');
-        const n = Number(tok);
-        if (digits.length > 15 || !Number.isFinite(n) || (n === 0 && digits.length > 0) ||
-            (n !== 0 && Math.abs(n) < 2.2250738585072014e-308)) {
-          throw new Error('number not exact: ' + tok);
-        }
-      }
-      i += tok.length;
-    } else {
-      i += 1;
-    }
-  }
-}
-
-// Throws on a duplicate key at any level of valid JSON text; JSON.parse would
-// silently keep the last one.
-function assertNoDuplicateKeys(text) {
+// The top-level entries of a canonical JSON object manifest, as a Map from
+// key to the exact text of its value. Throws unless the text is valid JSON
+// with an object at the top, no key repeated in any object, and no number
+// that a JSON parser would turn into an infinity. Values are compared and
+// shown as written, never reparsed, so two numbers a double cannot tell
+// apart still show as different.
+function manifestEntries(text) {
+  JSON.parse(text);
   let i = 0;
   const ws = () => { while (i < text.length && ' \t\n\r'.includes(text[i])) i += 1; };
   const str = () => {
@@ -336,59 +316,60 @@ function assertNoDuplicateKeys(text) {
     i += 1;
     return JSON.parse(text.slice(start, i));
   };
-  const val = () => {
+  const val = top => {
     ws();
     const c = text[i];
     if (c === '{') {
       i += 1; ws();
-      if (text[i] === '}') { i += 1; return; }
-      const seen = new Set();
+      const seen = new Map();
+      if (text[i] === '}') { i += 1; return seen; }
       for (;;) {
         ws();
         const k = str();
         if (seen.has(k)) throw new Error('duplicate key');
-        seen.add(k);
-        ws(); i += 1; val(); ws();
+        ws(); i += 1; ws();
+        const from = i;
+        val(false);
+        seen.set(k, top ? text.slice(from, i) : true);
+        ws();
         if (text[i] === ',') { i += 1; continue; }
-        i += 1; return;
+        i += 1; return seen;
       }
-    } else if (c === '[') {
+    }
+    if (top) throw new Error('manifest is not an object');
+    if (c === '[') {
       i += 1; ws();
       if (text[i] === ']') { i += 1; return; }
       for (;;) {
-        val(); ws();
+        val(false); ws();
         if (text[i] === ',') { i += 1; continue; }
         i += 1; return;
       }
     } else if (c === '"') {
       str();
     } else {
+      const from = i;
       while (i < text.length && !',]} \t\n\r'.includes(text[i])) i += 1;
+      const tok = text.slice(from, i);
+      if (c !== 't' && c !== 'f' && c !== 'n' && !Number.isFinite(Number(tok))) throw new Error('number out of range: ' + tok);
     }
   };
-  val();
-}
-
-function parseManifest(text) {
-  assertNumbersExact(text);
-  const v = JSON.parse(text);
-  assertNoDuplicateKeys(text);
-  if (v === null || typeof v !== 'object' || Array.isArray(v)) throw new Error('manifest is not an object');
-  return v;
+  return val(true);
 }
 
 // Added, removed and changed variables between two canonical manifests; the
-// baseline is null when there is none. Values are JSON text.
+// baseline is null when there is none. Values are the manifests' own text,
+// and a value is changed exactly when its text differs.
 function variableDiff(baseline, manifest) {
-  const a = baseline === null || baseline === undefined ? {} : parseManifest(baseline);
-  const b = parseManifest(manifest);
+  const a = baseline === null || baseline === undefined ? new Map() : manifestEntries(baseline);
+  const b = manifestEntries(manifest);
   const out = {added: [], removed: [], changed: []};
-  for (const key of Object.keys(b).sort()) {
-    if (!Object.prototype.hasOwnProperty.call(a, key)) out.added.push({key, new: JSON.stringify(b[key])});
-    else if (JSON.stringify(a[key]) !== JSON.stringify(b[key])) out.changed.push({key, old: JSON.stringify(a[key]), new: JSON.stringify(b[key])});
+  for (const key of [...b.keys()].sort()) {
+    if (!a.has(key)) out.added.push({key, new: b.get(key)});
+    else if (a.get(key) !== b.get(key)) out.changed.push({key, old: a.get(key), new: b.get(key)});
   }
-  for (const key of Object.keys(a).sort()) {
-    if (!Object.prototype.hasOwnProperty.call(b, key)) out.removed.push({key, old: JSON.stringify(a[key])});
+  for (const key of [...a.keys()].sort()) {
+    if (!b.has(key)) out.removed.push({key, old: a.get(key)});
   }
   return out;
 }
@@ -557,14 +538,18 @@ function renderApply(j) {
 // verified and signed over this object, not over whatever the latest poll
 // returned.
 let shownJob = null;
+// Counts renders, so a hold timer releases the buttons only for the render
+// that started it.
+let renderGen = 0;
 function jobToSign() { return shownJob ? shownJob.job : null; }
 
 function showJob(j) {
   $('job').classList.toggle('hidden', !j);
-  if (!j) { shownJob = null; return; }
+  if (!j) { shownJob = null; renderGen += 1; return; }
   const key = JSON.stringify(j);
   if (shownJob && shownJob.key === key) return;
   shownJob = {key, job: j};
+  const gen = ++renderGen;
   const s = j.scope || {};
   const trust = s.kind === 'trust';
   const band = $('jobband');
@@ -586,7 +571,7 @@ function showJob(j) {
   $('jobbody').replaceChildren(...body);
   $('jobapprove').disabled = $('jobdecline').disabled = true;
   setTimeout(() => {
-    if (shownJob && shownJob.key === key && !busy) $('jobapprove').disabled = $('jobdecline').disabled = false;
+    if (gen === renderGen && !busy) $('jobapprove').disabled = $('jobdecline').disabled = false;
   }, 1500);
   if (navigator.vibrate) navigator.vibrate(60);
 }
