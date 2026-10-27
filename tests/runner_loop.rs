@@ -44,6 +44,7 @@ struct Fx {
     root: PathBuf,
     client: Arc<Client>,
     cfg: RunnerConfig,
+    key: ssh_key::PrivateKey,
     _daemon: Arc<shoephone::server::Daemon>,
 }
 
@@ -101,8 +102,40 @@ impl Fx {
             root,
             client: Arc::new(client),
             cfg,
+            key,
             _daemon: daemon,
         }
+    }
+
+    /// A fresh daemon over the same state directory, the way a restart
+    /// does: it remembers the ledger and the trust, not the jobs. The
+    /// runner config is pointed at it; build a new runner to use it.
+    async fn restart_daemon(&mut self) {
+        let dir = self.root.join("daemon");
+        let (client, daemon) = start_everything(
+            &dir,
+            &dir.join("user_ca"),
+            None,
+            &[("web", "r1")],
+            &[("r1", &self.key)],
+        )
+        .await;
+        self.cfg.daemon = client.base().to_owned();
+        self.client = Arc::new(client);
+        self._daemon = daemon;
+    }
+
+    async fn ledger(&self) -> String {
+        let base = self.client.base().to_owned();
+        blocking(move || {
+            ureq::get(format!("{base}/api/ledger"))
+                .call()
+                .unwrap()
+                .into_body()
+                .read_to_string()
+                .unwrap()
+        })
+        .await
     }
 
     /// A fresh runner over this fixture's state, started up.
@@ -796,4 +829,41 @@ async fn local_trust_changed_before_the_claim_fails_the_apply_untrusted() {
     assert!(!fx.record().contains("arg:apply"), "nothing was applied");
     assert!(fx.applied().is_none(), "the baseline is untouched");
     fx.assert_no_job_leftovers();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn result_for_a_job_the_restarted_daemon_forgot_is_ledgered_outcome_unknown() {
+    let mut fx = Fx::new("forgotten", CREATE_ONLY).await;
+    let runner = fx.runner().await;
+    let runner = fx.trusted(runner).await;
+    let id = fx.apply(r#"{"region":"west"}"#).await;
+    let runner = step(runner).await;
+    fx.approve(id).await;
+    // The apply runs; its finish never arrives, and the daemon restarts.
+    runner.test_hooks_fault("/api/runner/finish", Fault::Unreachable);
+    let (runner, r) = try_step(runner).await;
+    assert!(r.is_err());
+    assert_eq!(count(&fx.record(), "arg:apply"), 1);
+    drop(runner);
+    fx.restart_daemon().await;
+
+    let _runner = fx.runner().await;
+    let paths = ProjectPaths::new(&fx.cfg.state_dir, "web").unwrap();
+    assert_eq!(
+        Journal::new(&paths).unfinished().unwrap(),
+        None,
+        "delivered, then closed"
+    );
+    let ledger: Vec<serde_json::Value> = serde_json::from_str(&fx.ledger().await).unwrap();
+    assert!(
+        ledger
+            .iter()
+            .any(|e| e["kind"] == "outcome_unknown" && e["id"] == json!(id)),
+        "{ledger:?}"
+    );
+    assert_eq!(
+        count(&fx.record(), "arg:apply"),
+        1,
+        "nothing was re-applied"
+    );
 }

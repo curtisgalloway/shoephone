@@ -52,7 +52,10 @@ Every claim is journaled before it is sent, and every result before
 `finish` is sent. A `finish` that fails transiently is retried on each pass,
 before any new poll, until the daemon has it or refuses it for good; a
 refusal of a retry whose first copy did arrive (the job status already shows
-that result) counts as delivered. A transient failure fetching an archive,
+that result) counts as delivered. If the daemon no longer knows the job (it
+restarted), an `applied` or `apply_failed` result is sent again as
+`outcome_unknown`, which the daemon records for a job it forgot, so the
+ledger still has a line for it. A transient failure fetching an archive,
 or sending a refusal, is retried for up to 60 s; an archive still out of
 reach ends the job `plan_failed` with category `archive_unavailable`. If the
 daemon never hears back about a claimed job, it records the outcome as

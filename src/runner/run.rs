@@ -651,12 +651,38 @@ impl Runner {
     /// Sends one `finish`. A permanent refusal of what may be a retry is
     /// checked against the job's status: if the daemon already has this
     /// very result, the earlier send arrived and only its reply was lost.
+    /// If the daemon no longer knows the job at all (it restarted), an apply
+    /// result is sent again as `outcome_unknown`, the one result it records
+    /// for a job it forgot, so the ledger still gets a line for it.
     fn send_finish(&self, body: &FinishBody) -> Sent {
         match self.client.finish(body) {
             Ok(()) => Sent::Delivered,
             Err(e) if is_permanent(&e) => match self.client.job(body.id) {
                 Ok(Some(st)) if st.result.as_deref() == Some(body.result.as_str()) => {
                     Sent::Delivered
+                }
+                Ok(None) if matches!(body.result.as_str(), "applied" | "apply_failed") => {
+                    eprintln!(
+                        "shoephone-runner: the daemon no longer knows job {}; reporting its {} as outcome_unknown",
+                        body.id, body.result
+                    );
+                    let unknown = FinishBody {
+                        id: body.id,
+                        result: "outcome_unknown".to_string(),
+                        failure: None,
+                        project: body.project.clone(),
+                    };
+                    match self.client.finish(&unknown) {
+                        Ok(()) => Sent::Delivered,
+                        Err(e) if is_permanent(&e) => {
+                            eprintln!(
+                                "shoephone-runner: outcome_unknown for job {} refused: {e}",
+                                body.id
+                            );
+                            Sent::Refused
+                        }
+                        Err(e) => Sent::Transient(format!("finish: {e}")),
+                    }
                 }
                 Ok(_) => {
                     eprintln!(

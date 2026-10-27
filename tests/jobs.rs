@@ -607,6 +607,8 @@ async fn unknown_job_result_is_ledgered_as_outcome_unknown() {
             Some(4242),
         )
         .await;
+    // Only outcome_unknown is taken for a job the daemon forgot; the runner
+    // re-sends an applied or apply_failed result in that form.
     assert_eq!(applied.http, 404);
 
     let reply = rig
