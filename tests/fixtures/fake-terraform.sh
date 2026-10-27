@@ -9,10 +9,12 @@
 #   init   a line of plain text
 #   plan   writes the -out= file and one -json line
 #   show   the file named by FAKE_TERRAFORM_SHOW
-#   apply  one -json line
+#   apply  appends "planfile:<contents of its plan argument>" to the
+#          record, then one -json line
 #
 # FAKE_TERRAFORM_FAIL=<subcommand> makes that subcommand print a -json
 # diagnostic whose summary is FAKE_TERRAFORM_TEXT and exit 1.
+# FAKE_TERRAFORM_SLEEP=<subcommand> makes that subcommand sleep 30 s.
 # Only absolute paths are used, because the executor passes no PATH.
 
 rec="${FAKE_TERRAFORM_RECORD:?FAKE_TERRAFORM_RECORD is not set}"
@@ -43,6 +45,10 @@ done
 
 printf 'fake-terraform stderr for %s\n' "$sub" >&2
 
+if [ "${FAKE_TERRAFORM_SLEEP:-}" = "$sub" ]; then
+    /bin/sleep 30
+fi
+
 if [ "${FAKE_TERRAFORM_FAIL:-}" = "$sub" ]; then
     printf '{"type":"diagnostic","diagnostic":{"severity":"error","summary":"%s","address":"null_resource.broken"}}\n' "${FAKE_TERRAFORM_TEXT:-}"
     exit 1
@@ -55,6 +61,9 @@ case "$sub" in
         printf '{"type":"version","terraform":"fake"}\n'
         ;;
     show) /bin/cat "${FAKE_TERRAFORM_SHOW:?FAKE_TERRAFORM_SHOW is not set}" ;;
-    apply) printf '{"type":"apply_complete","plan":"%s"}\n' "$last" ;;
+    apply)
+        printf 'planfile:%s\n' "$(/bin/cat "$last")" >>"$rec"
+        printf '{"type":"apply_complete"}\n'
+        ;;
     *) exit 2 ;;
 esac

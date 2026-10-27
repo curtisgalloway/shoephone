@@ -11,6 +11,10 @@ fn default_log_days() -> u32 {
     30
 }
 
+fn default_terraform_timeout_minutes() -> u32 {
+    60
+}
+
 fn default_schema_file() -> String {
     "shoephone-schema.toml".to_string()
 }
@@ -65,6 +69,10 @@ pub struct RunnerConfig {
     /// `secret_command`. It otherwise gets only `PATH=/usr/bin:/bin`.
     #[serde(default)]
     pub secret_env: Vec<String>,
+    /// How long one Terraform command may run before its process tree is
+    /// killed (`terraform_timeout`).
+    #[serde(default = "default_terraform_timeout_minutes")]
+    pub terraform_timeout_minutes: u32,
     #[serde(default)]
     pub projects: BTreeMap<String, ProjectConfig>,
 }
@@ -114,6 +122,9 @@ impl RunnerConfig {
         if self.secret_command.is_empty() || self.secret_command[0].is_empty() {
             return Err("secret_command must not be empty".to_string());
         }
+        if self.terraform_timeout_minutes == 0 {
+            return Err("terraform_timeout_minutes must be at least 1".to_string());
+        }
         for (name, p) in &self.projects {
             if !valid_project_name(name) {
                 return Err(format!(
@@ -159,6 +170,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(cfg.name, "runner-1");
         assert_eq!(cfg.log_days, 30);
+        assert_eq!(cfg.terraform_timeout_minutes, 60);
         assert_eq!(cfg.secret_command.len(), 2);
         let p = &cfg.projects["example"];
         assert_eq!(p.schema_file, "shoephone-schema.toml");

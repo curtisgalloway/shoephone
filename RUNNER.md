@@ -56,7 +56,8 @@ of the digest. A `.git` directory at the checkout root is ignored.
 
 One TOML file, unknown fields refused. Top level: `name`, `daemon`, `key`,
 `state_dir`, `log_dir`, `log_days` (default 30), `terraform`, `plugin_dir`,
-`bwrap`, `review_user`, `terraform_user`, `secret_command`, `secret_env`. Each
+`bwrap`, `review_user`, `terraform_user`, `secret_command`, `secret_env`,
+`terraform_timeout_minutes` (default 60). Each
 `[projects.<name>]` has `path`, `terraform_version`, `schema_file` (default
 `shoephone-schema.toml`) and the tables `backend_config`, `env` and
 `variables`. Project names match `^[A-Za-z0-9._-]{1,64}$`; paths are
@@ -66,8 +67,9 @@ Every value in those tables is `{ value = "..." }` or `{ secret = "ref" }`.
 `secret_command` is run with the reference appended as its last argument, in
 an environment holding only `PATH=/usr/bin:/bin` and the runner variables
 named in `secret_env` (default empty), with no stdin and a 30 s limit; its
-stdout, at most 64 KiB with one trailing newline removed, is the secret. Runner-supplied `variables` must not overlap
-the project's schema; that is checked when the project is trusted.
+stdout, at most 64 KiB with one trailing newline removed, is the secret.
+Runner-supplied `variables` must not overlap the project's schema; that is
+checked when the project is trusted.
 
 ## State
 
@@ -78,9 +80,35 @@ Under `state_dir/projects/<name>/`:
 - `applied.json`: `{ manifest, status }`, status `applied` or `uncertain`.
 - `journal.json`: `{ job, phase, result }`, phase `claimed`, `applying` or
   `done`.
+- `plans/<job>.tfplan`: root's copy of a job's saved plan, taken as soon as
+  `terraform plan` writes it. That copy is what is hashed, shown, approved
+  and applied (mounted read-only over the job directory's plan file), and
+  it is deleted when the job ends.
 
 Every write is atomic: a 0600 temp file, fsync, rename, fsync of the
 directory.
+
+## Terraform runs
+
+Terraform runs as `terraform_user` inside bubblewrap, which sees only the
+job directory (read-write), the Terraform binary, `plugin_dir`, `/usr`, the
+`/lib` directories, and `/etc/ssl`, `/etc/pki` and `/etc/resolv.conf` where
+present (a missing `/etc/ssl` or `/etc/resolv.conf` is warned about at
+startup). Its environment is only the project's values, `TF_IN_AUTOMATION`,
+`TF_INPUT`, `HOME` (the job directory), an empty `TF_CLI_CONFIG_FILE` and
+`TF_CLI_ARGS_init`. A command running longer than
+`terraform_timeout_minutes` is killed, with category `terraform_timeout`.
+Full output goes to `log_dir/<project>/<job>.log` (0600, directories 0700),
+which only the operator reads; logs older than `log_days` are pruned at
+startup.
+
+## Builds
+
+A deployed build must never enable the `test-hooks` feature. That feature
+lets this repository's tests run Terraform without the sandbox, and a
+`shoephone-runner` built with it refuses to start (exit 3) unless
+`SHOEPHONE_RUNNER_ALLOW_TEST_HOOKS=1`, which only the integration tests set.
+`cargo build --release` does not enable it.
 
 ## Exit codes
 
@@ -88,5 +116,6 @@ Bands follow the house contract: under 100 is portable.
 
 - 0: success.
 - 2: usage error.
-- 3: config missing or invalid, a bad `review-worker` request, or the verb is not implemented yet.
+- 3: config missing or invalid, a bad `review-worker` request, a `test-hooks`
+  build started without the test variable, or the verb is not implemented yet.
 - 30: a review or `diff-digest` was refused.

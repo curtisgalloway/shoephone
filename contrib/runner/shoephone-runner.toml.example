@@ -21,6 +21,8 @@ secret_command = ["/usr/local/bin/secret-tool", "read"]
 # Runner environment variables passed through to secret_command, which
 # otherwise gets only PATH=/usr/bin:/bin.
 secret_env = []
+# Minutes one Terraform command may run before it is killed.
+terraform_timeout_minutes = 60
 
 [projects.example]
 path = "infra/example"

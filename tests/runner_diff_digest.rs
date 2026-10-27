@@ -6,6 +6,7 @@ use std::process::Command;
 
 fn runner(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_shoephone-runner"))
+        .env("SHOEPHONE_RUNNER_ALLOW_TEST_HOOKS", "1")
         .args(args)
         .output()
         .unwrap()

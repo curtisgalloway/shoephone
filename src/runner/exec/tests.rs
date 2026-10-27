@@ -103,7 +103,7 @@ fn fixture() -> Fx {
     let root = tempfile::tempdir().unwrap();
     let r = root.path().to_path_buf();
     fs::write(r.join("secret.sh"), echo_script(&r)).unwrap();
-    for d in ["state", "logs", "plugins/registry/p", "job/checkout/infra"] {
+    for d in ["state", "plugins/registry/p", "job/checkout/infra"] {
         fs::create_dir_all(r.join(d)).unwrap();
     }
     fs::write(r.join("plugins/registry/p/provider"), b"provider v1").unwrap();
@@ -122,6 +122,7 @@ fn fixture() -> Fx {
         terraform_user: "shoephone-terraform".into(),
         secret_command: vec!["/bin/sh".into(), r.join("secret.sh").display().to_string()],
         secret_env: Vec::new(),
+        terraform_timeout_minutes: 60,
         projects: BTreeMap::new(),
     };
     let project = ProjectConfig {
@@ -297,6 +298,13 @@ fn reserved_and_malformed_names_are_refused() {
         "TF_CLI_ARGS_init",
         "TF_CLI_ARGS",
         "TF_VAR_x",
+        "TF_CLI_CONFIG_FILE",
+        "TF_LOG",
+        "TF_LOG_PATH",
+        "TF_LOG_CORE",
+        "TF_LOG_PROVIDER",
+        "TF_PLUGIN_CACHE_DIR",
+        "TF_DATA_DIR",
         "A=B",
         "",
     ] {
@@ -357,6 +365,10 @@ fn terraform_env_has_only_resolved_values() {
         ("TF_INPUT", "0".to_string()),
         ("HOME", dir.display().to_string()),
         (
+            "TF_CLI_CONFIG_FILE",
+            dir.join(CLI_CONFIG_FILE).display().to_string(),
+        ),
+        (
             "TF_CLI_ARGS_init",
             format!(
                 "-plugin-dir={} -backend-config={}/backend.hcl",
@@ -377,6 +389,9 @@ fn terraform_env_has_only_resolved_values() {
         env.values().all(|v| !v.contains("value-of-ref/backend")),
         "the backend secret goes only into backend.hcl"
     );
+    let rc = dir.join(CLI_CONFIG_FILE);
+    assert_eq!(fs::read(&rc).unwrap(), b"", "an empty CLI config");
+    assert_eq!(mode(&rc), 0o600);
 }
 
 #[test]
@@ -400,7 +415,7 @@ fn terraform_refuses_without_root_outside_test_mode() {
 fn bwrap_args_expose_only_job_and_plugin_dirs() {
     let fx = fixture();
     let dir = fx.job_dir();
-    let args: Vec<String> = bwrap_args(&fx.cfg, &dir)
+    let args: Vec<String> = bwrap_args(&fx.cfg, &dir, Some(9))
         .into_iter()
         .map(|a| a.into_string().unwrap())
         .collect();
@@ -413,6 +428,7 @@ fn bwrap_args_expose_only_job_and_plugin_dirs() {
     ] {
         assert!(has(&[flag]), "{flag}");
     }
+    assert!(has(&["--cap-drop", "ALL"]));
     let job_s = dir.display().to_string();
     let plugins = fx.cfg.plugin_dir.display().to_string();
     for seq in [
@@ -420,8 +436,6 @@ fn bwrap_args_expose_only_job_and_plugin_dirs() {
         &["--dev", "/dev"],
         &["--tmpfs", "/tmp"],
         &["--ro-bind", "/usr", "/usr"],
-        &["--ro-bind", "/etc/ssl", "/etc/ssl"],
-        &["--ro-bind", "/etc/resolv.conf", "/etc/resolv.conf"],
         &["--ro-bind", FAKE, FAKE],
         &["--ro-bind", &plugins, &plugins],
         &["--bind", &job_s, &job_s],
@@ -429,9 +443,22 @@ fn bwrap_args_expose_only_job_and_plugin_dirs() {
     ] {
         assert!(has(seq), "{seq:?} in {args:?}");
     }
+    for etc in ["/etc/ssl", "/etc/pki", "/etc/resolv.conf"] {
+        assert_eq!(
+            has(&["--ro-bind", etc, etc]),
+            Path::new(etc).exists(),
+            "{etc} is bound exactly when it exists"
+        );
+    }
+    let plan_dest = dir.join(PLAN_FILE).display().to_string();
+    assert!(has(&["--ro-bind-data", "9", &plan_dest]));
+    let data = args.iter().position(|a| a == "--ro-bind-data").unwrap();
     let tmp = args.iter().position(|a| a == "--tmpfs").unwrap();
     let bind = args.iter().position(|a| a == "--bind").unwrap();
     assert!(tmp < bind, "a job dir under /tmp must survive the tmpfs");
+    assert!(bind < data, "the verified plan is mounted over the job dir");
+    let without: Vec<OsString> = bwrap_args(&fx.cfg, &dir, None);
+    assert!(without.iter().all(|a| a != "--ro-bind-data"));
     for hidden in [&fx.cfg.state_dir, &fx.cfg.log_dir, &fx.cfg.key] {
         let h = hidden.display().to_string();
         assert!(args.iter().all(|a| !a.starts_with(&h)), "{h} is bound");
@@ -474,6 +501,11 @@ fn log_file_is_0600() {
     let err = terraform(&fx.cfg, &job8, &["init"], &resolved).unwrap_err();
     assert_eq!(err.category, "log_unavailable");
     assert_eq!(fs::read(fx.path("target")).unwrap(), b"keep");
+
+    // An existing log directory that is not exactly 0700 is refused.
+    fs::set_permissions(fx.path("fresh-logs/web"), fs::Permissions::from_mode(0o755)).unwrap();
+    let err = terraform(&fx.cfg, &job(&dir), &["init"], &resolved).unwrap_err();
+    assert_eq!(err.category, "log_unavailable");
 }
 
 #[test]
@@ -552,8 +584,16 @@ fn manifest_file_is_outside_checkout() {
     );
     assert_eq!(calls[0].0[2..], ["-input=false".to_string()]);
 
-    assert_eq!(plan_file, dir.join(PLAN_FILE));
-    assert_eq!(sha, sha256_file(&plan_file));
+    // The returned plan is the root-only copy, identical to what plan wrote.
+    let copy = fx.path("state/projects/web/plans/7.tfplan");
+    assert_eq!(plan_file, copy);
+    assert_eq!(sha, sha256_file(&copy));
+    assert_eq!(
+        fs::read(&copy).unwrap(),
+        fs::read(dir.join(PLAN_FILE)).unwrap()
+    );
+    assert_eq!(mode(&copy), 0o600);
+    assert_eq!(mode(&fx.path("state/projects/web/plans")), 0o700);
     let want = crate::runner::plan::summarize(&fs::read_to_string(SHOW).unwrap()).unwrap();
     assert_eq!(summary, want);
 }
@@ -637,43 +677,78 @@ fn plan_failure_carries_no_terraform_text() {
         // The full text is in the root-only log.
         let log = fs::read_to_string(fx.path("logs/web/7.log")).unwrap();
         assert!(log.contains("value-of-ref/leak"));
+        assert!(
+            !dir.join(BACKEND_FILE).exists(),
+            "{stage}: backend.hcl left"
+        );
+        assert!(!fx.path("state/projects/web/plans/7.tfplan").exists());
     }
+}
+
+fn journal_result(fx: &Fx) -> Option<String> {
+    let path = ProjectPaths::new(&fx.cfg.state_dir, "web")
+        .unwrap()
+        .journal_json();
+    let entry: crate::runner::state::Journal =
+        serde_json::from_slice(&fs::read(path).ok()?).unwrap();
+    entry.result
+}
+
+fn planned(fx: &Fx) -> (Resolved, Journal, PathBuf, String) {
+    no_sandbox();
+    let resolved = resolve(&fx.cfg, &fx.project).unwrap();
+    let dir = fx.job_dir();
+    let journal = Journal::new(&ProjectPaths::new(&fx.cfg.state_dir, "web").unwrap());
+    let (_, copy, sha) = plan(&fx.cfg, &job(&dir), &Canonical("{}".into()), &resolved).unwrap();
+    (resolved, journal, copy, sha)
+}
+
+fn apply_ran(fx: &Fx) -> bool {
+    fx.calls().iter().any(|(a, _)| a[1] == "apply")
 }
 
 #[test]
 fn plan_file_tamper_is_refused() {
     let fx = fixture();
-    no_sandbox();
-    let resolved = resolve(&fx.cfg, &fx.project).unwrap();
+    let (resolved, journal, copy, _) = planned(&fx);
     let dir = fx.job_dir();
-    let journal = Journal::new(&ProjectPaths::new(&fx.cfg.state_dir, "web").unwrap());
-    let (_, plan_file, sha) =
-        plan(&fx.cfg, &job(&dir), &Canonical("{}".into()), &resolved).unwrap();
-
     let wrong = "0".repeat(64);
-    let err = apply(&fx.cfg, &job(&dir), &plan_file, &wrong, &resolved, &journal).unwrap_err();
+    let err = apply(&fx.cfg, &job(&dir), &copy, &wrong, &resolved, &journal).unwrap_err();
     assert_eq!(err.category, "plan_changed");
     assert_eq!(
         journal.pending_unknown().unwrap(),
         None,
         "apply never began"
     );
+    assert!(!apply_ran(&fx));
+    assert!(!copy.exists(), "the job ended, so its copy is gone");
+}
 
-    let mut bytes = fs::read(&plan_file).unwrap();
+#[test]
+fn root_copy_edit_is_refused_as_plan_changed() {
+    let fx = fixture();
+    let (resolved, journal, copy, sha) = planned(&fx);
+    let mut bytes = fs::read(&copy).unwrap();
     bytes.push(b'!');
-    fs::write(&plan_file, &bytes).unwrap();
-    let err = apply(&fx.cfg, &job(&dir), &plan_file, &sha, &resolved, &journal).unwrap_err();
+    fs::write(&copy, &bytes).unwrap();
+    let dir = fx.job_dir();
+    let err = apply(&fx.cfg, &job(&dir), &copy, &sha, &resolved, &journal).unwrap_err();
     assert_eq!(err.category, "plan_changed");
+    assert!(!apply_ran(&fx));
+    assert_eq!(journal_result(&fx), None);
+    assert!(!copy.exists());
+}
 
-    let calls = fx.calls();
-    assert!(
-        calls.iter().all(|(a, _)| a[1] != "apply"),
-        "terraform apply ran"
-    );
+#[test]
+fn job_dir_plan_edit_does_not_change_what_apply_uses() {
+    let fx = fixture();
+    let (resolved, journal, copy, sha) = planned(&fx);
+    let dir = fx.job_dir();
+    let original = fs::read_to_string(&copy).unwrap();
+    // terraform_user owns the job dir and can rewrite its plan file.
+    fs::write(dir.join(PLAN_FILE), b"evil plan\n").unwrap();
 
-    bytes.pop();
-    fs::write(&plan_file, &bytes).unwrap();
-    apply(&fx.cfg, &job(&dir), &plan_file, &sha, &resolved, &journal).unwrap();
+    apply(&fx.cfg, &job(&dir), &copy, &sha, &resolved, &journal).unwrap();
     let calls = fx.calls();
     let (argv, _) = calls.last().unwrap();
     assert_eq!(
@@ -683,20 +758,113 @@ fn plan_file_tamper_is_refused() {
             "-json".to_string(),
             "-input=false".to_string(),
             "-lock-timeout=60s".to_string(),
-            plan_file.display().to_string(),
+            dir.join(PLAN_FILE).display().to_string(),
         ]
     );
+    let record = fx.record();
+    let used: Vec<&str> = record
+        .lines()
+        .filter_map(|l| l.strip_prefix("planfile:"))
+        .collect();
+    assert_eq!(
+        used,
+        [original.trim_end_matches('\n')],
+        "apply read the verified bytes"
+    );
     assert_eq!(journal.pending_unknown().unwrap(), None);
-    let entry: crate::runner::state::Journal = serde_json::from_slice(
-        &fs::read(
-            ProjectPaths::new(&fx.cfg.state_dir, "web")
-                .unwrap()
-                .journal_json(),
-        )
-        .unwrap(),
+    assert_eq!(journal_result(&fx).as_deref(), Some("applied"));
+    assert!(!copy.exists(), "the copy is deleted when the job ends");
+
+    // A copy path other than this job's is refused.
+    let other = fx.path("state/projects/web/plans/8.tfplan");
+    let err = apply(&fx.cfg, &job(&dir), &other, &sha, &resolved, &journal).unwrap_err();
+    assert_eq!(err.category, "path_refused");
+}
+
+#[test]
+fn discard_plan_removes_the_root_copy() {
+    let fx = fixture();
+    let (_, _, copy, _) = planned(&fx);
+    assert!(copy.exists());
+    discard_plan(&fx.cfg, &job(&fx.job_dir()));
+    assert!(!copy.exists());
+}
+
+#[test]
+fn terraform_is_killed_at_its_timeout() {
+    let mut fx = fixture();
+    fx.set_env("FAKE_TERRAFORM_SLEEP", "init");
+    no_sandbox();
+    let resolved = resolve(&fx.cfg, &fx.project).unwrap();
+    let dir = fx.job_dir();
+    let start = Instant::now();
+    let err = run(
+        &fx.cfg,
+        Launch::Direct,
+        &job(&dir),
+        &["init"],
+        &resolved,
+        None,
+        Duration::from_millis(500),
     )
-    .unwrap();
-    assert_eq!(entry.result.as_deref(), Some("applied"));
+    .unwrap_err();
+    assert_eq!(err.category, "terraform_timeout");
+    assert!(start.elapsed() < Duration::from_secs(10));
+    let log = fs::read_to_string(fx.path("logs/web/7.log")).unwrap();
+    assert!(log.contains("killed: timeout"), "{log}");
+}
+
+#[test]
+fn stdout_kept_in_memory_is_capped() {
+    let mut fx = fixture();
+    let big = fx.path("big.json");
+    fs::write(&big, vec![b'x'; 17 * 1024 * 1024]).unwrap();
+    fx.set_env("FAKE_TERRAFORM_SHOW", &big.display().to_string());
+    no_sandbox();
+    let resolved = resolve(&fx.cfg, &fx.project).unwrap();
+    let dir = fx.job_dir();
+    let out = terraform(&fx.cfg, &job(&dir), &["show", "-json", "x"], &resolved).unwrap();
+    assert!(out.truncated);
+    assert!(out.stdout.len() <= 16 * 1024 * 1024);
+    let logged = fs::metadata(fx.path("logs/web/7.log")).unwrap().len();
+    assert!(logged > 17 * 1024 * 1024, "the log keeps all of it");
+}
+
+#[test]
+fn bwrap_version_gates_disable_userns() {
+    use super::sandbox::version_has_disable_userns as has;
+    assert!(has("bubblewrap 0.8.0"));
+    assert!(has("bubblewrap 0.11.0\n"));
+    assert!(has("bubblewrap 1.0"));
+    assert!(!has("bubblewrap 0.6.2"));
+    assert!(!has("bubblewrap"));
+    assert!(!has(""));
+}
+
+#[test]
+fn prune_continues_past_an_unreadable_project() {
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let fx = fixture();
+    let logs = fx.path("logs");
+    for d in ["a-locked", "b-open"] {
+        fs::create_dir_all(logs.join(d)).unwrap();
+    }
+    let old = logs.join("b-open/old.log");
+    fs::write(&old, b"x").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(90 * 86_400))
+        .unwrap();
+    fs::set_permissions(logs.join("a-locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let removed = prune_logs(&logs, 30);
+    fs::set_permissions(logs.join("a-locked"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(removed.unwrap(), 1);
+    assert!(!old.exists());
 }
 
 #[test]
@@ -788,6 +956,7 @@ fn bwrap_hides_runner_secrets() {
             Path::new("/usr/bin/cat"),
             &[path.as_os_str().to_owned()],
             &[],
+            None,
         )
         .output()
         .unwrap();

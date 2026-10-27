@@ -60,7 +60,27 @@ fn diff_digest_verb(
     }
 }
 
+/// Set only by this repository's integration tests.
+const ALLOW_TEST_HOOKS: &str = "SHOEPHONE_RUNNER_ALLOW_TEST_HOOKS";
+
+/// A build with `test-hooks` can run Terraform without the sandbox, so it
+/// refuses to start unless the integration tests say otherwise.
+fn test_hooks_refusal() -> Option<Status> {
+    let allowed = std::env::var_os(ALLOW_TEST_HOOKS).is_some_and(|v| v == "1");
+    if cfg!(feature = "test-hooks") && !allowed {
+        eprintln!(
+            "shoephone-runner: this build has the test-hooks feature, which can run Terraform \
+             outside the sandbox; refusing to start. Build without --features test-hooks."
+        );
+        return Some(Status::Precondition);
+    }
+    None
+}
+
 fn main() -> ExitCode {
+    if let Some(status) = test_hooks_refusal() {
+        return status.into();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     run(&args).into()
 }
