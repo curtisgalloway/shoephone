@@ -9,10 +9,14 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::Mutex;
+
 use serde::de::DeserializeOwned;
 use ssh_key::PrivateKey;
 use ssh_key::rand_core::{OsRng, RngCore};
 use ureq::Agent;
+use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::api::{
     ById, FinishBody, JobScopeWire, JobStatus, MAX_ARCHIVE_BYTES, RefuseBody, RunnerJob, SubmitBody,
@@ -25,12 +29,25 @@ const TIMESTAMP_HEADER: &str = "shoephone-runner-timestamp";
 /// Header carrying the request's single-use nonce.
 const NONCE_HEADER: &str = "shoephone-runner-nonce";
 
+/// A failure the integration tests inject into one request path.
+/// Exists only with `test-hooks`.
+#[cfg(any(test, feature = "test-hooks"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// The request is never sent; the daemon looks unreachable.
+    Unreachable,
+    /// The request is sent and the daemon acts on it, but its reply is lost.
+    LoseReply,
+}
+
 /// A signed client for one runner.
 pub struct RunnerClient {
     agent: Agent,
     base: String,
     name: String,
     key: PrivateKey,
+    #[cfg(any(test, feature = "test-hooks"))]
+    faults: Mutex<Vec<(String, Fault)>>,
 }
 
 impl std::fmt::Debug for RunnerClient {
@@ -56,18 +73,64 @@ fn unix_now() -> u64 {
 }
 
 impl RunnerClient {
-    pub fn new(base: &str, name: &str, key: PrivateKey) -> RunnerClient {
+    /// Refuses a daemon URL that is not `https://` (plain `http://` only to
+    /// a loopback host). TLS is rustls with the platform verifier, so a
+    /// private CA in the machine's trust store works.
+    pub fn new(base: &str, name: &str, key: PrivateKey) -> Result<RunnerClient, String> {
+        crate::runner::config::check_daemon_url(base)?;
+        let tls = TlsConfig::builder()
+            .root_certs(RootCerts::PlatformVerifier)
+            .build();
         let config = Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(Duration::from_secs(60)))
+            .tls_config(tls)
             .user_agent(concat!("shoephone-runner/", env!("CARGO_PKG_VERSION")))
             .build();
-        RunnerClient {
+        Ok(RunnerClient {
             agent: config.into(),
             base: base.trim_end_matches('/').to_owned(),
             name: name.to_owned(),
             key,
+            #[cfg(any(test, feature = "test-hooks"))]
+            faults: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// For integration tests only: the next request to `path` fails as
+    /// `fault` says. Queued faults are used in order, one per request.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_hooks_fault(&self, path: &str, fault: Fault) {
+        self.faults
+            .lock()
+            .expect("fault list")
+            .push((path.to_owned(), fault));
+    }
+
+    /// The fault queued for `path`, taken off the list.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn take_fault(&self, path: &str) -> Option<Fault> {
+        let mut faults = self.faults.lock().expect("fault list");
+        let i = faults.iter().position(|(p, _)| p == path)?;
+        Some(faults.remove(i).1)
+    }
+
+    /// Sends `send` unless a fault says otherwise.
+    fn faulted<T>(&self, path: &str, send: impl FnOnce() -> Result<T, Error>) -> Result<T, Error> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        match self.take_fault(path) {
+            Some(Fault::Unreachable) => {
+                return Err(Error::Unreachable("injected by a test".into()));
+            }
+            Some(Fault::LoseReply) => {
+                let _ = send();
+                return Err(Error::Ambiguous("reply lost (injected by a test)".into()));
+            }
+            None => {}
         }
+        #[cfg(not(any(test, feature = "test-hooks")))]
+        let _ = path;
+        send()
     }
 
     /// The three signature headers for one request.
@@ -106,7 +169,7 @@ impl RunnerClient {
         for (k, v) in self.headers("POST", path, &bytes, job)? {
             req = req.header(k, v);
         }
-        decode(req.send(&bytes[..])?)
+        self.faulted(path, || decode(req.send(&bytes[..])?))
     }
 
     /// `POST /api/runner/poll`: the next job for this runner, if any.
@@ -122,23 +185,25 @@ impl RunnerClient {
         for (k, v) in self.headers("GET", &path, b"", Some(id))? {
             req = req.header(k, v);
         }
-        let mut resp = req.call()?;
-        let http = resp.status().as_u16();
-        if !(200..300).contains(&http) {
-            return decode::<serde_json::Value>(resp).map(|_| Vec::new());
-        }
-        resp.body_mut()
-            .with_config()
-            .limit(MAX_ARCHIVE_BYTES as u64 + 1)
-            .read_to_vec()
-            .map_err(|e| Error::Protocol(e.to_string()))
-            .and_then(|bytes| {
-                if bytes.len() > MAX_ARCHIVE_BYTES {
-                    Err(Error::Protocol("the archive is too large".into()))
-                } else {
-                    Ok(bytes)
-                }
-            })
+        self.faulted(&path, || {
+            let mut resp = req.call()?;
+            let http = resp.status().as_u16();
+            if !(200..300).contains(&http) {
+                return decode::<serde_json::Value>(resp).map(|_| Vec::new());
+            }
+            resp.body_mut()
+                .with_config()
+                .limit(MAX_ARCHIVE_BYTES as u64 + 1)
+                .read_to_vec()
+                .map_err(|e| Error::Protocol(e.to_string()))
+                .and_then(|bytes| {
+                    if bytes.len() > MAX_ARCHIVE_BYTES {
+                        Err(Error::Protocol("the archive is too large".into()))
+                    } else {
+                        Ok(bytes)
+                    }
+                })
+        })
     }
 
     /// `POST /api/runner/submit`: hand in a planned scope and its display.
@@ -184,6 +249,14 @@ impl RunnerClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plain_http_daemon_is_refused() {
+        let key = PrivateKey::random(&mut OsRng, ssh_key::Algorithm::Ed25519).unwrap();
+        assert!(RunnerClient::new("http://approve.example.internal", "r", key.clone()).is_err());
+        assert!(RunnerClient::new("https://approve.example.internal", "r", key.clone()).is_ok());
+        assert!(RunnerClient::new("http://127.0.0.1:7391", "r", key).is_ok());
+    }
 
     #[test]
     fn nonces_are_fresh_and_single_line() {

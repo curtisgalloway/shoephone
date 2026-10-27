@@ -105,6 +105,47 @@ fn names_a_child(path: &str) -> bool {
         )
 }
 
+/// The runner acts on what the daemon answers, so the channel must be
+/// authenticated: `https://`, or plain `http://` only to a loopback host
+/// (`127.0.0.1`, `::1`, `localhost`), which never leaves the machine.
+pub fn check_daemon_url(url: &str) -> Result<(), String> {
+    let refuse = || {
+        Err(format!(
+            "daemon {url:?} must be an https:// URL (plain http:// only to 127.0.0.1, ::1 or localhost)"
+        ))
+    };
+    let (scheme, rest) = match url.split_once("://") {
+        Some(parts) => parts,
+        None => return refuse(),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return refuse();
+    }
+    match scheme {
+        "https" => Ok(()),
+        "http" => {
+            let host = if let Some(v6) = authority.strip_prefix('[') {
+                match v6.split_once(']') {
+                    Some((host, port)) if port.is_empty() || port.starts_with(':') => host,
+                    _ => return refuse(),
+                }
+            } else {
+                match authority.split_once(':') {
+                    Some((host, _port)) => host,
+                    None => authority,
+                }
+            };
+            if matches!(host, "127.0.0.1" | "::1" | "localhost") {
+                Ok(())
+            } else {
+                refuse()
+            }
+        }
+        _ => refuse(),
+    }
+}
+
 impl RunnerConfig {
     /// Read and validate the config. This checks only what the file itself
     /// contains. The overlap between a project's `variables` and its schema
@@ -119,6 +160,7 @@ impl RunnerConfig {
     }
 
     fn validate(&self) -> Result<(), String> {
+        check_daemon_url(&self.daemon)?;
         if self.secret_command.is_empty() || self.secret_command[0].is_empty() {
             return Err("secret_command must not be empty".to_string());
         }
@@ -190,6 +232,36 @@ mod tests {
         assert!(parse(&bad).unwrap_err().contains("surprise"));
         let bad = EXAMPLE.replace("terraform_version", "terraform_versio");
         assert!(parse(&bad).is_err());
+    }
+
+    #[test]
+    fn config_refuses_a_daemon_url_without_tls() {
+        for bad in [
+            "http://approve.example.internal",
+            "http://10.0.0.1:7391",
+            "http://127.0.0.1.example.internal",
+            "http://localhost@evil.example",
+            "http://[::2]:80",
+            "ftp://approve.example.internal",
+            "approve.example.internal",
+            "https://",
+        ] {
+            let text = EXAMPLE.replace("https://approve.example.internal", bad);
+            assert!(
+                parse(&text).unwrap_err().contains("https://"),
+                "{bad} must be refused"
+            );
+        }
+        for good in [
+            "https://approve.example.internal",
+            "https://approve.example.internal:8443/base",
+            "http://127.0.0.1:7391",
+            "http://localhost:7391",
+            "http://[::1]:7391",
+        ] {
+            let text = EXAMPLE.replace("https://approve.example.internal", good);
+            assert!(parse(&text).is_ok(), "{good} must be accepted");
+        }
     }
 
     #[test]
