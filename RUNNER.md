@@ -24,7 +24,58 @@ runner. Agents do not run it; the operator does.
 `--config` defaults to `/etc/shoephone-runner/shoephone-runner.toml`. An
 example with placeholder values is `contrib/runner/shoephone-runner.toml.example`.
 
-`run` is not implemented yet; it exits 3.
+### run
+
+Startup: probe the sandbox (warnings on stderr), prune old logs, remove
+every job directory and plan copy an earlier run left behind, and report any
+apply that `journal.json` still says is `applying` to the daemon as
+`outcome_unknown` (the baseline is marked `uncertain`) before the first
+poll. An unreadable journal stops the runner (exit 3) until the operator
+checks the project by hand.
+
+The loop polls every 2 s, backing off to 30 s while the daemon cannot be
+reached, and handles one job at a time. Every request is signed with the
+runner key over a fresh nonce and the current time.
+
+- **Trust.** The baseline is the daemon's trusted record, which must match
+  the local `trusted.json` and `trusted/` tree (otherwise the job is refused
+  `baseline_mismatch`; `shoephoned untrust` clears it). The archive is
+  unpacked into `state_dir/jobs/<id>/candidate`, the baseline's execution
+  input is copied beside it, the directory is handed to `review_user`, and
+  `review-worker` runs as that user with no credentials and an environment
+  of only `PATH`. Its scope and diff are submitted. On approval the runner
+  unpacks the archive again itself, checks the approved candidate and
+  schema digests, installs only the execution input as `trusted/`, writes
+  `trusted.json`, and reports `trusted`; if the daemon does not record it,
+  the previous trust is put back.
+- **Apply.** Refused `no_trusted_revision` unless the daemon's record, the
+  local `trusted.json` and a fresh digest of `trusted/` agree, and the
+  schema file still hashes to the recorded schema digest. The manifest is
+  validated against that schema; Terraform gets only its canonical text.
+  The execution input is copied from `trusted/` into
+  `state_dir/jobs/<id>/checkout`, handed to `terraform_user`, and planned.
+  A plan that deletes or replaces anything without `--allow-destroy` is
+  refused `destroy_not_requested` with those addresses. Otherwise the
+  scope (counts, destructive flag and address text from one plan summary)
+  and the display (canonical manifest, the `applied.json` baseline, the
+  address text) are submitted. On approval the job is claimed and the
+  pinned context is recomputed; a change fails the job `apply_failed`
+  with category `context_changed` before anything runs. `applied.json` is
+  marked `uncertain` (keeping the last applied manifest) before Terraform
+  starts and set to `applied` with the new manifest only on success. A
+  `terraform_timeout` or a Terraform killed by a signal
+  (`terraform_crashed`) is reported `outcome_unknown`; any other failure
+  `apply_failed`.
+
+A job's directory and root-only plan copy are removed when it ends, however
+it ends: applied, failed, refused, declined, timed out or killed (noticed
+when the daemon's job status says it is over). An approval the runner has
+no plan for (it restarted after submitting) is claimed and failed with
+`plan_lost`, so nothing is applied from it.
+
+`state_dir/jobs` is created 0711 so each worker user can reach its own 0700
+job directory; `state_dir` itself must therefore be traversable (0711 or
+0755) by `review_user` and `terraform_user`.
 
 ### review-worker
 
@@ -76,7 +127,8 @@ checked when the project is trusted.
 Under `state_dir/projects/<name>/`:
 
 - `trusted/`: the unpacked trusted tree.
-- `trusted.json`: `{ digest, schema }`.
+- `trusted.json`: `{ digest, schema, modes }`, `modes` holding the archive
+  header mode of each file of the trusted tree, which the digest covers.
 - `applied.json`: `{ manifest, status }`, status `applied` or `uncertain`.
 - `journal.json`: `{ job, phase, result }`, phase `claimed`, `applying` or
   `done`.
@@ -116,6 +168,7 @@ Bands follow the house contract: under 100 is portable.
 
 - 0: success.
 - 2: usage error.
-- 3: config missing or invalid, a bad `review-worker` request, a `test-hooks`
-  build started without the test variable, or the verb is not implemented yet.
+- 3: config missing or invalid, an unreadable runner key or apply journal,
+  a bad `review-worker` request, or a `test-hooks` build started without the
+  test variable.
 - 30: a review or `diff-digest` was refused.

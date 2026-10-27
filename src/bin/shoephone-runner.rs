@@ -5,8 +5,7 @@
 //!
 //! Verbs: `run` (the poll loop), `review-worker <job-dir>` (the
 //! credential-free review step), `diff-digest` (the operator's check of a
-//! trust review) and `--skill`. `run` is not implemented yet and exits with
-//! status 3.
+//! trust review) and `--skill`.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -14,6 +13,7 @@ use std::process::ExitCode;
 use shoephone::exit::{Status, VERSION};
 use shoephone::runner::config::RunnerConfig;
 use shoephone::runner::review::{WorkerError, diff_digest, review_worker};
+use shoephone::runner::run;
 
 /// The runner's own agent-facing document, compiled in so it cannot drift.
 const RUNNER_DOC: &str = include_str!("../../RUNNER.md");
@@ -82,17 +82,17 @@ fn main() -> ExitCode {
         return status.into();
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
-    run(&args).into()
+    dispatch(&args)
 }
 
-fn run(args: &[String]) -> Status {
+fn dispatch(args: &[String]) -> ExitCode {
     if args.iter().any(|a| a == "--skill") {
         print!("{}", RUNNER_DOC.replace("{{VERSION}}", VERSION));
-        return Status::Ok;
+        return Status::Ok.into();
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("shoephone-runner {VERSION}");
-        return Status::Ok;
+        return Status::Ok.into();
     }
     let json = args.iter().any(|a| a == "--json");
     let args: Vec<String> = args.iter().filter(|a| *a != "--json").cloned().collect();
@@ -106,7 +106,7 @@ fn run(args: &[String]) -> Status {
                 Some(v) => config = v.clone(),
                 None => {
                     eprintln!("--config needs a value");
-                    return usage();
+                    return usage().into();
                 }
             }
         } else {
@@ -114,32 +114,36 @@ fn run(args: &[String]) -> Status {
         }
     }
     match rest.as_slice() {
-        ["run"] => {
-            if let Err(e) = RunnerConfig::from_file(std::path::Path::new(&config)) {
+        ["run"] => match RunnerConfig::from_file(Path::new(&config)) {
+            Ok(cfg) => run::run(cfg),
+            Err(e) => {
                 eprintln!("shoephone-runner: {e}");
-                return Status::Precondition;
-            }
-            eprintln!("shoephone-runner: run is not yet implemented");
-            Status::Precondition
-        }
-        ["review-worker", job_dir] => match review_worker(Path::new(job_dir)) {
-            Ok(()) => Status::Ok,
-            Err(WorkerError::Refused(f)) => {
-                eprintln!("shoephone-runner: review refused: {}", f.category);
-                Status::Permanent
-            }
-            Err(WorkerError::Request(e)) => {
-                eprintln!("shoephone-runner: {e}");
-                Status::Precondition
+                Status::Precondition.into()
             }
         },
+        ["review-worker", job_dir] => review_worker_verb(job_dir).into(),
         [
             "diff-digest",
             baseline_digest,
             baseline,
             candidate,
             project_path,
-        ] => diff_digest_verb(baseline_digest, baseline, candidate, project_path, json),
-        _ => usage(),
+        ] => diff_digest_verb(baseline_digest, baseline, candidate, project_path, json).into(),
+        _ => usage().into(),
+    }
+}
+
+/// `review-worker <job-dir>`, which `run` starts as `review_user`.
+fn review_worker_verb(job_dir: &str) -> Status {
+    match review_worker(Path::new(job_dir)) {
+        Ok(()) => Status::Ok,
+        Err(WorkerError::Refused(f)) => {
+            eprintln!("shoephone-runner: review refused: {}", f.category);
+            Status::Permanent
+        }
+        Err(WorkerError::Request(e)) => {
+            eprintln!("shoephone-runner: {e}");
+            Status::Precondition
+        }
     }
 }
