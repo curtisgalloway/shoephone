@@ -188,11 +188,19 @@ config or another job. Then, as root on the host:
 1. Start the service with a test project and confirm a job runs as
    `shoephone-terraform` (`ps -o user,cmd` during a plan), the review as
    `shoephone-review`, and that neither can read `/etc/shoephone-runner`.
-2. Check that a job directory under `state_dir/jobs` is owned by the worker
+2. Run the ignored sandbox test under the actual unit's restrictions, with
+   `systemd-run --pty --wait --property=CapabilityBoundingSet='...'
+   --property=NoNewPrivileges=no --property=ProtectSystem=strict ...`
+   mirroring every setting of the unit (or run the unit itself with a test
+   config), as the test binary. Note any capability bwrap reports missing
+   and add it to the unit with a comment. If you switch to unprivileged user
+   namespaces, repeat this with `ProtectKernelTunables`, `ProtectKernelLogs`
+   and `ProtectControlGroups` relaxed, since they overmount `/proc`.
+3. Check that a job directory under `state_dir/jobs` is owned by the worker
    user, mode 0700, that `state_dir/jobs` itself is 0711, and that the other
    worker user cannot list it.
-3. Check that the production user switch worked: the worker processes have
+4. Check that the production user switch worked: the worker processes have
    no supplementary groups and no capabilities
    (`grep -E 'Cap|Groups' /proc/<pid>/status`).
-4. Confirm the firewall: as `shoephone-terraform`, a connection to an unlisted
+5. Confirm the firewall: as `shoephone-terraform`, a connection to an unlisted
    address is rejected and counted.

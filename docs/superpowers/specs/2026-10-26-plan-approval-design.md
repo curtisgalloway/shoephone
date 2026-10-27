@@ -276,7 +276,8 @@ variables it supplies itself.
   size cap on archives.
 - Ledger and push: `trust requested`, `trust waiting`, `trusted`,
   `apply requested`, `plan started`, `plan refused`, `apply waiting`,
-  `applied`, `apply failed`, `outcome unknown`, plus the existing declined
+  `applied`, `apply failed`, `outcome unknown`, `job requested`, `job
+  approved`, `job killed`, `untrusted`, plus the existing declined
   and timed out. Only the two `waiting` events interrupt. `server::push_for`
   stays an exhaustive match.
 - The ledger and `/api/pending` have no read authentication today. So
@@ -431,3 +432,17 @@ why.
 - **Test-hooks start guard.** Both binaries built with `test-hooks` refuse to
   start unless an explicit variable is set, so a deployed build cannot carry
   the test routes or the no-sandbox path by accident.
+- **Project names.** A project name matches `[A-Za-z0-9._-]{1,64}`, since
+  names are runner config keys and need no `/`.
+- **Manifest canonical form.** A manifest is a JSON object with sorted keys and
+  no whitespace, every schema key present, variable names `[a-z_][a-z0-9_]{0,63}`,
+  integers emitted exactly, and strings free of control and bidi characters.
+  Integral floats render as integers and -0.0 as 0, so equal values give equal
+  bytes.
+- **More ledger and push kinds.** `job_requested`, `job_approved`,
+  `job_killed` and `untrusted` were added so every event pushes or is
+  ledgered. `untrusted` is written by the console and cannot push.
+- **Startup reconcile.** A trust record with no `trusted` ledger entry is
+  dropped at daemon startup, since the audit trail is authoritative.
+- **Live untrust.** `shoephoned untrust` works while the daemon runs, under an
+  advisory flock on `trusted.lock`, which the daemon takes too.

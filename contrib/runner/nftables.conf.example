@@ -3,8 +3,9 @@
 #
 # Per-user egress rules for the runner host. Every address below is a
 # placeholder from a documentation range (RFC 5737, RFC 3849); replace them
-# with your own. Load with:  nft -f /etc/nftables.d/shoephone-runner.conf
-# Check first with:         nft -c -f contrib/runner/nftables.conf.example
+# with your own.
+# Load with:         nft -f /etc/nftables.d/shoephone-runner.conf
+# Check first with:  nft -c -f contrib/runner/nftables.conf.example
 #
 # Who may connect out, by the user that owns the process (meta skuid):
 #   shoephone-terraform  only the listed provider endpoints (tcp 443, and tcp
@@ -19,26 +20,38 @@
 # the operator is allowed from the operator network only. Replace the user
 # names if config uses others.
 
+# Time: the runner's signed requests fail beyond 60 s of clock skew, so root
+# must reach a time server. DHCP: if this host gets its address by DHCP, add
+# rules allowing udp 67/68 (client) in both directions, or lease renewal
+# will be dropped.
+
+# Start clean so a reload replaces these rules instead of appending.
+flush ruleset
+
 define daemon_host = 192.0.2.10
 define resolver = 192.0.2.53
 define operator_net = 203.0.113.0/24
 define terraform_endpoints = { 198.51.100.20, 198.51.100.21 }
 define ssh_upload_endpoints = { 198.51.100.30 }
 define secrets_store = 192.0.2.20
+define time_server = 192.0.2.123
 
 table inet shoephone_runner {
     chain input {
         type filter hook input priority 0; policy drop;
         ct state established,related accept
         iifname "lo" accept
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
         ip saddr $operator_net tcp dport 22 ct state new accept
-        counter log prefix "runner-in-drop " drop
+        limit rate 10/minute log prefix "runner-in-drop "
+        counter drop
     }
 
     chain output {
         type filter hook output priority 0; policy drop;
         ct state established,related accept
         oifname "lo" accept
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
 
         meta skuid "shoephone-review" counter reject with icmpx type admin-prohibited
 
@@ -51,7 +64,9 @@ table inet shoephone_runner {
         meta skuid root ip daddr $resolver udp dport 53 accept
         meta skuid root ip daddr $daemon_host tcp dport 443 accept
         meta skuid root ip daddr $secrets_store tcp dport 443 accept
+        meta skuid root ip daddr $time_server udp dport 123 accept
 
-        counter log prefix "runner-out-drop " reject with icmpx type admin-prohibited
+        limit rate 10/minute log prefix "runner-out-drop "
+        counter reject with icmpx type admin-prohibited
     }
 }
