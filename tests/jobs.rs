@@ -1160,3 +1160,27 @@ async fn startup_drops_trust_without_a_ledger_entry() {
     let polled = rig.poll().await;
     assert!(polled["trusted"].is_null(), "{polled}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_keeps_an_audited_trust() {
+    let dir = scratch("jobs-reconcile-keep");
+    let key = runner_key();
+    let (client, d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = claimed_trust(&rig, &client).await;
+    assert_eq!(finish_trusted(&rig, id).await.http, 200);
+    drop(d);
+
+    let ca_key = dir.join("user_ca");
+    let (client2, _d2) =
+        start_everything(&dir, &ca_key, None, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig2 = Rig::new(&client2, "r1", &key);
+    let client2 = Arc::new(client2);
+    let records = Store::new(&dir).load_trusted().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].job, id);
+    file_trust(&client2, "net", b"tar again").await;
+    let polled = rig2.poll().await;
+    assert_eq!(polled["trusted"]["digest"], hex('c'));
+}

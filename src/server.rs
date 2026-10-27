@@ -2184,7 +2184,18 @@ fn finish_trusted(
         .jobs
         .finish(now, runner, &project, req.id, JobResult::Trusted)
     {
-        let _ = restore_trusted_file(d, &undo);
+        if !restore_trusted_file(d, &undo) {
+            // Near-unreachable: the pre-checks above make `Jobs::finish`
+            // accept this. If it fails anyway and the file cannot be put
+            // back, an unaudited record is on disk. Trust nothing for the
+            // project and refuse audited calls (including the reload in
+            // `refresh_trusted`) until a restart, when reconcile drops it.
+            inner.trusted.remove(&project);
+            inner.jobs.set_trusted(&project, None);
+            inner.ledger_failed = Some(format!(
+                "trust for {project:?} could not be rolled back; restart to reconcile"
+            ));
+        }
         return Err(finish_failure(e));
     }
     inner.claimed.remove(&req.id);
