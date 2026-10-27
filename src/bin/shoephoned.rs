@@ -311,6 +311,10 @@ fn forget(config: &Config, target: &str) -> Status {
 /// Console-only, like `forget`, but safe with the daemon running: the write
 /// takes the same lock the daemon takes, and the daemon reads `trusted.json`
 /// again on its next runner poll and trust approval.
+///
+/// The removal is ledgered as an `untrusted` line ([`Store::untrust`]). The
+/// console has no push channel, so the phone learns of it from the ledger
+/// view, not from a notification.
 fn untrust(config: &Config, project: &str, json: bool) -> Status {
     let store = Store::new(&config.state_dir);
     match store.untrust(project) {

@@ -478,7 +478,39 @@ impl Store {
     /// the project had none. Other projects' records are untouched. Safe
     /// while the daemon runs: it takes the same lock, and the daemon reads
     /// the file again on its next runner poll.
+    ///
+    /// A removal is written to the ledger as one `untrusted` line (`host` is
+    /// the project, `id` the removed record's job). The console cannot push,
+    /// so the phone learns of an untrust from the ledger view, not from a
+    /// notification. The line is a single `write_all` on an `O_APPEND` file
+    /// (see [`Store::append_ledger`]), so it cannot interleave with a line
+    /// the running daemon appends at the same moment. If that append fails
+    /// the record is already gone and the error says so.
     pub fn untrust(&self, project: &str) -> Result<Option<TrustRecord>, String> {
+        let removed = self.untrust_record(project)?;
+        if let Some(record) = &removed {
+            let entry = LedgerEntry {
+                seq: None,
+                at: unix(SystemTime::now()),
+                kind: "untrusted".to_owned(),
+                host: record.project.clone(),
+                id: Some(record.job),
+                serial: None,
+                until: None,
+                reason: None,
+                context: None,
+                category: None,
+            };
+            self.append_ledger(&[entry]).map_err(|e| {
+                format!(
+                    "the trust record was removed but the ledger line could not be written: {e}"
+                )
+            })?;
+        }
+        Ok(removed)
+    }
+
+    fn untrust_record(&self, project: &str) -> Result<Option<TrustRecord>, String> {
         self.update_trusted(|records| {
             let Some(found) = records.iter().find(|r| r.project == project).cloned() else {
                 return (None, None);
@@ -537,10 +569,17 @@ impl Store {
             .append(true)
             .open(&path)
             .map_err(|e| format!("opening {}: {e}", path.display()))?;
+        // One `write_all` for the whole batch: the file is `O_APPEND`, so the
+        // kernel places the bytes at the end in one step and a concurrent
+        // appender (the console's `untrust` while the daemon runs) cannot
+        // land in the middle of a line.
+        let mut buf = String::new();
         for e in entries {
-            let line = serde_json::to_string(e).map_err(|e| e.to_string())?;
-            writeln!(f, "{line}").map_err(|e| format!("writing {}: {e}", path.display()))?;
+            buf.push_str(&serde_json::to_string(e).map_err(|e| e.to_string())?);
+            buf.push('\n');
         }
+        f.write_all(buf.as_bytes())
+            .map_err(|e| format!("writing {}: {e}", path.display()))?;
         f.sync_all()
             .map_err(|e| format!("syncing {}: {e}", path.display()))
     }
@@ -994,6 +1033,11 @@ mod tests {
         assert_eq!(store.load_trusted().unwrap(), vec![record("db", "dd")]);
         assert_eq!(store.untrust("web").unwrap(), None);
         assert_eq!(store.load_trusted().unwrap().len(), 1);
+        let ledger = store.read_ledger(None, 10).unwrap();
+        assert_eq!(ledger.len(), 1, "only the real removal is ledgered");
+        assert_eq!(ledger[0].kind, "untrusted");
+        assert_eq!(ledger[0].host, "web");
+        assert_eq!(ledger[0].id, Some(gone.job));
         fs::remove_dir_all(&dir).unwrap();
     }
 
