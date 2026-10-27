@@ -107,3 +107,255 @@ fn refused_connection_is_unreachable() {
     let err = client.status().unwrap_err();
     assert_eq!(err.status(), Status::Unreachable);
 }
+
+// ---------------------------------------------------------------------
+// The binary itself: stdout piped, stdin closed, NO_COLOR=1, as CI runs it
+// ---------------------------------------------------------------------
+
+mod common;
+
+use std::process::{Command, Output, Stdio};
+
+use serde_json::json;
+
+fn shoephone(args: &[&str], dir: &std::path::Path) -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_shoephone"));
+    cmd.args(args)
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .env_remove("SHOEPHONE_DAEMON")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[test]
+fn trust_in_dirty_tree_exits_3() {
+    let repo = scratch("dirty-tree");
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("main.tf"), "# one\n").unwrap();
+    git(&repo, &["add", "main.tf"]);
+    git(&repo, &["commit", "-q", "-m", "one"]);
+    std::fs::write(repo.join("main.tf"), "# two\n").unwrap();
+
+    let out = shoephone(
+        &[
+            "trust",
+            "net",
+            "--reason",
+            "r",
+            "--daemon",
+            "http://127.0.0.1:1",
+        ],
+        &repo,
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("git status"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn trust_outside_a_repository_exits_3() {
+    let dir = scratch("not-a-repo");
+    let out = shoephone(
+        &[
+            "trust",
+            "net",
+            "--reason",
+            "r",
+            "--daemon",
+            "http://127.0.0.1:1",
+        ],
+        &dir,
+    )
+    .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap())
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", text(&out.stderr));
+}
+
+#[test]
+fn apply_missing_manifest_exits_3() {
+    let dir = scratch("no-manifest");
+    let out = shoephone(
+        &[
+            "apply",
+            "net",
+            "--manifest",
+            "does-not-exist.json",
+            "--reason",
+            "r",
+            "--daemon",
+            "http://127.0.0.1:1",
+        ],
+        &dir,
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(3), "stderr: {}", text(&out.stderr));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn apply_oversized_manifest_exits_30() {
+    let dir = scratch("big-manifest");
+    std::fs::write(dir.join("m.json"), vec![b' '; 64 * 1024 + 1]).unwrap();
+    let out = shoephone(
+        &[
+            "apply",
+            "net",
+            "--manifest",
+            "m.json",
+            "--reason",
+            "r",
+            "--daemon",
+            "http://127.0.0.1:1",
+        ],
+        &dir,
+    )
+    .output()
+    .unwrap();
+    assert_eq!(out.status.code(), Some(30), "stderr: {}", text(&out.stderr));
+}
+
+#[test]
+fn skill_mentions_trust_and_apply() {
+    let dir = scratch("skill");
+    let out = shoephone(&["--skill"], &dir).output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let skill = text(&out.stdout);
+    for needle in [
+        "shoephone trust",
+        "shoephone apply",
+        "outcome_unknown",
+        "102",
+        "never retry",
+    ] {
+        assert!(skill.contains(needle), "SKILL.md lacks {needle:?}");
+    }
+}
+
+fn run_apply_against_daemon(
+    result: &'static str,
+    category: &'static str,
+    extra: &'static [&'static str],
+    name: &str,
+) -> Output {
+    let dir = scratch(name);
+    std::fs::write(dir.join("m.json"), "{}").unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let key = common::runner_key();
+        let (client, _d) = common::start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+        let base = client.base().to_owned();
+        let mut args = vec![
+            "apply",
+            "net",
+            "--manifest",
+            "m.json",
+            "--reason",
+            "r",
+            "--daemon",
+            &base,
+        ];
+        args.extend_from_slice(extra);
+        let mut child = shoephone(&args, &dir).spawn().unwrap();
+        let client = std::sync::Arc::new(client);
+        let c = client.clone();
+        let id = common::blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if let Some(job) = c.status().unwrap().job {
+                    return Some((job.id, child));
+                }
+                if child.try_wait().unwrap().is_some() || std::time::Instant::now() > deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+        .await;
+        let Some((id, child)) = id else {
+            panic!("the binary never filed a job");
+        };
+        let (b2, k2) = (base.clone(), key.clone());
+        let reply = common::blocking(move || {
+            common::runner_post(&b2, &k2, "r1", "/api/runner/poll", &json!({}), None);
+            common::runner_post(
+                &b2,
+                &k2,
+                "r1",
+                "/api/runner/refuse",
+                &json!({
+                    "id": id,
+                    "result": result,
+                    "failure": { "category": category, "addresses": ["a.b"], "detail": null },
+                }),
+                Some(id),
+            )
+        })
+        .await;
+        assert_eq!(reply.http, 200, "{}", text(&reply.body));
+        common::blocking(move || child.wait_with_output().unwrap()).await
+    })
+}
+
+#[test]
+fn apply_refused_exits_30_with_category_on_stderr() {
+    let out = run_apply_against_daemon("refused", "policy", &[], "apply-refused");
+    assert_eq!(out.status.code(), Some(30), "stderr: {}", text(&out.stderr));
+    let err = text(&out.stderr);
+    assert!(err.contains("policy"), "{err}");
+    assert!(err.contains("a.b"), "{err}");
+}
+
+#[test]
+fn apply_plan_failed_exits_100_and_json_has_the_shape() {
+    let out = run_apply_against_daemon("plan_failed", "tf_error", &["--json"], "apply-planfail");
+    assert_eq!(
+        out.status.code(),
+        Some(100),
+        "stderr: {}",
+        text(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["empty"], false);
+    let r = &v["result"];
+    assert_eq!(r["project"], "net");
+    assert_eq!(r["kind"], "apply");
+    assert_eq!(r["outcome"], "plan_failed");
+    assert_eq!(r["category"], "tf_error");
+    assert_eq!(r["addresses"], json!(["a.b"]));
+    assert!(r["counts"].is_null());
+    assert!(r["changed_variables"].is_null());
+}

@@ -9,8 +9,12 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use serde_json::json;
-use shoephone::api::{RequestBody, RequestState};
+use shoephone::api::{
+    ApplyBody, JobReply, JobStatus, MAX_ARCHIVE_BYTES, MAX_MANIFEST_BYTES, RequestBody,
+    RequestState, TrustBody,
+};
 use shoephone::client::{Client, Error};
 use shoephone::exit::{SKILL, Status, VERSION};
 use shoephone::session::Session;
@@ -38,6 +42,8 @@ struct Opts {
     window: Option<u64>,
     reason: Option<String>,
     context: Option<String>,
+    manifest: Option<String>,
+    allow_destroy: bool,
     positional: Vec<String>,
 }
 
@@ -48,6 +54,8 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         window: None,
         reason: None,
         context: None,
+        manifest: None,
+        allow_destroy: false,
         positional: Vec::new(),
     };
     let mut it = args.iter();
@@ -58,6 +66,11 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--context" => {
                 let v = it.next().ok_or("--context needs a URL")?;
                 opts.context = Some(v.clone());
+            }
+            "--allow-destroy" => opts.allow_destroy = true,
+            "--manifest" => {
+                let v = it.next().ok_or("--manifest needs a file")?;
+                opts.manifest = Some(v.clone());
             }
             "--reason" => {
                 let v = it.next().ok_or("--reason needs text")?;
@@ -129,9 +142,18 @@ fn run(args: &[String]) -> Status {
         (Some("request"), Some(h)) => request(&opts, h),
         (Some("renew"), Some(h)) => renew(&opts, h),
         (Some("disavow"), Some(h)) => disavow(&opts, h),
+        (Some("trust"), Some(p)) => trust(&opts, p),
+        (Some("apply"), Some(p)) => apply(&opts, p),
         (Some("request" | "renew" | "disavow"), None) => {
             eprintln!(
                 "shoephone: {} needs a host; try --skill",
+                verb.unwrap_or_default()
+            );
+            Status::Usage
+        }
+        (Some("trust" | "apply"), None) => {
+            eprintln!(
+                "shoephone: {} needs a project; try --skill",
                 verb.unwrap_or_default()
             );
             Status::Usage
@@ -353,15 +375,22 @@ fn status(opts: &Opts) -> Status {
         Ok(s) => {
             if opts.json {
                 println!("{}", serde_json::to_string(&s).unwrap_or_default());
-            } else if s.windows.is_empty() {
-                println!("no open windows");
             } else {
+                if s.windows.is_empty() && s.job.is_none() {
+                    println!("no open windows");
+                }
                 for w in &s.windows {
                     println!(
                         "admin on {} for {} (key {})",
                         w.host,
                         in_minutes(w.ends_at),
                         w.fingerprint
+                    );
+                }
+                if let Some(j) = &s.job {
+                    println!(
+                        "active job #{}: {} {} ({})",
+                        j.id, j.kind, j.project, j.state
                     );
                 }
             }
@@ -618,4 +647,313 @@ fn disavow(opts: &Opts, host: &str) -> Status {
         }
         Err(e) => fail(&e),
     }
+}
+
+fn project_ok(project: &str) -> bool {
+    !project.is_empty()
+        && project
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_'))
+}
+
+/// The `--reason` text, or the usage error the caller returns.
+fn need_reason(opts: &Opts) -> Result<String, Status> {
+    match opts
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
+        Some(r) => Ok(r.to_owned()),
+        None => {
+            eprintln!(
+                "shoephone: --reason is required: say what the change is and why; the person reads it before approving"
+            );
+            Err(Status::Usage)
+        }
+    }
+}
+
+/// Run git with a cleared environment (plus `PATH` and `HOME`), never
+/// through a shell. Returns its stdout, or the reason it failed.
+fn git(args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args)
+        .env_clear()
+        .stdin(std::process::Stdio::null());
+    for var in ["PATH", "HOME"] {
+        if let Some(v) = std::env::var_os(var) {
+            cmd.env(var, v);
+        }
+    }
+    let out = cmd.output().map_err(|e| format!("cannot run git: {e}"))?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
+    }
+}
+
+/// The whole repository at `HEAD`, from the repo root, as a gzip tar.
+fn repo_archive() -> Result<Vec<u8>, (Status, String)> {
+    let top = git(&["rev-parse", "--show-toplevel"]).map_err(|e| {
+        (
+            Status::Precondition,
+            format!("run this inside the Terraform repository's git checkout: {e}"),
+        )
+    })?;
+    let top = String::from_utf8_lossy(&top).trim().to_owned();
+    let dirty = git(&["-C", &top, "status", "--porcelain", "--untracked-files=no"])
+        .map_err(|e| (Status::Precondition, format!("git status failed: {e}")))?;
+    if !dirty.is_empty() {
+        return Err((
+            Status::Precondition,
+            "tracked files have uncommitted changes (see `git status`); commit or stash them, because only HEAD is trusted".to_owned(),
+        ));
+    }
+    let tar = git(&["-C", &top, "archive", "--format=tar", "HEAD"])
+        .map_err(|e| (Status::Precondition, format!("git archive failed: {e}")))?;
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gz, &tar).map_err(|e| {
+        (
+            Status::Precondition,
+            format!("cannot compress the archive: {e}"),
+        )
+    })?;
+    let gz = gz.finish().map_err(|e| {
+        (
+            Status::Precondition,
+            format!("cannot compress the archive: {e}"),
+        )
+    })?;
+    if gz.len() > MAX_ARCHIVE_BYTES {
+        return Err((
+            Status::Permanent,
+            format!(
+                "archive_too_large: the compressed repository is {} MiB; the limit is {} MiB",
+                gz.len() >> 20,
+                MAX_ARCHIVE_BYTES >> 20
+            ),
+        ));
+    }
+    Ok(gz)
+}
+
+fn trust(opts: &Opts, project: &str) -> Status {
+    if !project_ok(project) {
+        eprintln!("shoephone: {project:?} is not a project name");
+        return Status::Usage;
+    }
+    let reason = match need_reason(opts) {
+        Ok(r) => r,
+        Err(s) => return s,
+    };
+    let client = match need_client(opts) {
+        Ok(c) => c,
+        Err(s) => return s,
+    };
+    let archive = match repo_archive() {
+        Ok(a) => a,
+        Err((status, msg)) => {
+            eprintln!("shoephone: {msg}");
+            return status;
+        }
+    };
+    let reply = match client.trust(&TrustBody {
+        project: project.to_owned(),
+        archive: base64::engine::general_purpose::STANDARD.encode(&archive),
+        reason,
+        requester: requester(),
+        context: opts.context.clone().or_else(session_link),
+    }) {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    wait_for_job(opts, &client, &reply, "trust")
+}
+
+fn apply(opts: &Opts, project: &str) -> Status {
+    if !project_ok(project) {
+        eprintln!("shoephone: {project:?} is not a project name");
+        return Status::Usage;
+    }
+    let reason = match need_reason(opts) {
+        Ok(r) => r,
+        Err(s) => return s,
+    };
+    let Some(path) = opts.manifest.as_deref() else {
+        eprintln!("shoephone: --manifest FILE is required: the JSON file of variable values");
+        return Status::Usage;
+    };
+    let manifest = match std::fs::read(path) {
+        Ok(b) if b.len() > MAX_MANIFEST_BYTES => {
+            eprintln!(
+                "shoephone: {path}: manifest_too_large: {} bytes; the limit is {MAX_MANIFEST_BYTES}",
+                b.len()
+            );
+            return Status::Permanent;
+        }
+        Ok(b) => match String::from_utf8(b) {
+            Ok(t) => t,
+            Err(_) => {
+                eprintln!("shoephone: {path}: not UTF-8 text");
+                return Status::Permanent;
+            }
+        },
+        Err(e) => {
+            eprintln!("shoephone: cannot read manifest {path}: {e}");
+            return Status::Precondition;
+        }
+    };
+    let client = match need_client(opts) {
+        Ok(c) => c,
+        Err(s) => return s,
+    };
+    let reply = match client.apply(&ApplyBody {
+        project: project.to_owned(),
+        manifest,
+        allow_destroy: opts.allow_destroy,
+        reason,
+        requester: requester(),
+        context: opts.context.clone().or_else(session_link),
+    }) {
+        Ok(r) => r,
+        Err(e) => return fail(&e),
+    };
+    wait_for_job(opts, &client, &reply, "apply")
+}
+
+/// Poll a filed job until it is done, then report and map the outcome.
+fn wait_for_job(opts: &Opts, client: &Client, reply: &JobReply, kind: &str) -> Status {
+    eprintln!(
+        "shoephone: match code {}  <- the person compares this with their phone",
+        reply.match_code
+    );
+    if !opts.json {
+        println!("match code: {}", reply.match_code);
+    }
+    eprintln!(
+        "shoephone: waiting for the {kind} (the runner plans first, then the person decides)"
+    );
+    // The daemon settles every state on its own clock, so this is only a
+    // backstop against a poll loop that never ends.
+    let deadline = Instant::now() + Duration::from_secs(8 * 3600);
+    let mut hinted = false;
+    let mut failures = 0;
+    let done = loop {
+        match client.job(reply.id) {
+            Ok(job) => {
+                failures = 0;
+                if job.state == "done" {
+                    break job;
+                }
+                if job.state == "waiting" && !hinted {
+                    hinted = true;
+                    if kind == "trust" {
+                        eprintln!("shoephone: approve on your phone: trust this code");
+                    } else {
+                        eprintln!("shoephone: approve this apply on your phone");
+                    }
+                }
+            }
+            Err(Error::Daemon {
+                http: 404,
+                reply: r,
+            }) if r.code == "no_such_job" => {
+                eprintln!(
+                    "shoephone: the daemon no longer knows job {}; its outcome is unknown. Check the real state before anything else",
+                    reply.id
+                );
+                return Status::OutcomeUnknown;
+            }
+            // A poll only reads, so a few failed ones are not the end.
+            Err(Error::Unreachable(_) | Error::Ambiguous(_)) if failures < 5 => failures += 1,
+            Err(e) => return fail(&e),
+        }
+        if Instant::now() > deadline {
+            eprintln!(
+                "shoephone: no result after 8 hours; check `shoephone status` before retrying"
+            );
+            return Status::RetryUnknown;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
+    report_job(opts, &done)
+}
+
+fn report_job(opts: &Opts, job: &JobStatus) -> Status {
+    let outcome = job.result.as_deref().unwrap_or("unknown");
+    let (category, addresses) = match &job.failure {
+        Some(f) => (Some(f.category.as_str()), f.addresses.as_slice()),
+        None => (None, &[][..]),
+    };
+    if let Some(f) = &job.failure {
+        eprintln!(
+            "shoephone: {outcome}: {}{}",
+            f.category,
+            f.detail
+                .as_deref()
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default()
+        );
+        for a in &f.addresses {
+            eprintln!("shoephone:   {a}");
+        }
+    }
+    let status = match outcome {
+        "trusted" | "applied" => Status::Ok,
+        "declined" | "timed_out" => {
+            eprintln!("shoephone: {outcome}; do not retry");
+            Status::AuthDenied
+        }
+        "killed" => {
+            eprintln!("shoephone: the job was killed; do not retry");
+            Status::AuthDenied
+        }
+        "refused" => Status::Permanent,
+        "plan_failed" => Status::PlanFailed,
+        "apply_failed" => {
+            eprintln!("shoephone: the apply failed part way; check the real state before retrying");
+            Status::ApplyFailed
+        }
+        "outcome_unknown" => {
+            eprintln!(
+                "shoephone: the runner cannot say whether the apply took effect. Check the real state before anything else; do not retry"
+            );
+            Status::OutcomeUnknown
+        }
+        other => {
+            eprintln!("shoephone: unexpected result {other:?}; check `shoephone status`");
+            Status::RetryUnknown
+        }
+    };
+    if opts.json {
+        let counts = job.summary.as_ref().map(|s| {
+            json!({
+                "create": s.create,
+                "update": s.update,
+                "replace": s.replace,
+                "delete": s.delete,
+            })
+        });
+        println!(
+            "{}",
+            json!({
+                "result": {
+                    "id": job.id,
+                    "project": job.project,
+                    "kind": job.kind,
+                    "outcome": outcome,
+                    "category": category,
+                    "addresses": addresses,
+                    "counts": counts,
+                    "changed_variables": job.summary.as_ref().map(|s| &s.variables),
+                },
+                "empty": false,
+            })
+        );
+    } else if status == Status::Ok {
+        println!("{outcome}: {}", job.project);
+    }
+    status
 }

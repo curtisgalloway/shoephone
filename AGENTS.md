@@ -40,9 +40,11 @@ A two-tier access model for an agent that operates machines:
   `SKILL.md`, compiled in with `include_str!` so it cannot drift. `--json` is
   one document on stdout; diagnostics go to stderr. Never prompt when stdin
   is not a TTY.
-- **Tool-specific exit codes (100-124):** none yet. Every outcome fits the
-  portable bands (see `SKILL.md`). Record any new code here so the next
-  session extends the list instead of renumbering.
+- **Tool-specific exit codes (100-124):** `100` plan failed (`plan_failed`),
+  `101` apply failed (`apply_failed`), `102` outcome unknown
+  (`outcome_unknown`: check the real state before anything else). Every other
+  outcome fits the portable bands (see `SKILL.md`). Record any new code here
+  so the next session extends the list instead of renumbering.
 - **Generic by construction.** No real hostnames, vault names, addresses or
   secrets in this repo, ever. The estate-specific deployment lives in the
   operator's private infrastructure repo.
@@ -72,7 +74,12 @@ code, and amended since. Change a decision here first, then in the code.
 | Kill also declines | `kill <host>` closes every window for the host and declines any request still pending for it, with the usual cooldown, so a tap a moment later cannot reopen what was just closed. From the 2026-09-06 review. |
 | Two windows per host | Allowed: a second request for a host with an open window is a new approval. `issue` selects on host and key together, so each approved key gets its own window's certificate. |
 | Enrollment | `shoephoned enroll --name <device>`, at the console, stores the SHA-256 of a one-time code in the root-only state dir and prints the code and a QR. The app or the web page consumes it within 10 minutes or 5 wrong guesses. The agent never sees the code. A name already enrolled is refused; `forget` works by handle, because a name identifies nobody. |
-| Build status | Grant state machine, CA signing, HTTP surface with WebAuthn and ledger, the five CLI verbs, and both push channels are done and tested. Deployment lives in the operator's infrastructure repo. |
+| Terraform plan approval | Design in `docs/superpowers/specs/2026-10-26-plan-approval-design.md`: `trust` and `apply` jobs, a runner that holds the credentials, and a phone approval bound to the displayed diff or plan. |
+| Runner channel | The runner refuses a daemon URL that is not `https://`, unless the host is loopback, because it acts on what the daemon says. |
+| Claimed-job lifetime | A claimed job the daemon never hears from lapses to `outcome_unknown` after `claim_ttl` (default 3 h, set with `[policy] claim_ttl_minutes`). The runner journals every claim and result and re-sends. |
+| Root re-review | The runner's root process recomputes the trust review itself (diff digest and counts) and refuses `review_inconsistent` on a mismatch with the worker. This is why root parses archive content. |
+| `trust` archive | The whole repository at `HEAD`, from the repo root, gzipped in the CLI. Tracked changes refuse with exit 3; a gzip over 16 MiB refuses with exit 30. Git runs with a cleared environment plus `PATH` and `HOME`. |
+| Build status | Grant state machine, CA signing, HTTP surface with WebAuthn and ledger, the five CLI verbs plus `trust` and `apply`, the runner, and both push channels are done and tested. Deployment lives in the operator's infrastructure repo. |
 
 ## Security invariants
 
@@ -90,6 +97,12 @@ Do not relax these in code.
   a kill switch that closes the window, so no new login works after one
   certificate lifetime. It does not end a session already open; that is a
   host-side limit.
+- Terraform runs with credentials only at a project's one trusted revision,
+  and only with a manifest that passed that revision's schema.
+- An apply grant applies only the saved plan whose digest the approver
+  signed, at most once.
+- Nothing that can hold a credential is returned to the agent or written to
+  the daemon's ledger.
 - Every issuance, renewal, decline, and kill is reported to the approver's
   device. The daemon's own logs are not the audit trail.
 

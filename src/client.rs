@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use ureq::Agent;
+use ureq::tls::{RootCerts, TlsConfig};
 
 use crate::api::*;
 use crate::exit::Status;
@@ -52,10 +53,19 @@ impl Error {
             Error::Ambiguous(_) => Status::RetryUnknown,
             Error::Protocol(_) => Status::RetryUnknown,
             Error::Daemon { http, reply } => match reply.code.as_str() {
-                "unknown_host" | "unknown_project" | "bad_key" | "bad_archive" | "bad_request"
-                | "archive_too_large" | "manifest_too_large" | "reason_required" => {
-                    Status::Permanent
-                }
+                "unknown_host"
+                | "unknown_project"
+                | "bad_key"
+                | "bad_archive"
+                | "bad_request"
+                | "archive_too_large"
+                | "manifest_too_large"
+                | "reason_required"
+                | "no_trusted_revision"
+                | "destroy_not_requested"
+                | "inconsistent_scope"
+                | "stale_baseline" => Status::Permanent,
+                code if code.starts_with("manifest_") => Status::Permanent,
                 "busy" => Status::RetryClean,
                 "cooldown" | "rate_capped" => Status::RetryLater,
                 "no_window" | "no_such_request" => Status::AuthNeedsHuman,
@@ -95,6 +105,20 @@ impl From<ureq::Error> for Error {
     }
 }
 
+/// rustls with the platform verifier, so a private CA in the machine's trust
+/// store works; the same choice the runner's client makes.
+fn agent_config(timeout: Duration) -> ureq::config::Config {
+    let tls = TlsConfig::builder()
+        .root_certs(RootCerts::PlatformVerifier)
+        .build();
+    Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout))
+        .tls_config(tls)
+        .user_agent(concat!("shoephone/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
 pub struct Client {
     agent: Agent,
     base: String,
@@ -108,13 +132,8 @@ impl Client {
     /// Like [`Client::new`], but with an explicit global timeout instead of
     /// the default 15 seconds. For tests that need a short one.
     pub fn with_timeout(base: &str, timeout: Duration) -> Self {
-        let config = Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(timeout))
-            .user_agent(concat!("shoephone/", env!("CARGO_PKG_VERSION")))
-            .build();
         Self {
-            agent: config.into(),
+            agent: agent_config(timeout).into(),
             base: base.trim_end_matches('/').to_owned(),
         }
     }
@@ -235,6 +254,32 @@ mod tests {
                 until: None,
             },
         }
+    }
+
+    #[test]
+    fn job_refusals_are_permanent() {
+        for code in [
+            "unknown_project",
+            "no_trusted_revision",
+            "manifest_too_large",
+            "manifest_type",
+            "destroy_not_requested",
+            "inconsistent_scope",
+            "archive_too_large",
+            "bad_archive",
+            "stale_baseline",
+        ] {
+            assert_eq!(daemon(code, 400).status(), Status::Permanent, "{code}");
+        }
+    }
+
+    #[test]
+    fn the_agent_verifies_tls_with_the_platform_verifier() {
+        let config = agent_config(Duration::from_secs(1));
+        assert!(matches!(
+            config.tls_config().root_certs(),
+            RootCerts::PlatformVerifier
+        ));
     }
 
     #[test]

@@ -956,6 +956,15 @@ impl Jobs {
         self.entries.iter().find(|e| e.job.id == id).map(|e| &e.job)
     }
 
+    /// The job that has not finished, if any. At most one exists.
+    pub fn active(&mut self, now: SystemTime) -> Option<&Job> {
+        self.clamp(now);
+        self.entries
+            .iter()
+            .find(|e| !matches!(e.job.state, JobState::Done(_)))
+            .map(|e| &e.job)
+    }
+
     /// The job awaiting the approver's verdict, if any.
     pub fn waiting(&mut self, now: SystemTime) -> Option<&Job> {
         self.clamp(now);

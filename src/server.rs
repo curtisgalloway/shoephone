@@ -697,10 +697,13 @@ async fn page() -> Html<&'static str> {
 
 async fn status(State(d): App) -> Reply<StatusReply> {
     let now = now();
-    let (devices, windows) = d.with(|inner| {
+    let policy = d.config.policy();
+    let (devices, windows, job) = d.with(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
         (
             inner.devices.iter().map(|x| x.name.clone()).collect(),
             window_views(inner, now),
+            inner.jobs.active(now).map(job_status),
         )
     });
     Ok(Json(StatusReply {
@@ -709,6 +712,7 @@ async fn status(State(d): App) -> Reply<StatusReply> {
         devices,
         windows,
         ca_fingerprint: d.ca.fingerprint().to_string(),
+        job,
     }))
 }
 

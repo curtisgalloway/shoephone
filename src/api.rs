@@ -91,6 +91,9 @@ pub struct StatusReply {
     pub devices: Vec<String>,
     pub windows: Vec<WindowView>,
     pub ca_fingerprint: String,
+    /// The Terraform job that has not finished, if any. At most one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

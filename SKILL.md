@@ -1,6 +1,6 @@
 ---
 name: shoephone
-description: Request a phone-approved, short-lived SSH certificate for admin work on a host, renew it inside the approved window, end it early, and check why a request cannot succeed before making it. Use when an agent session needs escalation beyond its promptless read-only account, or when `shoephone` exits non-zero and you need to know what the code means.
+description: Request a phone-approved, short-lived SSH certificate for admin work on a host, renew it inside the approved window, end it early, and check why a request cannot succeed before making it. Also file Terraform trust and apply jobs for a person to approve. Use when an agent session needs escalation beyond its promptless read-only account, or when `shoephone` exits non-zero and you need to know what the code means.
 ---
 <!--
   SPDX-FileCopyrightText: 2026 Curtis Galloway
@@ -26,7 +26,9 @@ shoephone doctor                     # check everything a request needs
 shoephone request <host> --reason "..." [--context URL] [--window MINUTES]
 shoephone renew <host>               # a fresh certificate inside the open window
 shoephone disavow <host>             # end the window early; unload the key
-shoephone status                     # list open windows
+shoephone status                     # list open windows and the active Terraform job
+shoephone trust <project> --reason "..."
+shoephone apply <project> --manifest FILE --reason "..." [--allow-destroy]
 shoephone --skill                    # print this document
 shoephone --version
 ```
@@ -72,6 +74,39 @@ ssh agent-admin@web01 sudo ...
 When the task is done, run `shoephone disavow <host>`. A certificate already
 loaded still works until it expires.
 
+## Terraform: trust and apply
+
+For a project the daemon manages, a person approves on their phone and a
+runner holding the credentials does the work. You never hold a credential.
+
+- `shoephone trust <project> --reason "..."` archives the whole repository at
+  `HEAD` and files it for the person to read as a diff. Run it from inside the
+  checkout. It refuses (exit 3, naming `git status`) when tracked files have
+  uncommitted changes, because only committed code can be trusted. Untracked
+  files are ignored. An archive over 16 MiB compressed is refused (exit 30).
+- `shoephone apply <project> --manifest FILE --reason "..."` sends FILE (JSON,
+  at most 64 KiB) as is. The manifest holds variable values and nothing else:
+  no code, no secrets. The runner validates it and may refuse it (exit 30,
+  with the category and addresses on stderr). `--allow-destroy` says the plan
+  may delete resources; without it, a plan that deletes is refused.
+
+Both print a match code and then wait, polling every 2 seconds, until the job
+is done. The person compares the code with their phone. The runner plans
+first, so the wait can be several minutes.
+
+`--json` prints, once the job is done:
+
+```
+{"result": {"id", "project", "kind", "outcome", "category", "addresses", "counts", "changed_variables"}, "empty": false}
+```
+
+`outcome` is `trusted`, `applied`, `refused`, `plan_failed`, `apply_failed`,
+`outcome_unknown`, `declined`, `timed_out` or `killed`. `category` and
+`addresses` describe a failure (`null` and `[]` otherwise). `counts`
+(`create`, `update`, `replace`, `delete`) and `changed_variables` come from
+the plan summary and are `null` when there is none. Manifest values are never
+printed.
+
 ## Exit status
 
 | Code | Meaning | What to do |
@@ -87,7 +122,10 @@ loaded still works until it expires.
 | 20 | another request is pending | wait for it; a retry is free |
 | 22 | the daemon answered with an error or nonsense, or the connection failed after the request may have been sent; outcome unknown | run `shoephone status` before retrying |
 | 23 | cooldown or hourly cap; stderr says until when | come back after that time |
-| 30 | permanent: unknown host or a malformed key | the request itself must change |
+| 30 | permanent: unknown host or project, a malformed key, a manifest or archive the runner or daemon refused | the request itself must change; stderr names the category |
+| 100 | `plan_failed`: the Terraform plan failed; nothing was applied | read the category on stderr, fix the code or manifest, then file again |
+| 101 | `apply_failed`: the apply started and failed; infrastructure may be partly changed | check the real state; do not blindly file the same apply again |
+| 102 | `outcome_unknown`: the runner cannot say whether the apply took effect | check the real state before anything else; do not retry |
 
 ## Output
 
@@ -109,6 +147,17 @@ the exit status to learn the answer was empty. `request` and `renew` return:
 - **Exit 12 is a verdict.** Do not retry a declined or timed-out request.
   Each one adds to a growing cooldown, and the hourly cap is shared by every
   requester.
+- **Exit 102 means check before anything else.** An apply that may or may not
+  have happened must be read back from the infrastructure itself. Do not file
+  another apply, and never retry it.
+- **Never retry exit 12 on `trust` or `apply` either.** A declined or timed-out
+  job is the person's answer, and it adds to the cooldown.
+- **A trust request is rare.** The person has to read a diff of the whole
+  repository. File one only after the code change is committed and reviewed,
+  and say in `--reason` what changed.
+- **The manifest holds data only.** Variable values go in; code, scripts and
+  secrets never do. To change what Terraform does, change the code and trust
+  it.
 - **One host per request.** A window covers one host and one key. Admin on a
   second host is a second request and a second approval.
 - **Run `shoephone doctor` first** in a new environment. It reports the

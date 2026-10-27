@@ -51,6 +51,15 @@ pub enum Status {
 
     // 30s: permanent. The request itself must change.
     Permanent = 30,
+
+    // 100-124: this tool's own.
+    /// A Terraform plan failed before anything was applied.
+    PlanFailed = 100,
+    /// An apply started and failed; the infrastructure may be partly changed.
+    ApplyFailed = 101,
+    /// The runner could not say whether an apply took effect. Check the real
+    /// state before doing anything else.
+    OutcomeUnknown = 102,
 }
 
 impl From<Status> for ExitCode {
