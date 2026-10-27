@@ -130,6 +130,7 @@ pub struct PolicyConfig {
     pub plan_timeout_minutes: Option<u64>,
     pub approval_ttl_minutes: Option<u64>,
     pub max_plan_age_minutes: Option<u64>,
+    pub claim_ttl_minutes: Option<u64>,
 }
 
 fn default_listen() -> String {
@@ -248,6 +249,7 @@ impl Config {
             plan_timeout: mins(p.plan_timeout_minutes, d.plan_timeout),
             approval_ttl: mins(p.approval_ttl_minutes, d.approval_ttl),
             max_plan_age: mins(p.max_plan_age_minutes, d.max_plan_age),
+            claim_ttl: mins(p.claim_ttl_minutes, d.claim_ttl),
         }
     }
 }
@@ -282,6 +284,10 @@ web01 = "agent-admin:web01"
         c.validate().unwrap();
         assert_eq!(c.policy().max_window, Duration::from_secs(7200));
         assert_eq!(c.policy().cert_ttl, Duration::from_secs(600));
+
+        let text = format!("{MINIMAL}\n[policy]\nclaim_ttl_minutes = 240\n");
+        let c: Config = toml::from_str(&text).unwrap();
+        assert_eq!(c.policy().claim_ttl, Duration::from_secs(4 * 3600));
 
         let bad = MINIMAL.replace("https://", "http://");
         let c: Config = toml::from_str(&bad).unwrap();

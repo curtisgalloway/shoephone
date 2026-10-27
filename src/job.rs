@@ -231,6 +231,9 @@ struct Entry {
     plan_timeout: Duration,
     approval_ttl: Duration,
     max_plan_age: Duration,
+    claim_ttl: Duration,
+    /// When the runner claimed it, for [`lapse_claimed`].
+    claimed_at: Option<SystemTime>,
     /// When the job reached `Done`, for [`Jobs::prune`].
     done_at: Option<SystemTime>,
 }
@@ -295,6 +298,27 @@ fn lapse_approved(entry: &mut Entry, events: &mut Vec<JobEvent>, now: SystemTime
     }
     entry.settle(JobResult::TimedOut, now);
     events.push(JobEvent::TimedOut {
+        id: entry.job.id,
+        project: entry.job.project.clone(),
+        at: lapsed,
+    });
+    true
+}
+
+/// Record a `Claimed` job whose runner has not reported within `claim_ttl`
+/// as `OutcomeUnknown`, dated to when it lapsed. Nobody knows whether the
+/// apply ran, and a runner that lost its result must not block every later
+/// job. Returns whether it did.
+fn lapse_claimed(entry: &mut Entry, events: &mut Vec<JobEvent>, now: SystemTime) -> bool {
+    if entry.job.state != JobState::Claimed {
+        return false;
+    }
+    let lapsed = entry.claimed_at.unwrap_or(entry.job.created) + entry.claim_ttl;
+    if lapsed > now {
+        return false;
+    }
+    entry.settle(JobResult::OutcomeUnknown, now);
+    events.push(JobEvent::OutcomeUnknown {
         id: entry.job.id,
         project: entry.job.project.clone(),
         at: lapsed,
@@ -495,6 +519,8 @@ impl Jobs {
             plan_timeout: policy.plan_timeout,
             approval_ttl: policy.approval_ttl,
             max_plan_age: policy.max_plan_age,
+            claim_ttl: policy.claim_ttl,
+            claimed_at: None,
             done_at: None,
         });
         Ok(job)
@@ -747,6 +773,7 @@ impl Jobs {
                     }
                 }
                 entry.job.state = JobState::Claimed;
+                entry.claimed_at = Some(now);
                 Ok(scope)
             }
             JobState::Claimed => Err(Refusal::AlreadyClaimed),
@@ -907,12 +934,15 @@ impl Jobs {
     /// - `Waiting` past the approval window times out, with a strike.
     /// - `Approved` and unclaimed past `max_plan_age` from the plan times
     ///   out, with no strike: the approver did answer.
+    /// - `Claimed` with no result past `claim_ttl` from the claim ends as
+    ///   `OutcomeUnknown`, with no strike.
     /// - A job that finished more than an hour ago is forgotten.
     pub fn tick(&mut self, now: SystemTime, gate: &mut Gate, policy: &Policy) {
         let now = self.clamp(now);
         for entry in &mut self.entries {
             if lapse_planning(entry, &mut self.events, gate, now)
                 || lapse_approved(entry, &mut self.events, now)
+                || lapse_claimed(entry, &mut self.events, now)
             {
                 continue;
             }
@@ -1686,6 +1716,63 @@ mod tests {
             Err(Refusal::NoSuchRequest)
         );
         assert_eq!(r.jobs.take_events().len(), 1);
+    }
+
+    #[test]
+    fn claimed_job_lapses_to_outcome_unknown_after_claim_ttl() {
+        let mut r = Rig::new();
+        let nonce = r.waiting(1, apply_kind(), apply_scope());
+        r.approve(t(3), 1, &nonce, &apply_scope()).unwrap();
+        r.jobs.claim(t(4), "runner-a", 1).unwrap();
+        r.jobs.take_events();
+        let ttl = r.policy.claim_ttl;
+        assert_eq!(ttl, Duration::from_secs(3 * 60 * 60), "the default");
+
+        // Just inside the limit nothing happens, and a new job is busy.
+        let policy = r.policy.clone();
+        r.jobs.tick(t(4) + ttl - MIN, &mut r.gate, &policy);
+        assert_eq!(r.state(1), JobState::Claimed);
+        assert_eq!(
+            r.request(t(4) + ttl - MIN, 2, apply_kind()).unwrap_err(),
+            Refusal::Busy
+        );
+
+        r.jobs.tick(t(4) + ttl + MIN, &mut r.gate, &policy);
+        assert_eq!(r.state(1), JobState::Done(JobResult::OutcomeUnknown));
+        assert_eq!(
+            r.jobs.take_events(),
+            vec![JobEvent::OutcomeUnknown {
+                id: 1,
+                project: "web".into(),
+                at: t(4) + ttl,
+            }]
+        );
+        assert_eq!(r.gate.strikes, 0);
+        // The one-job rule is free again, and a late finish is refused.
+        r.request(t(4) + ttl + MIN, 2, apply_kind()).unwrap();
+        assert_eq!(
+            r.jobs
+                .finish(t(4) + ttl + MIN, "runner-a", "web", 1, JobResult::Applied),
+            Err(Refusal::NoSuchRequest)
+        );
+    }
+
+    #[test]
+    fn claim_ttl_counts_from_the_claim_not_the_request() {
+        let mut r = Rig::new();
+        r.policy.claim_ttl = 10 * MIN;
+        let nonce = r.waiting(1, apply_kind(), apply_scope());
+        r.approve(t(3), 1, &nonce, &apply_scope()).unwrap();
+        r.jobs.claim(t(2) + 9 * MIN, "runner-a", 1).unwrap();
+        let policy = r.policy.clone();
+        r.jobs.tick(t(2) + 15 * MIN, &mut r.gate, &policy);
+        assert_eq!(
+            r.state(1),
+            JobState::Claimed,
+            "only 6 minutes since the claim"
+        );
+        r.jobs.tick(t(2) + 20 * MIN, &mut r.gate, &policy);
+        assert_eq!(r.state(1), JobState::Done(JobResult::OutcomeUnknown));
     }
 
     #[test]

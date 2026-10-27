@@ -70,6 +70,11 @@ pub struct Policy {
     /// The oldest a plan may be when it is approved or claimed. Older plans
     /// are refused or expire, so an apply never runs a stale plan.
     pub max_plan_age: Duration,
+    /// How long a claimed job may go without a result from its runner
+    /// before the daemon records its outcome as unknown and frees the
+    /// one-job slot. Above three Terraform timeouts, so a running apply is
+    /// not cut short.
+    pub claim_ttl: Duration,
 }
 
 impl Default for Policy {
@@ -85,6 +90,7 @@ impl Default for Policy {
             plan_timeout: Duration::from_secs(10 * 60),
             approval_ttl: Duration::from_secs(5 * 60),
             max_plan_age: Duration::from_secs(15 * 60),
+            claim_ttl: Duration::from_secs(3 * 60 * 60),
         }
     }
 }
