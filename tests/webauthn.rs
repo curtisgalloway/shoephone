@@ -997,3 +997,194 @@ async fn enrollment_returns_a_secret_only_once_and_stores_its_hash() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------
+// Terraform jobs: the same ceremony, over a job's scope.
+// ---------------------------------------------------------------------
+
+mod common;
+
+fn hex64(c: char) -> String {
+    c.to_string().repeat(64)
+}
+
+/// A well-formed apply scope for `project` and the display that backs it.
+fn apply_scope(project: &str) -> (serde_json::Value, serde_json::Value) {
+    let manifest = "canonical manifest text";
+    let address_text = "create aws_s3_bucket.logs\n";
+    let scope = json!({
+        "kind": "apply",
+        "project": project,
+        "revision": hex64('1'),
+        "schema": hex64('2'),
+        "manifest": sha256_hex(manifest),
+        "baseline_manifest": null,
+        "baseline_status": "none",
+        "plan": hex64('3'),
+        "destructive": false,
+        "counts": { "create": 1, "update": 0, "replace": 0, "delete": 0 },
+        "addresses": sha256_hex(address_text),
+    });
+    let display = json!({
+        "manifest": manifest,
+        "baseline_manifest": null,
+        "address_text": address_text,
+    });
+    (scope, display)
+}
+
+/// File an apply for `net`, have its runner plan and submit, and return the
+/// job id once it is waiting on the approver.
+async fn waiting_apply(
+    client: &Arc<Client>,
+    runner: &ssh_key::PrivateKey,
+) -> (u64, serde_json::Value) {
+    let c = client.clone();
+    let id = blocking(move || {
+        c.apply(&shoephone::api::ApplyBody {
+            project: "net".into(),
+            manifest: "{}".into(),
+            allow_destroy: false,
+            reason: "webauthn test: apply".into(),
+            requester: "agent".into(),
+            context: None,
+        })
+    })
+    .await
+    .unwrap()
+    .id;
+    let (base, key) = (client.base().to_owned(), runner.clone());
+    let (scope, display) = apply_scope("net");
+    blocking(move || {
+        let polled = common::runner_post(&base, &key, "r1", "/api/runner/poll", &json!({}), None);
+        assert_eq!(polled.http, 200);
+        let body = json!({ "id": id, "scope": scope, "display": display });
+        let submitted =
+            common::runner_post(&base, &key, "r1", "/api/runner/submit", &body, Some(id));
+        assert_eq!(
+            submitted.http,
+            200,
+            "{}",
+            String::from_utf8_lossy(&submitted.body)
+        );
+    })
+    .await;
+    (id, apply_scope("net").0)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_approval_with_real_assertion_moves_job_to_approved() {
+    let dir = scratch("job-approve");
+    let runner = common::runner_key();
+    let (client, _daemon) = common::start_runners(&dir, &[("net", "r1")], &[("r1", &runner)]).await;
+    let client = Arc::new(client);
+    let base = client.base().to_owned();
+    let agent = test_agent();
+    let (mut key, user_handle_b64, _secret) = enroll(&dir, &base, &agent, "test-phone");
+
+    let (id, _) = waiting_apply(&client, &runner).await;
+
+    let resp = agent.get(format!("{base}/api/pending")).call().unwrap();
+    let state: ApproverState = expect_ok(resp);
+    assert!(state.pending.is_none());
+    let view = state.job.expect("the waiting apply is in the pending view");
+    assert_eq!(view.id, id);
+    assert_eq!(view.project, "net");
+    assert_eq!(view.kind, "apply");
+    assert_eq!(view.requester, "agent");
+    assert_eq!(view.nonce.len(), 64);
+    assert_eq!(
+        view.display.address_text.as_deref(),
+        Some("create aws_s3_bucket.logs\n")
+    );
+
+    let resp = agent
+        .post(format!("{base}/api/approve/start"))
+        .send_json(json!({ "id": id }))
+        .unwrap();
+    let rcr: RequestChallengeResponse = expect_ok(resp);
+    let expected_bytes = format!(
+        "shoephone-apply-v1\nproject=net\nrevision={}\nschema={}\nmanifest={}\n\
+         baseline_manifest=none\nbaseline_status=none\nplan={}\ndestructive=0\n\
+         create=1\nupdate=0\nreplace=0\ndelete=0\naddresses={}\nnonce={}\n",
+        hex64('1'),
+        hex64('2'),
+        sha256_hex("canonical manifest text"),
+        hex64('3'),
+        sha256_hex("create aws_s3_bucket.logs\n"),
+        view.nonce
+    );
+    assert_eq!(
+        b64url(rcr.public_key.challenge.as_slice()),
+        b64url(&sha256(expected_bytes.as_bytes()))
+    );
+
+    let challenge_b64 = b64url(rcr.public_key.challenge.as_slice());
+    let assertion = key.assert(&challenge_b64, 0x05, &user_handle_b64);
+    let resp = agent
+        .post(format!("{base}/api/approve/finish"))
+        .send_json(json!({ "id": id, "credential": assertion }))
+        .unwrap();
+    let body: serde_json::Value = expect_ok(resp);
+    assert_eq!(body["approved"], id);
+
+    let c = client.clone();
+    let status = blocking(move || c.job(id)).await.unwrap();
+    assert_eq!(status.state, "approved");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assertion_over_ssh_challenge_cannot_approve_job() {
+    let dir = scratch("job-ssh-assertion");
+    let runner = common::runner_key();
+    let (client, _daemon) = common::start_runners(&dir, &[("net", "r1")], &[("r1", &runner)]).await;
+    let client = Arc::new(client);
+    let base = client.base().to_owned();
+    let agent = test_agent();
+    let (mut key, user_handle_b64, _secret) = enroll(&dir, &base, &agent, "test-phone");
+
+    // An SSH request goes through the ceremony and is approved, which also
+    // frees the approver's one slot.
+    let session = Session::new(dir.join("session"));
+    let session_key = session.public_key().unwrap();
+    let c = client.clone();
+    let body = request_body(&session_key, "webauthn test: ssh first");
+    let reply = blocking(move || c.request(&body)).await.unwrap();
+    let resp = agent
+        .post(format!("{base}/api/approve/start"))
+        .send_json(json!({ "id": reply.id }))
+        .unwrap();
+    let rcr: RequestChallengeResponse = expect_ok(resp);
+    let ssh_challenge = b64url(rcr.public_key.challenge.as_slice());
+    let assertion = key.assert(&ssh_challenge, 0x05, &user_handle_b64);
+    let resp = agent
+        .post(format!("{base}/api/approve/finish"))
+        .send_json(json!({ "id": reply.id, "credential": assertion }))
+        .unwrap();
+    let _: serde_json::Value = expect_ok(resp);
+
+    // A fresh assertion, with a fresh counter, over that same SSH challenge.
+    let stale = key.assert(&ssh_challenge, 0x05, &user_handle_b64);
+
+    let (id, _) = waiting_apply(&client, &runner).await;
+    let resp = agent
+        .post(format!("{base}/api/approve/start"))
+        .send_json(json!({ "id": id }))
+        .unwrap();
+    let rcr: RequestChallengeResponse = expect_ok(resp);
+    assert_ne!(b64url(rcr.public_key.challenge.as_slice()), ssh_challenge);
+
+    let resp = agent
+        .post(format!("{base}/api/approve/finish"))
+        .send_json(json!({ "id": id, "credential": stale }))
+        .unwrap();
+    expect_error(resp, 403, "assertion_rejected");
+
+    let c = client.clone();
+    let status = blocking(move || c.job(id)).await.unwrap();
+    assert_eq!(status.state, "waiting", "the job must still be waiting");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

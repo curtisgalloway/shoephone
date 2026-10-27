@@ -151,9 +151,38 @@ pub struct PendingView {
     pub expires: u64,
 }
 
+/// A Terraform trust or apply waiting on the approver, inside
+/// [`ApproverState`]. Built only from a job that is `Waiting`.
+///
+/// `nonce`, `scope` and `display` are exposed for the same reason as in
+/// [`PendingView`]: the approve page recomputes the digests in `scope` from
+/// `display`, then `sha256(scope.bytes_to_sign(nonce))`, and checks the
+/// result against the WebAuthn challenge before it will sign anything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobPendingView {
+    pub id: u64,
+    pub project: String,
+    /// `trust` or `apply`.
+    pub kind: String,
+    pub match_code: String,
+    pub nonce: String,
+    pub reason: String,
+    pub requester: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    pub created: u64,
+    pub expires: u64,
+    pub scope: JobScopeWire,
+    pub display: DisplayWire,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApproverState {
     pub pending: Option<PendingView>,
+    /// The Terraform job waiting on the approver, if any. At most one of
+    /// `pending` and `job` is set: the two share the approver's one slot.
+    #[serde(default)]
+    pub job: Option<JobPendingView>,
     pub enrolled: usize,
     pub windows: Vec<WindowView>,
 }

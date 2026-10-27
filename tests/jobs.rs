@@ -1184,3 +1184,90 @@ async fn startup_keeps_an_audited_trust() {
     let polled = rig2.poll().await;
     assert_eq!(polled["trusted"]["digest"], hex('c'));
 }
+
+fn push_bodies(rx: &std::sync::mpsc::Receiver<String>, want: usize) -> Vec<String> {
+    (0..want)
+        .map(|_| {
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a push was expected")
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trust_job_pushes_one_per_event_and_only_the_waiting_one_asks() {
+    let dir = scratch("jobs-push");
+    let ca_key = dir.join("user_ca");
+    shoephone::ca::UserCa::generate("test CA")
+        .unwrap()
+        .write_openssh_file(&ca_key)
+        .unwrap();
+    let (url, pushes) = fake_topic();
+    let notify = shoephone::notify::NotifyConfig {
+        url,
+        token: None,
+        click: None,
+    };
+    let key = runner_key();
+    let (client, _d) = start_everything(
+        &dir,
+        &ca_key,
+        Some(notify),
+        &[("net", "r1")],
+        &[("r1", &key)],
+    )
+    .await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    claimed_trust(&rig, &client).await;
+    assert_eq!(
+        push_bodies(&pushes, 4),
+        [
+            "A deploy request was filed.",
+            "A deploy plan was started.",
+            "A code change is waiting for your approval.",
+            "A deploy was approved.",
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_undone_trust_sends_no_push() {
+    let dir = scratch("jobs-push-undo");
+    let ca_key = dir.join("user_ca");
+    shoephone::ca::UserCa::generate("test CA")
+        .unwrap()
+        .write_openssh_file(&ca_key)
+        .unwrap();
+    let (url, pushes) = fake_topic();
+    let notify = shoephone::notify::NotifyConfig {
+        url,
+        token: None,
+        click: None,
+    };
+    let key = runner_key();
+    let (client, _d) = start_everything(
+        &dir,
+        &ca_key,
+        Some(notify),
+        &[("net", "r1")],
+        &[("r1", &key)],
+    )
+    .await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = claimed_trust(&rig, &client).await;
+    push_bodies(&pushes, 4);
+
+    chmod(&dir.join("ledger.jsonl"), 0o000);
+    let failed = finish_trusted(&rig, id).await;
+    chmod(&dir.join("ledger.jsonl"), 0o600);
+    assert_eq!(
+        (failed.http, failed.code().as_str()),
+        (503, "ledger_unavailable")
+    );
+    assert_eq!(status_of(&client, id).await.state, "claimed");
+    let late = pushes.recv_timeout(std::time::Duration::from_millis(700));
+    assert!(late.is_err(), "the undone trust was pushed: {late:?}");
+    assert!(!ledger_text(&client).await.contains("\"trusted\""));
+}

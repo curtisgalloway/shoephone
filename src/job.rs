@@ -60,6 +60,15 @@ impl JobScope {
         }
     }
 
+    /// The bytes the approver's device signs for this scope, or `None` when
+    /// the scope is malformed. See [`TrustScope::bytes_to_sign`].
+    pub fn bytes_to_sign(&self, nonce: &str) -> Option<Vec<u8>> {
+        match self {
+            JobScope::Trust(s) => s.bytes_to_sign(nonce),
+            JobScope::Apply(s) => s.bytes_to_sign(nonce),
+        }
+    }
+
     fn is_well_formed(&self) -> bool {
         match self {
             JobScope::Trust(s) => s.is_well_formed(),

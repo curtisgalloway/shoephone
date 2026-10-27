@@ -43,8 +43,8 @@ use crate::api::*;
 use crate::ca::{self, UserCa};
 use crate::config::Config;
 use crate::exit::VERSION;
-use crate::grant::{self, Approval, Entropy, Event, Grants, Pending, Refusal, Scope};
-use crate::job::{Failure, Job, JobKind, JobResult, JobScope, JobState, Jobs};
+use crate::grant::{self, Approval, Entropy, Event, Grants, Pending, Policy, Refusal, Scope};
+use crate::job::{Failure, Job, JobEvent, JobKind, JobResult, JobScope, JobState, Jobs};
 use crate::notify::{Apns, Delivery, Notifier, Push};
 use crate::runner_auth::{self, Verifier};
 use crate::scope::{self, Action, ApplyScope, BaselineStatus, Counts, TrustScope};
@@ -90,7 +90,8 @@ struct Inner {
     archives: HashMap<u64, Vec<u8>>,
     /// What the approver reads to recompute a submitted scope's digests, by
     /// job id, as the runner sent it. Dropped once the job leaves `Waiting`.
-    // Task 8: the approve page reads these.
+    /// The pending view is built from a `Waiting` job and reads this beside
+    /// it, never from an entry here alone.
     displays: HashMap<u64, DisplayWire>,
     /// The trust scope of each claimed trust job, so `finish` can record
     /// what was trusted. Dropped when the job finishes.
@@ -104,8 +105,6 @@ struct Inner {
 }
 
 /// The display-only fields of a job request, already sanitized.
-// Task 8: the approver's pending view reads these.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct JobMeta {
     requester: String,
@@ -126,10 +125,17 @@ struct CachedCertificate {
     window_ends_at: SystemTime,
 }
 
+/// What an approval ceremony is over: the SSH request or the Terraform job
+/// that was waiting when it started. At most one of the two exists.
+enum CeremonyScope {
+    Ssh(Scope),
+    Job(JobScope),
+}
+
 struct ApproveCeremony {
     id: u64,
     nonce: String,
-    scope: Scope,
+    scope: CeremonyScope,
     auth: SecurityKeyAuthentication,
     started: SystemTime,
 }
@@ -321,11 +327,11 @@ impl Daemon {
     fn with<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
         let mut inner = self.inner.lock().expect("daemon lock");
         let out = f(&mut inner);
-        let events = self.drain_and_append(&mut inner);
+        let pushes = self.drain_and_append(&mut inner);
         let targets = push_targets(&inner);
         let badge = badge_count(&mut inner, SystemTime::now());
         drop(inner);
-        self.dispatch_pushes(&events, targets, badge);
+        self.dispatch_pushes(pushes, targets, badge);
         out
     }
 
@@ -348,7 +354,9 @@ impl Daemon {
     /// fails, `undo` runs under the same lock, before any other caller can
     /// see the change, and the caller is told `ledger_unavailable`. `undo`
     /// does not run when `f` itself failed, so `f` must not change state on
-    /// an error path.
+    /// an error path. When `undo` runs, the pushes for the call's events are
+    /// discarded: the ledger holds no line for them and the change no longer
+    /// stands, so the phone is not told.
     fn audited_or_undo<T, U>(
         &self,
         f: impl FnOnce(&mut Inner) -> Result<(T, U), Fail>,
@@ -359,11 +367,14 @@ impl Daemon {
             return Err(Self::ledger_unavailable());
         }
         let out = f(&mut inner);
-        let events = self.drain_and_append(&mut inner);
+        let mut pushes = self.drain_and_append(&mut inner);
         let append_failed = inner.ledger_failed.is_some();
         let out = match out {
             Ok((_, taken)) if append_failed => {
                 undo(&mut inner, taken);
+                // The change was taken back and its ledger line was not
+                // written, so the phone must not be told it happened.
+                pushes.clear();
                 Err(Self::ledger_unavailable())
             }
             Ok((value, _)) => Ok(value),
@@ -372,7 +383,7 @@ impl Daemon {
         let targets = push_targets(&inner);
         let badge = badge_count(&mut inner, SystemTime::now());
         drop(inner);
-        self.dispatch_pushes(&events, targets, badge);
+        self.dispatch_pushes(pushes, targets, badge);
         if append_failed {
             return Err(Self::ledger_unavailable());
         }
@@ -396,11 +407,9 @@ impl Daemon {
     /// `issue` each push one when they call `take_id`), so this never does
     /// avoidable work, but it also never assumes that pairing rather than
     /// re-deriving it, which is one fewer thing to keep in sync by hand.
-    fn drain_and_append(&self, inner: &mut Inner) -> Vec<Event> {
+    fn drain_and_append(&self, inner: &mut Inner) -> Vec<Push> {
         let events = inner.grants.take_events();
         let job_events = inner.jobs.take_events();
-        // Task 8: job events become pushes here; until then they are
-        // audited in the ledger only.
         if !events.is_empty() || !job_events.is_empty() {
             let entries: Vec<LedgerEntry> = events
                 .iter()
@@ -423,6 +432,10 @@ impl Daemon {
             }
         }
         events
+            .iter()
+            .map(push_for)
+            .chain(job_events.iter().map(push_for_job))
+            .collect()
     }
 
     /// Send the content-free pushes for this call's events. Always called
@@ -431,14 +444,13 @@ impl Daemon {
     /// caller is waiting on the daemon lock.
     fn dispatch_pushes(
         &self,
-        events: &[Event],
+        pushes: Vec<Push>,
         targets: Vec<(String, Option<Vec<String>>)>,
         badge: u64,
     ) {
-        if events.is_empty() {
+        if pushes.is_empty() {
             return;
         }
-        let pushes: Vec<Push> = events.iter().map(push_for).collect();
         if let Some(n) = &self.notifier
             && !pushes.is_empty()
         {
@@ -547,9 +559,10 @@ fn now() -> SystemTime {
 /// is waiting. Computed under the lock beside the targets, because by the
 /// time the push is sent the lock is gone and the state may have moved.
 ///
-/// The daemon holds at most one pending request, so this is windows + 0 or 1.
+/// The daemon holds at most one pending request or waiting job, so this is
+/// windows + 0 or 1.
 fn badge_count(inner: &mut Inner, now: SystemTime) -> u64 {
-    inner.grants.outstanding(now)
+    inner.grants.outstanding(now) + u64::from(inner.jobs.waiting(now).is_some())
 }
 
 /// Every ledger event becomes a push; the device, not the daemon, keeps the
@@ -564,6 +577,34 @@ fn push_for(event: &Event) -> Push {
         Event::Declined { .. } => Push::RequestDeclined,
         Event::TimedOut { .. } => Push::RequestTimedOut,
         Event::Killed { .. } => Push::WindowKilled,
+    }
+}
+
+/// Every job event becomes a push too, so the audit rule holds for
+/// Terraform jobs as it does for SSH windows. Exhaustive for the same
+/// reason as [`push_for`]. Only a `Waiting` job interrupts; a filed request
+/// is a quiet record, because nobody is asked until a plan is ready.
+/// `kind` is `"trust"` or `"apply"`.
+fn push_for_job(event: &JobEvent) -> Push {
+    match event {
+        JobEvent::Requested { .. } => Push::JobRequested,
+        JobEvent::Started { .. } => Push::PlanStarted,
+        JobEvent::Waiting { kind, .. } => {
+            if *kind == "trust" {
+                Push::TrustWaiting
+            } else {
+                Push::ApplyWaiting
+            }
+        }
+        JobEvent::Approved { .. } => Push::JobApproved,
+        JobEvent::Refused { .. } => Push::PlanRefused,
+        JobEvent::Applied { .. } => Push::Applied,
+        JobEvent::Trusted { .. } => Push::Trusted,
+        JobEvent::ApplyFailed { .. } => Push::ApplyFailed,
+        JobEvent::OutcomeUnknown { .. } => Push::OutcomeUnknown,
+        JobEvent::Declined { .. } => Push::RequestDeclined,
+        JobEvent::TimedOut { .. } => Push::RequestTimedOut,
+        JobEvent::Killed { .. } => Push::JobKilled,
     }
 }
 
@@ -1093,18 +1134,57 @@ async fn job(State(d): App, Path(id): Path<u64>) -> Reply<JobStatus> {
 }
 
 async fn pending(State(d): App) -> Reply<ApproverState> {
-    let now = now();
-    let ttl = d.config.policy().pending_ttl;
-    let state = d.with(|inner| ApproverState {
-        pending: inner.grants.pending(now).map(|p| pending_view(p, ttl)),
-        enrolled: inner.devices.len(),
-        windows: window_views(inner, now),
+    let (now, policy) = (now(), d.config.policy());
+    let ttl = policy.pending_ttl;
+    let state = d.with(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        prune_jobs(inner, now);
+        ApproverState {
+            pending: inner.grants.pending(now).map(|p| pending_view(p, ttl)),
+            job: job_pending_view(inner, now, &policy),
+            enrolled: inner.devices.len(),
+            windows: window_views(inner, now),
+        }
     });
     Ok(Json(state))
 }
 
+/// The approver's view of the job waiting on them. Built from the job
+/// itself, only while it is `Waiting`; the display text is read beside it
+/// and an entry in `displays` without a waiting job shows nothing.
+fn job_pending_view(inner: &mut Inner, now: SystemTime, policy: &Policy) -> Option<JobPendingView> {
+    let job = inner.jobs.waiting(now)?.clone();
+    let JobState::Waiting {
+        scope,
+        nonce,
+        since,
+    } = &job.state
+    else {
+        return None;
+    };
+    let meta = inner.job_meta.get(&job.id);
+    Some(JobPendingView {
+        id: job.id,
+        project: job.project.clone(),
+        kind: match job.kind {
+            JobKind::Trust { .. } => "trust",
+            JobKind::Apply { .. } => "apply",
+        }
+        .to_owned(),
+        match_code: job.match_code.clone(),
+        nonce: nonce.clone(),
+        reason: job.reason.clone(),
+        requester: meta.map(|m| m.requester.clone()).unwrap_or_default(),
+        context: meta.and_then(|m| m.context.clone()),
+        created: store::unix(job.created),
+        expires: store::unix(*since + policy.approval_ttl),
+        scope: scope_to_wire(scope),
+        display: inner.displays.get(&job.id).cloned().unwrap_or_default(),
+    })
+}
+
 async fn approve_start(State(d): App, Json(body): Json<ById>) -> Reply<RequestChallengeResponse> {
-    let now = now();
+    let (now, policy) = (now(), d.config.policy());
     d.with(|inner| {
         if inner.devices.is_empty() {
             return Err(Fail::new(
@@ -1113,23 +1193,41 @@ async fn approve_start(State(d): App, Json(body): Json<ById>) -> Reply<RequestCh
                 "no approver device is enrolled; run `shoephoned enroll` at the console",
             ));
         }
-        let p = inner
-            .grants
-            .pending(now)
-            .filter(|p| p.id == body.id)
-            .cloned()
-            .ok_or(Refusal::NoSuchRequest)?;
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        // At most one of an SSH request and a job is waiting, so whichever
+        // has this id is the subject of the ceremony.
+        let (nonce, scope) = match inner.grants.pending(now).filter(|p| p.id == body.id) {
+            Some(p) => (p.nonce.clone(), CeremonyScope::Ssh(p.scope.clone())),
+            None => match inner.jobs.waiting(now) {
+                Some(Job {
+                    id,
+                    state: JobState::Waiting { scope, nonce, .. },
+                    ..
+                }) if *id == body.id => (nonce.clone(), CeremonyScope::Job(scope.clone())),
+                _ => return Err(Refusal::NoSuchRequest.into()),
+            },
+        };
+        let bound = match &scope {
+            CeremonyScope::Ssh(s) => Some(grant::bound_challenge(s, &nonce)),
+            CeremonyScope::Job(s) => s.bytes_to_sign(&nonce).map(|b| scope::challenge_of(&b)),
+        }
+        .ok_or_else(|| {
+            Fail::new(
+                StatusCode::CONFLICT,
+                "malformed_scope",
+                "the waiting scope is malformed and cannot be signed",
+            )
+        })?;
         let keys: Vec<SecurityKey> = inner.devices.iter().map(|x| x.key.clone()).collect();
         let (challenge, auth) = d
             .webauthn
             .start_securitykey_authentication(&keys)
             .map_err(|e| Fail::internal(format!("webauthn: {e}")))?;
-        let bound = grant::bound_challenge(&p.scope, &p.nonce);
         let (challenge, auth) = bind_challenge(challenge, auth, &bound).map_err(Fail::internal)?;
         inner.approve = Some(ApproveCeremony {
-            id: p.id,
-            nonce: p.nonce,
-            scope: p.scope,
+            id: body.id,
+            nonce,
+            scope,
             auth,
             started: now,
         });
@@ -1141,7 +1239,7 @@ async fn approve_finish(
     State(d): App,
     Json(body): Json<ApproveFinish<PublicKeyCredential>>,
 ) -> Reply<serde_json::Value> {
-    let now = now();
+    let (now, policy) = (now(), d.config.policy());
     d.audited(|inner| {
         let ceremony = inner
             .approve
@@ -1183,26 +1281,55 @@ async fn approve_finish(
                 .save_devices(&inner.devices)
                 .map_err(Fail::internal)?;
         }
-        let approval = Approval {
-            id: ceremony.id,
-            nonce: ceremony.nonce,
-            scope: ceremony.scope,
-        };
-        let window = inner.grants.approve(now, &approval)?;
-        Ok(Json(serde_json::json!({
-            "approved": window.id,
-            "host": window.scope.host,
-            "ends_at": store::unix(window.scope.ends_at),
-            "device": device_name,
-        })))
+        match ceremony.scope {
+            CeremonyScope::Ssh(scope) => {
+                let approval = Approval {
+                    id: ceremony.id,
+                    nonce: ceremony.nonce,
+                    scope,
+                };
+                let window = inner.grants.approve(now, &approval)?;
+                Ok(Json(serde_json::json!({
+                    "approved": window.id,
+                    "host": window.scope.host,
+                    "ends_at": store::unix(window.scope.ends_at),
+                    "device": device_name,
+                })))
+            }
+            CeremonyScope::Job(scope) => {
+                // A trust is judged against the baseline now on disk, as the
+                // runner endpoints do, so an `untrust` since the last look
+                // counts.
+                refresh_trusted(&d, inner)?;
+                inner.jobs.approve(
+                    now,
+                    inner.grants.gate_mut(),
+                    &policy,
+                    ceremony.id,
+                    &ceremony.nonce,
+                    &scope,
+                )?;
+                Ok(Json(serde_json::json!({
+                    "approved": ceremony.id,
+                    "device": device_name,
+                })))
+            }
+        }
     })
 }
 
 async fn decline(State(d): App, Json(body): Json<ById>) -> Reply<serde_json::Value> {
-    let now = now();
+    let (now, policy) = (now(), d.config.policy());
     d.with(|inner| {
         inner.approve = None;
-        inner.grants.decline(now, body.id)
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        if inner.jobs.waiting(now).is_some_and(|j| j.id == body.id) {
+            inner
+                .jobs
+                .decline(now, inner.grants.gate_mut(), &policy, body.id)
+        } else {
+            inner.grants.decline(now, body.id)
+        }
     })?;
     Ok(Json(serde_json::json!({ "declined": body.id })))
 }
@@ -1508,14 +1635,16 @@ async fn ledger(State(d): App, Query(q): Query<LedgerQuery>) -> Reply<Vec<Ledger
 /// and deployed builds must not.
 #[cfg(feature = "test-hooks")]
 async fn test_approve(State(d): App, Json(body): Json<ById>) -> Reply<serde_json::Value> {
-    let now = now();
+    let (now, policy) = (now(), d.config.policy());
     d.audited(|inner| {
-        let p = inner
+        let Some(p) = inner
             .grants
             .pending(now)
             .filter(|p| p.id == body.id)
             .cloned()
-            .ok_or(Refusal::NoSuchRequest)?;
+        else {
+            return approve_waiting_job(&d, inner, now, &policy, body.id);
+        };
         let window = inner.grants.approve(
             now,
             &Approval {
@@ -2252,27 +2381,32 @@ fn undo_trust(d: &Daemon, inner: &mut Inner, undo: TrustUndo) {
     }
 }
 
+/// Approve job `id` the way a verified ceremony would, with no ceremony.
+#[cfg(feature = "test-hooks")]
+fn approve_waiting_job(
+    d: &Daemon,
+    inner: &mut Inner,
+    now: SystemTime,
+    policy: &Policy,
+    id: u64,
+) -> Result<Json<serde_json::Value>, Fail> {
+    refresh_trusted(d, inner)?;
+    let (nonce, scope) = match inner.jobs.job(now, id).map(|j| j.state.clone()) {
+        Some(JobState::Waiting { scope, nonce, .. }) => (nonce, scope),
+        _ => return Err(Refusal::NoSuchRequest.into()),
+    };
+    inner
+        .jobs
+        .approve(now, inner.grants.gate_mut(), policy, id, &nonce, &scope)?;
+    Ok(Json(serde_json::json!({ "approved": id })))
+}
+
 /// Approves the job waiting on the approver, as the approver's device would.
 /// Only compiled with `test-hooks`.
 #[cfg(feature = "test-hooks")]
 async fn test_approve_job(State(d): App, Json(body): Json<ById>) -> Reply<serde_json::Value> {
     let (now, policy) = (now(), d.config.policy());
-    d.audited(|inner| {
-        refresh_trusted(&d, inner)?;
-        let (nonce, scope) = match inner.jobs.job(now, body.id).map(|j| j.state.clone()) {
-            Some(JobState::Waiting { scope, nonce, .. }) => (nonce, scope),
-            _ => return Err(Refusal::NoSuchRequest.into()),
-        };
-        inner.jobs.approve(
-            now,
-            inner.grants.gate_mut(),
-            &policy,
-            body.id,
-            &nonce,
-            &scope,
-        )?;
-        Ok(Json(serde_json::json!({ "approved": body.id })))
-    })
+    d.audited(|inner| approve_waiting_job(&d, inner, now, &policy, body.id))
 }
 
 #[cfg(test)]
@@ -2316,6 +2450,131 @@ mod tests {
 
         let missing = check_push_secret(None, "anything").unwrap_err();
         assert_eq!(missing.1.code, "reenroll_required");
+    }
+
+    #[test]
+    fn push_for_job_is_exhaustive() {
+        use crate::job::JobEvent as E;
+        let at = SystemTime::UNIX_EPOCH;
+        let (id, project) = (1, "net".to_owned());
+        let cases = [
+            (
+                E::Requested {
+                    id,
+                    project: project.clone(),
+                    kind: "trust",
+                    reason: "r".into(),
+                    at,
+                },
+                Push::JobRequested,
+            ),
+            (
+                E::Requested {
+                    id,
+                    project: project.clone(),
+                    kind: "apply",
+                    reason: "r".into(),
+                    at,
+                },
+                Push::JobRequested,
+            ),
+            (
+                E::Started {
+                    id,
+                    project: project.clone(),
+                    kind: "apply",
+                    at,
+                },
+                Push::PlanStarted,
+            ),
+            (
+                E::Waiting {
+                    id,
+                    project: project.clone(),
+                    kind: "trust",
+                    at,
+                },
+                Push::TrustWaiting,
+            ),
+            (
+                E::Waiting {
+                    id,
+                    project: project.clone(),
+                    kind: "apply",
+                    at,
+                },
+                Push::ApplyWaiting,
+            ),
+            (
+                E::Approved {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::JobApproved,
+            ),
+            (
+                E::Refused {
+                    id,
+                    project: project.clone(),
+                    category: "plan_too_old".into(),
+                    at,
+                },
+                Push::PlanRefused,
+            ),
+            (
+                E::Applied {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::Applied,
+            ),
+            (
+                E::Trusted {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::Trusted,
+            ),
+            (
+                E::ApplyFailed {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::ApplyFailed,
+            ),
+            (
+                E::OutcomeUnknown {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::OutcomeUnknown,
+            ),
+            (
+                E::Declined {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::RequestDeclined,
+            ),
+            (
+                E::TimedOut {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::RequestTimedOut,
+            ),
+            (E::Killed { id, project, at }, Push::JobKilled),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(push_for_job(&event), expected, "{event:?}");
+        }
     }
 
     fn test_webauthn() -> Webauthn {

@@ -227,6 +227,47 @@ pub async fn start_everything(
     (Client::new(&format!("http://{addr}")), daemon)
 }
 
+/// A stand-in ntfy topic: answers every POST with 200 and a closed
+/// connection, and sends each body down the channel.
+pub fn fake_topic() -> (String, std::sync::mpsc::Receiver<String>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/shoephone", listener.local_addr().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for sock in listener.incoming() {
+            let mut sock = sock.unwrap();
+            let mut raw = Vec::new();
+            let mut buf = [0u8; 1024];
+            let body = loop {
+                let n = sock.read(&mut buf).unwrap();
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw);
+                let Some(head_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let len = text[..head_end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= head_end + 4 + len {
+                    break text[head_end + 4..].to_string();
+                }
+            };
+            sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            if tx.send(body).is_err() {
+                return;
+            }
+        }
+    });
+    (url, rx)
+}
+
 pub async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     tokio::task::spawn_blocking(f).await.unwrap()
 }
