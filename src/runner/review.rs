@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use similar::{ChangeTag, TextDiff};
 use ssh_key::sha2::{Digest, Sha256};
 
-use crate::api::TrustScopeWire;
+use crate::api::{TrustScopeWire, WarningView};
 use crate::job::Failure;
 use crate::runner::config::ProjectConfig;
 use crate::runner::schema::{self, Schema};
@@ -96,6 +96,44 @@ pub enum Warning {
         variable: String,
         into: String,
     },
+}
+
+impl Warning {
+    /// The wire form the approver reads: a fixed `kind` slug, `file:line`,
+    /// and for a steering variable the variable and what it reaches.
+    pub fn view(&self) -> WarningView {
+        let (kind, file, line, extra) = match self {
+            Warning::Provisioner { file, line } => ("provisioner", file, line, None),
+            Warning::ExternalData { file, line } => ("external_data", file, line, None),
+            Warning::HttpData { file, line } => ("http_data", file, line, None),
+            Warning::Import { file, line } => ("import", file, line, None),
+            Warning::Nonsensitive { file, line } => ("nonsensitive", file, line, None),
+            Warning::ProviderFunction { file, line } => ("provider_function", file, line, None),
+            Warning::LocalFileRead { file, line } => ("local_file_read", file, line, None),
+            Warning::SchemaVariableSteers {
+                file,
+                line,
+                variable,
+                into,
+            } => (
+                "schema_variable_steers",
+                file,
+                line,
+                Some((variable.clone(), into.clone())),
+            ),
+        };
+        let (variable, into) = match extra {
+            Some((v, i)) => (Some(v), Some(i)),
+            None => (None, None),
+        };
+        WarningView {
+            kind: kind.to_string(),
+            file: file.clone(),
+            line: *line,
+            variable,
+            into,
+        }
+    }
 }
 
 /// The result of a trust review.
@@ -949,6 +987,52 @@ mod tests {
             },
         ] {
             assert!(w.contains(&want), "{want:?} in {w:?}");
+        }
+    }
+
+    #[test]
+    fn every_warning_has_a_wire_view_the_daemon_accepts() {
+        let all = [
+            Warning::Provisioner {
+                file: "a.tf".into(),
+                line: 1,
+            },
+            Warning::ExternalData {
+                file: "a.tf".into(),
+                line: 2,
+            },
+            Warning::HttpData {
+                file: "a.tf".into(),
+                line: 3,
+            },
+            Warning::Import {
+                file: "a.tf".into(),
+                line: 4,
+            },
+            Warning::Nonsensitive {
+                file: "a.tf".into(),
+                line: 5,
+            },
+            Warning::ProviderFunction {
+                file: "a.tf".into(),
+                line: 6,
+            },
+            Warning::LocalFileRead {
+                file: "a.tf".into(),
+                line: 7,
+            },
+            steers("region", "count", 8),
+        ];
+        let kinds: Vec<String> = all.iter().map(|w| w.view().kind).collect();
+        assert_eq!(kinds, crate::api::WARNING_KINDS);
+        let v = all[7].view();
+        assert_eq!(
+            (v.variable.as_deref(), v.into.as_deref(), v.line),
+            (Some("region"), Some("count"), 8)
+        );
+        assert!(all[0].view().variable.is_none() && all[0].view().into.is_none());
+        for into in crate::api::WARNING_INTOS {
+            assert_eq!(steers("v", into, 1).view().into.as_deref(), Some(into));
         }
     }
 

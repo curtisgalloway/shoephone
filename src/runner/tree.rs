@@ -72,7 +72,7 @@ fn fail(category: &str, detail: impl Into<String>) -> Failure {
 /// Characters that never belong in a path the agent controls: controls
 /// (C0 and C1) and the bidi and invisible formatting set, which can make one
 /// path read as another.
-fn is_hostile_char(c: char) -> bool {
+pub(crate) fn is_hostile_char(c: char) -> bool {
     c.is_control()
         || matches!(c,
             '\u{61c}' | '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'

@@ -396,7 +396,48 @@ pub struct DisplayWire {
     /// An apply: one `"{action} {address}\n"` line per change.
     #[serde(default)]
     pub address_text: Option<String>,
+    /// A trust: the runner's own review warnings, for the approver to read.
+    /// They are not part of the signed scope and not in the ledger.
+    #[serde(default)]
+    pub warnings: Vec<WarningView>,
 }
+
+/// One reviewer warning as the approver sees it. `kind` is one of
+/// [`WARNING_KINDS`]; the daemon checks every field before it shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WarningView {
+    pub kind: String,
+    pub file: String,
+    pub line: u32,
+    #[serde(default)]
+    pub variable: Option<String>,
+    #[serde(default)]
+    pub into: Option<String>,
+}
+
+/// The fixed set of warning kinds a trust display may carry.
+pub const WARNING_KINDS: [&str; 8] = [
+    "provisioner",
+    "external_data",
+    "http_data",
+    "import",
+    "nonsensitive",
+    "provider_function",
+    "local_file_read",
+    "schema_variable_steers",
+];
+
+/// What an agent-settable variable can reach, for `schema_variable_steers`.
+pub const WARNING_INTOS: [&str; 5] = [
+    "secret_selector",
+    "file_path",
+    "count",
+    "for_each",
+    "condition",
+];
+
+/// The most warnings a trust display may carry.
+pub const MAX_WARNINGS: usize = 200;
 
 /// What `POST /api/runner/poll` hands a runner.
 #[derive(Debug, Clone, Serialize, Deserialize)]

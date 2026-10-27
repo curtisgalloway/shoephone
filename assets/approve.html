@@ -497,6 +497,31 @@ function lineList(items) {
   return ul;
 }
 
+// What each runner warning kind means, in plain words. An unknown kind is
+// shown as such, never dropped, and never refuses anything.
+const WARNING_LABELS = {
+  provisioner: 'provisioner block',
+  external_data: 'external data source',
+  http_data: 'HTTP data source',
+  import: 'import block',
+  nonsensitive: 'nonsensitive() call',
+  provider_function: 'provider-defined function',
+  local_file_read: 'local file read',
+};
+function warningLine(w) {
+  let label;
+  if (w.kind === 'schema_variable_steers') label = 'agent-settable variable ' + String(w.variable) + ' reaches ' + String(w.into);
+  else if (Object.prototype.hasOwnProperty.call(WARNING_LABELS, w.kind)) label = WARNING_LABELS[w.kind];
+  else label = 'unknown warning ' + String(w.kind);
+  return label + ' ' + String(w.file) + ':' + String(w.line);
+}
+// Advisory only: the runner's review warnings are not in the signed bytes.
+function warningsSection(list) {
+  const items = Array.isArray(list) ? list : [];
+  return section('Runner warnings (not covered by your signature)',
+    items.length ? lineList(items.map(w => [warningLine(w)])) : el('p', 'No warnings', 'muted'));
+}
+
 function renderTrust(j) {
   const s = j.scope, d = j.display;
   const nodes = [el('p', OBLIGATION, 'obligation')];
@@ -504,6 +529,7 @@ function renderTrust(j) {
     ['files changed', String(s.files_changed)], ['lines added', String(s.lines_added)],
     ['lines removed', String(s.lines_removed)], ['schema changed', s.schema_changed ? 'yes' : 'no'],
   ]));
+  nodes.push(warningsSection(d.warnings));
   if (d.external) {
     nodes.push(el('p', 'This diff is too large to show here. Run this command against your own clean exports of both revisions (git worktree add, or git archive | tar x; no .terraform directory, no untracked files). It must print the candidate digest and the diff digest below, and both must match.', 'warn'));
     nodes.push(section('verification command', block(verifyCommand(s))));

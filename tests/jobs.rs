@@ -900,6 +900,86 @@ async fn submit_with_unchecked_display_fields_is_400() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_warnings_are_checked_field_by_field() {
+    let dir = scratch("jobs-warnings");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = file_trust(&client, "net", b"tar").await;
+    rig.poll().await;
+    let (scope, good) = trust_pair("net");
+
+    let ok = |extra: serde_json::Value| {
+        let mut w = json!({"kind": "provisioner", "file": "infra/main.tf", "line": 3});
+        for (k, v) in extra.as_object().unwrap() {
+            w[k] = v.clone();
+        }
+        w
+    };
+    let many: Vec<_> = (0..201).map(|_| ok(json!({}))).collect();
+    let bad = [
+        ok(json!({"kind": "shell"})),
+        ok(json!({"kind": ""})),
+        ok(json!({"file": ""})),
+        ok(json!({"file": "a".repeat(256)})),
+        ok(json!({"file": "a\u{202e}b.tf"})),
+        ok(json!({"file": "a\nb.tf"})),
+        ok(json!({"file": "a\u{200b}b.tf"})),
+        ok(json!({"kind": "schema_variable_steers", "variable": "Region", "into": "count"})),
+        ok(json!({"kind": "schema_variable_steers", "variable": "1x", "into": "count"})),
+        ok(json!({"kind": "schema_variable_steers", "variable": "a".repeat(65), "into": "count"})),
+        ok(json!({"kind": "schema_variable_steers", "variable": "r\u{202e}", "into": "count"})),
+        ok(json!({"kind": "schema_variable_steers", "variable": "region", "into": "network"})),
+    ];
+    for w in bad {
+        let mut display = good.clone();
+        display["warnings"] = json!([w]);
+        let reply = submit(&rig, id, scope.clone(), display).await;
+        assert_eq!(
+            (reply.http, reply.code().as_str()),
+            (400, "inconsistent_scope"),
+            "{w}"
+        );
+    }
+    let mut display = good.clone();
+    display["warnings"] = json!(many);
+    let reply = submit(&rig, id, scope.clone(), display).await;
+    assert_eq!(
+        (reply.http, reply.code().as_str()),
+        (400, "inconsistent_scope"),
+        "201 warnings"
+    );
+    assert_eq!(status_of(&client, id).await.state, "working");
+
+    let mut display = good;
+    let mut all: Vec<_> = (0..200).map(|_| ok(json!({}))).collect();
+    all[0] = ok(json!({
+        "kind": "schema_variable_steers", "variable": "_r1", "into": "for_each", "file": "a".repeat(255)
+    }));
+    display["warnings"] = json!(all);
+    assert_eq!(submit(&rig, id, scope, display).await.http, 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_display_with_warnings_is_refused() {
+    let dir = scratch("jobs-apply-warnings");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = file_apply(&client, "net").await;
+    rig.poll().await;
+    let (scope, mut display) = apply_pair("net", &["create a.b"], [1, 0, 0, 0], false);
+    display["warnings"] = json!([{"kind": "provisioner", "file": "a.tf", "line": 1}]);
+    let reply = submit(&rig, id, scope, display).await;
+    assert_eq!(
+        (reply.http, reply.code().as_str()),
+        (400, "inconsistent_scope")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baseline_status_must_match_baseline_manifest() {
     let dir = scratch("jobs-baseline");
     let key = runner_key();

@@ -279,6 +279,16 @@ fn forge_review(job_dir: &Path) {
     std::fs::write(&path, serde_json::to_vec(&review).unwrap()).unwrap();
 }
 
+/// A review worker that lies about its warnings only: the diff and scope
+/// stay true, so nothing refuses it.
+fn forge_warnings(job_dir: &Path) {
+    let path = job_dir.join("review.json");
+    let mut review: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    review["warnings"] = json!([{"kind": "http_data", "file": "forged.tf", "line": 1}]);
+    std::fs::write(&path, serde_json::to_vec(&review).unwrap()).unwrap();
+}
+
 /// One pass of the loop.
 async fn step(mut runner: Runner) -> Runner {
     blocking(move || {
@@ -544,6 +554,44 @@ async fn forged_review_is_refused_review_inconsistent() {
     assert_eq!(st.failure.unwrap().category, "review_inconsistent");
     assert!(!fx.project_dir().join("trusted.json").exists());
     fx.assert_no_job_leftovers();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn trust_display_carries_roots_warnings_not_the_workers() {
+    let fx = Fx::new("warnings", CREATE_ONLY).await;
+    exec::test_hooks_tamper_review(&fx.cfg.state_dir, forge_warnings);
+    let runner = fx.runner().await;
+    let main = "variable \"region\" {}\nresource \"null_resource\" \"c\" {\n  count = var.region\n  provisioner \"local-exec\" {}\n}\n";
+    let id = fx
+        .trust(&[
+            ("infra/main.tf", main),
+            ("infra/shoephone-schema.toml", SCHEMA),
+        ])
+        .await;
+    let _runner = step(runner).await;
+    assert_eq!(fx.status(id).await.state, "waiting");
+    let job = fx.pending().await["job"].clone();
+    let warnings = job["display"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["kind"] == "provisioner" && w["file"] == "infra/main.tf"),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["kind"] == "schema_variable_steers"
+                && w["variable"] == "region"
+                && w["into"] == "count"),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings
+            .iter()
+            .all(|w| w["kind"] != "http_data" && w["file"] != "forged.tf"),
+        "the worker's forged warning must not be sent: {warnings:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

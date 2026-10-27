@@ -311,6 +311,47 @@ const withChallenge = async (job, bytes) => {
   assert.ok(await verifyJob(await mkTrust({external: true})));
   assert.equal(verifyCommand({baseline: null}), 'shoephone-runner diff-digest none - <candidate-checkout> <project-path>');
   assert.equal(verifyCommand({baseline: 'a'.repeat(64)}), 'shoephone-runner diff-digest ' + 'a'.repeat(64) + ' <baseline-checkout> <candidate-checkout> <project-path>');
+  // Runner warnings: shown through textContent and visible(), never signed.
+  const realCreate = document.createElement;
+  const rec = () => ({className: '', textContent: '', children: [], append(...c) { this.children.push(...c); }});
+  const texts = n => [n.textContent, ...n.children.map(texts)].filter(t => t !== '').join('|');
+  const rendered = async display => {
+    document.createElement = rec;
+    try { return renderTrust(await mkTrust(display)).map(texts); } finally { document.createElement = realCreate; }
+  };
+  const w = (kind, extra) => ({kind, file: 'infra/main.tf', line: 7, ...extra});
+  const expectLines = [
+    [w('provisioner'), 'provisioner block infra/main.tf:7'],
+    [w('external_data'), 'external data source infra/main.tf:7'],
+    [w('http_data'), 'HTTP data source infra/main.tf:7'],
+    [w('import'), 'import block infra/main.tf:7'],
+    [w('nonsensitive'), 'nonsensitive() call infra/main.tf:7'],
+    [w('provider_function'), 'provider-defined function infra/main.tf:7'],
+    [w('local_file_read'), 'local file read infra/main.tf:7'],
+    [w('schema_variable_steers', {variable: 'region', into: 'count'}), 'agent-settable variable region reaches count infra/main.tf:7'],
+  ];
+  for (const [warning, line] of expectLines) assert.equal(warningLine(warning), line);
+  const header = 'Runner warnings (not covered by your signature)';
+  const withDiff = await rendered({diff, warnings: expectLines.map(x => x[0])});
+  const wi = withDiff.findIndex(t => t.startsWith(header));
+  assert.ok(wi > 0 && withDiff[0].length > 0, 'warnings follow the obligation statement');
+  assert.ok(withDiff[wi].includes('provisioner block infra/main.tf:7'));
+  assert.ok(withDiff[wi].includes('agent-settable variable region reaches count infra/main.tf:7'));
+  assert.ok(!withDiff[wi].includes('No warnings'));
+  assert.ok(withDiff.findIndex(t => t.startsWith('diff')) > wi, 'warnings come before the diff');
+  for (const display of [{diff}, {diff, warnings: []}, {external: true}]) {
+    const out = await rendered(display);
+    const i = out.findIndex(t => t.startsWith(header));
+    assert.ok(i > 0 && out[i].endsWith('No warnings'), JSON.stringify(display));
+  }
+  const hostileOut = await rendered({diff, warnings: [w('provisioner', {file: 'a' + bidi + 'b.tf'}), w('bogus<b>')]});
+  const hi = hostileOut.find(t => t.startsWith(header));
+  assert.ok(hi.includes('a\\u202eb.tf') && !hi.includes(bidi), 'hidden characters are escaped');
+  assert.ok(hi.includes('unknown warning bogus<b>'), 'an unknown kind is shown, not dropped');
+  // Warnings change nothing about verification.
+  assert.ok(await verifyJob(await mkTrust({diff, warnings: [w('provisioner')]})));
+  assert.ok(await verifyJob(await mkTrust({external: true, warnings: [w('import')]})));
+  await refused(await mkTrust({diff: diff + 'x', warnings: [w('provisioner')]}), 'warnings do not rescue a bad diff');
   console.log('harness ok');
 })().catch(e => { console.error(e); process.exit(1); });
 "#;

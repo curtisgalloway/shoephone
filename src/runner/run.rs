@@ -7,10 +7,11 @@
 //! credential-free review worker. Root then repeats the review on its own
 //! unpack of the archive and refuses `review_inconsistent` unless every
 //! digest and count agrees, so a lying worker cannot change what the
-//! approver signs; the worker's output stays the source of the warnings and
-//! the display text. On approval root unpacks and reviews the archive once
-//! more, against the trusted tree as it is then, and installs only the
-//! execution input as `trusted/`.
+//! approver signs; the worker's output stays the source of the display text,
+//! while the warnings shown to the approver come from root's own review. On
+//! approval root unpacks and reviews the archive once more, against the
+//! trusted tree as it is then, and installs only the execution input as
+//! `trusted/`.
 //!
 //! **Accepted deviation from the design** (Ruling 31): the spec has the
 //! resolver never parse repository content. Here the root process does
@@ -45,7 +46,7 @@ use ssh_key::PrivateKey;
 
 use crate::api::{
     ApplyScopeWire, CountsWire, DisplayWire, FailureView, FinishBody, JobScopeWire, RefuseBody,
-    RunnerJob, SubmitBody, TrustScopeWire,
+    RunnerJob, SubmitBody, TrustScopeWire, WarningView,
 };
 use crate::client::Error;
 use crate::exit::Status;
@@ -1017,6 +1018,9 @@ impl Runner {
         remove_path(&incoming);
         let inconsistent = || refused("review_inconsistent");
         let (root, _) = root.map_err(|_| inconsistent())?;
+        // The approver is shown root's own warnings. The worker's list is
+        // only logged; a forged one changes nothing that is sent.
+        let warnings: Vec<WarningView> = root.warnings.iter().map(Warning::view).collect();
         let display_ok = match (&review.diff, &root.diff) {
             (Some(text), Some(_)) => sha256_hex(text) == root.scope.diff,
             (None, None) => review.verify_command.as_deref() == Some(root.verify_command.as_str()),
@@ -1035,11 +1039,13 @@ impl Runner {
         let display = match review.diff {
             Some(diff) => DisplayWire {
                 diff: Some(diff),
+                warnings,
                 ..DisplayWire::default()
             },
             None => DisplayWire {
                 external: true,
                 verify_command: review.verify_command,
+                warnings,
                 ..DisplayWire::default()
             },
         };
