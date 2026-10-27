@@ -23,6 +23,10 @@ path = "src/bin/shoephone.rs"
 name = "shoephoned"
 path = "src/bin/shoephoned.rs"
 
+[[bin]]
+name = "shoephone-runner"
+path = "src/bin/shoephone-runner.rs"
+
 [features]
 # Adds POST /api/test/approve, which opens a window with no security key.
 # For integration tests only; never enable it in a build that gets deployed.
