@@ -237,6 +237,12 @@ function visible(text, keepLines, keepBackslash) {
   });
 }
 
+// For a multi-line code block: a backslash is shown as written unless a u or
+// U follows, the one place typed text could pass for this page's own escapes.
+function visibleDiff(text) {
+  return visible(String(text).replace(/\\(?=[uU])/g, '\\\\'), true, true);
+}
+
 async function sha256Hex(text) {
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
   return Array.from(new Uint8Array(d), b => b.toString(16).padStart(2, '0')).join('');
@@ -473,7 +479,7 @@ function section(title, ...nodes) {
 }
 function block(text) {
   const e = el('pre', undefined, 'block');
-  e.textContent = visible(text, true);
+  e.textContent = visibleDiff(text);
   return e;
 }
 function kv(pairs) {

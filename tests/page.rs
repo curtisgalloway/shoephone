@@ -205,6 +205,11 @@ const withChallenge = async (job, bytes) => {
   assert.equal(els.jobapprove.disabled, false);
   timers.length = 0;
 
+  const line = 'x = "a' + bs + 'nb" y = ' + bs + '"q' + bs + '" ' + bs + 'u202e ' + bs + 'U{1} p' + bs + bs + 'u';
+  assert.equal(visibleDiff(line), 'x = "a' + bs + 'nb" y = ' + bs + '"q' + bs + '" ' + bs + bs + 'u202e ' + bs + bs + 'U{1} p' + bs + bs + bs + 'u');
+  assert.equal(visibleDiff('a' + bs + 'nb' + bidi), 'a' + bs + 'nb' + bs + 'u202e');
+  assert.equal(visibleDiff('c:' + bs + 'temp' + bs + 'new'), 'c:' + bs + 'temp' + bs + 'new');
+
   const shown = await mkApply();
   const later = await mkApply();
   later.display.manifest = '{"b":"z"}';
