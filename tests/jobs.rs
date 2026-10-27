@@ -1105,3 +1105,58 @@ async fn rollback_without_a_previous_record_removes_the_file_entry() {
     assert!(Store::new(&dir).load_trusted().unwrap().is_empty());
     assert_eq!(status_of(&client, id).await.state, "claimed");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untrust_between_claim_and_finish_refuses_the_trust() {
+    let dir = scratch("jobs-untrust-mid");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let first = claimed_trust(&rig, &client).await;
+    assert_eq!(finish_trusted(&rig, first).await.http, 200);
+
+    let second = file_trust(&client, "net", b"tar two").await;
+    rig.poll().await;
+    let (mut scope, display) = trust_pair("net");
+    scope["baseline"] = json!(hex('c'));
+    scope["candidate"] = json!(hex('d'));
+    assert_eq!(submit(&rig, second, scope, display).await.http, 200);
+    approve_job(client.base(), second).await;
+    let claim = rig
+        .post("/api/runner/claim", json!({ "id": second }), Some(second))
+        .await;
+    assert_eq!(claim.http, 200);
+
+    assert!(Store::new(&dir).untrust("net").unwrap().is_some());
+    let finish = finish_trusted(&rig, second).await;
+    assert_eq!(
+        (finish.http, finish.code().as_str()),
+        (409, "stale_baseline")
+    );
+    assert!(Store::new(&dir).load_trusted().unwrap().is_empty());
+    let status = status_of(&client, second).await;
+    assert_eq!(status.result.as_deref(), Some("refused"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_drops_trust_without_a_ledger_entry() {
+    let dir = scratch("jobs-reconcile");
+    let key = runner_key();
+    let seeded = shoephone::store::TrustRecord {
+        project: "net".into(),
+        digest: hex('9'),
+        schema: hex('8'),
+        job: 41,
+        at: 1,
+    };
+    Store::new(&dir).save_trusted(&[seeded]).unwrap();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+
+    assert!(Store::new(&dir).load_trusted().unwrap().is_empty());
+    file_trust(&client, "net", b"tar").await;
+    let polled = rig.poll().await;
+    assert!(polled["trusted"].is_null(), "{polled}");
+}

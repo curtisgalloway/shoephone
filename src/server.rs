@@ -247,6 +247,12 @@ impl Daemon {
         );
         let mut jobs = jobs;
         let mut trusted = BTreeMap::new();
+        for dropped in store.reconcile_trusted()? {
+            eprintln!(
+                "shoephoned: dropping trust for {:?} (job {}): no matching entry in the ledger",
+                dropped.project, dropped.job
+            );
+        }
         for record in store.load_trusted()? {
             jobs.set_trusted(&record.project, Some(record.digest.clone()));
             trusted.insert(record.project.clone(), record);
@@ -2093,6 +2099,7 @@ struct TrustUndo {
     record: TrustRecord,
     previous: Option<TrustRecord>,
     scope: TrustScope,
+    meta: Option<JobMeta>,
 }
 
 /// Record a trust. It goes on disk before the job is marked done, so a
@@ -2133,12 +2140,19 @@ fn finish_trusted(
         at: store::unix(now),
     };
     let mut previous = None;
+    let mut stale = false;
     // A failed write deliberately does not set `ledger_failed`: that flag
     // is sticky until restart and would refuse the retry this ordering
     // exists to allow. Nothing was recorded anywhere, so no audit gap
     // opened; the job is still Claimed and the runner is told to retry.
     let written = d.store.update_trusted(|mut records| {
         previous = records.iter().find(|r| r.project == project).cloned();
+        // The trust may have changed (an `untrust`) since the claim; the
+        // approver signed a change against the baseline in the scope.
+        if previous.as_ref().map(|r| &r.digest) != scope.baseline.as_ref() {
+            stale = true;
+            return (None, records);
+        }
         records.retain(|r| r.project != project);
         records.push(record.clone());
         records.sort_by(|a, b| a.project.cmp(&b.project));
@@ -2152,17 +2166,25 @@ fn finish_trusted(
             "the trust record could not be saved; the job is still claimed, retry",
         )
     })?;
+    if stale {
+        sync_trusted(d, inner, records);
+        inner.jobs.refuse_claimed(now, req.id, "stale_baseline");
+        inner.claimed.remove(&req.id);
+        prune_jobs(inner, now);
+        return Err(Refusal::StaleBaseline.into());
+    }
     let undo = TrustUndo {
         id: req.id,
         record: record.clone(),
         previous,
         scope,
+        meta: inner.job_meta.get(&req.id).cloned(),
     };
     if let Err(e) = inner
         .jobs
         .finish(now, runner, &project, req.id, JobResult::Trusted)
     {
-        restore_trusted_file(d, &undo);
+        let _ = restore_trusted_file(d, &undo);
         return Err(finish_failure(e));
     }
     inner.claimed.remove(&req.id);
@@ -2173,7 +2195,7 @@ fn finish_trusted(
 
 /// Put the project's record in `trusted.json` back as it was, unless
 /// something else (an `untrust`, a later trust) has changed it since.
-fn restore_trusted_file(d: &Daemon, undo: &TrustUndo) {
+fn restore_trusted_file(d: &Daemon, undo: &TrustUndo) -> bool {
     let project = &undo.record.project;
     let restored = d.store.update_trusted(|mut records| {
         if records.iter().find(|r| &r.project == project) != Some(&undo.record) {
@@ -2186,22 +2208,35 @@ fn restore_trusted_file(d: &Daemon, undo: &TrustUndo) {
     });
     if let Err(e) = restored {
         eprintln!("shoephoned: trusted: rolling back: {e}");
+        return false;
     }
+    true
 }
 
 /// The ledger could not record a trust: take it back on disk and in memory,
 /// and leave the job Claimed. The ledger is now marked failed, so the daemon
 /// refuses further approvals until it restarts with a writable one.
 fn undo_trust(d: &Daemon, inner: &mut Inner, undo: TrustUndo) {
-    restore_trusted_file(d, &undo);
+    let restored = restore_trusted_file(d, &undo);
     inner.jobs.reopen_trusted(undo.id);
     inner.claimed.insert(undo.id, undo.scope);
-    match d.store.load_trusted() {
-        Ok(records) => sync_trusted(d, inner, records),
-        Err(e) => {
-            eprintln!("shoephoned: trusted: {e}");
-            // Fail closed: trust nothing until the next refresh succeeds.
-            sync_trusted(d, inner, Vec::new());
+    if let Some(meta) = undo.meta {
+        inner.job_meta.insert(undo.id, meta);
+    }
+    let reloaded = if restored {
+        d.store.load_trusted().ok()
+    } else {
+        None
+    };
+    match reloaded {
+        Some(records) => sync_trusted(d, inner, records),
+        None => {
+            // The file could not be put back, so the trust nobody can audit
+            // may still be on disk (startup reconciliation drops it). Fail
+            // closed for this project in the meantime.
+            let project = undo.record.project;
+            inner.trusted.remove(&project);
+            inner.jobs.set_trusted(&project, None);
         }
     }
 }

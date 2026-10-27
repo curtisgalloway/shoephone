@@ -413,6 +413,10 @@ impl Store {
 
     /// Written whole, atomically, mode 0600: what is trusted decides what an
     /// approval can apply, so only the daemon's user may read or change it.
+    ///
+    /// Takes no lock. Anything that changes the file while a daemon may be
+    /// running must go through [`Store::update_trusted`]; this is public only
+    /// so tests can seed a state directory.
     pub fn save_trusted(&self, records: &[TrustRecord]) -> Result<(), String> {
         let json = serde_json::to_vec_pretty(records).map_err(|e| e.to_string())?;
         write_atomic_private(&self.trusted_path(), &json)
@@ -423,19 +427,27 @@ impl Store {
     /// each other's change. `f` gets the records on disk and returns the
     /// records to write, or `None` to leave the file alone, with a value to
     /// hand back. The lock is held until this returns.
+    ///
+    /// The flock is blocking, and the daemon calls this with its own mutex
+    /// held. That is acceptable: the critical section is one small file read
+    /// and write, and the only other party that takes the lock is the
+    /// console `untrust` verb, which holds it for the same short time.
     pub fn update_trusted<T>(
         &self,
         f: impl FnOnce(Vec<TrustRecord>) -> (Option<Vec<TrustRecord>>, T),
     ) -> Result<T, String> {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let path = self.dir.join("trusted.lock");
         let lock = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .map_err(|e| format!("opening {}: {e}", path.display()))?;
+        lock.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("securing {}: {e}", path.display()))?;
         lock.lock()
             .map_err(|e| format!("locking {}: {e}", path.display()))?;
         // Closing the file on drop releases the lock.
@@ -444,6 +456,22 @@ impl Store {
             self.save_trusted(&records)?;
         }
         Ok(out)
+    }
+
+    /// Drop every trust record whose `trusted` event is not in the ledger,
+    /// rewriting `trusted.json` without them, and return what was dropped. A
+    /// trust that cannot be shown in the audit trail is not trusted. The
+    /// daemon runs this at startup.
+    pub fn reconcile_trusted(&self) -> Result<Vec<TrustRecord>, String> {
+        let ledger = self.read_ledger(None, usize::MAX)?;
+        self.update_trusted(|records| {
+            let (kept, dropped) = reconcile(records, &ledger);
+            if dropped.is_empty() {
+                (None, dropped)
+            } else {
+                (Some(kept), dropped)
+            }
+        })
     }
 
     /// Remove the trust record for `project`, returning it, or `None` when
@@ -568,6 +596,19 @@ impl Store {
         }
         Ok(window.into_iter().collect())
     }
+}
+
+/// Split `records` into those with a `trusted` ledger entry for their
+/// project and job, and those without.
+fn reconcile(
+    records: Vec<TrustRecord>,
+    ledger: &[LedgerEntry],
+) -> (Vec<TrustRecord>, Vec<TrustRecord>) {
+    records.into_iter().partition(|r| {
+        ledger
+            .iter()
+            .any(|e| e.kind == "trusted" && e.host == r.project && e.id == Some(r.job))
+    })
 }
 
 /// Write through a per-process temp name and rename into place. Callers
@@ -848,6 +889,33 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_drops_trust_without_a_ledger_entry() {
+        let entry = |kind: &str, project: &str, id: u64| LedgerEntry {
+            seq: None,
+            at: 1,
+            kind: kind.into(),
+            host: project.into(),
+            id: Some(id),
+            serial: None,
+            until: None,
+            reason: None,
+            context: None,
+            category: None,
+        };
+        let mut with = record("web", "d");
+        with.job = 7;
+        let mut without = record("db", "d");
+        without.job = 8;
+        let ledger = [
+            entry("trusted", "web", 7),
+            entry("trust_requested", "db", 8),
+        ];
+        let (kept, dropped) = reconcile(vec![with.clone(), without.clone()], &ledger);
+        assert_eq!(kept, vec![with]);
+        assert_eq!(dropped, vec![without]);
+    }
+
+    #[test]
     fn stale_temp_file_is_replaced_not_reused() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tmp("trusted-stale-tmp");
@@ -862,6 +930,26 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         assert!(!stale.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn symlinked_lock_file_is_refused_and_a_loose_one_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("trusted-lock-link");
+        let store = Store::new(&dir);
+        let lock = dir.join("trusted.lock");
+        fs::write(&lock, "").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o666)).unwrap();
+        store.update_trusted(|_| (None, ())).unwrap();
+        assert_eq!(
+            fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere"), &lock).unwrap();
+        assert!(store.update_trusted(|_| (None, ())).is_err());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

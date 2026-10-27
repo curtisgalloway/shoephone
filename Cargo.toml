@@ -31,6 +31,8 @@ test-hooks = []
 [dependencies]
 axum = "0.8.9"
 base64 = "0.23.1"
+# Already in Cargo.lock through tokio and friends; used for O_NOFOLLOW.
+libc = "0.2"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 qrcodegen = "1.8.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls-no-provider", "json"] }

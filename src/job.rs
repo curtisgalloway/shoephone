@@ -837,6 +837,22 @@ impl Jobs {
         true
     }
 
+    /// End a `Claimed` job as `Refused` with `category` and no strike, as
+    /// the daemon does when the trust it was claimed against has changed
+    /// before the runner could finish. Returns whether there was such a job.
+    pub fn refuse_claimed(&mut self, now: SystemTime, id: u64, category: &str) -> bool {
+        let now = self.clamp(now);
+        let Some(i) = self.index(id) else {
+            return false;
+        };
+        let entry = &mut self.entries[i];
+        if entry.job.state != JobState::Claimed {
+            return false;
+        }
+        refuse_unstruck(entry, &mut self.events, now, category);
+        true
+    }
+
     /// The kill switch for one project. A job still waiting on a person is
     /// declined with the usual cooldown, so a tap a moment later cannot
     /// reopen it. An approval not yet claimed is voided. A claimed job is
