@@ -147,6 +147,17 @@ fn read_file(tree: &Tree, rel: &str) -> Result<Vec<u8>, Failure> {
     Ok(out)
 }
 
+/// A path as git writes it when it holds a space, a double quote or a
+/// backslash: in double quotes, with `"` and `\\` escaped. Other paths stay
+/// as they are. Control characters never reach here (unpack refuses them).
+fn quoted(path: &str) -> String {
+    if path.contains([' ', '"', '\\']) {
+        format!("\"{}\"", path.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        path.to_string()
+    }
+}
+
 fn mode_text(mode: u32) -> String {
     format!("{:06o}", 0o100000 | mode)
 }
@@ -172,19 +183,18 @@ fn render(base: Option<&Tree>, cand: &Tree) -> Result<Rendered, Failure> {
         }
         r.files_changed += 1;
         let name = shown(path);
+        let side = |present: bool, prefix: &str| {
+            if present {
+                quoted(&format!("{prefix}/{name}"))
+            } else {
+                "/dev/null".to_string()
+            }
+        };
         let _ = writeln!(
             r.text,
             "diff --git {} {}",
-            if old.is_some() {
-                format!("a/{name}")
-            } else {
-                "/dev/null".to_string()
-            },
-            if new.is_some() {
-                format!("b/{name}")
-            } else {
-                "/dev/null".to_string()
-            },
+            side(old.is_some(), "a"),
+            side(new.is_some(), "b"),
         );
         match (old, new) {
             (None, Some(n)) => {
@@ -199,13 +209,6 @@ fn render(base: Option<&Tree>, cand: &Tree) -> Result<Rendered, Failure> {
             }
             _ => {}
         }
-        let side = |present: bool, prefix: &str| {
-            if present {
-                format!("{prefix}/{name}")
-            } else {
-                "/dev/null".to_string()
-            }
-        };
         let (a, b) = (side(old.is_some(), "a"), side(new.is_some(), "b"));
         let _ = writeln!(r.text, "--- {a}");
         let _ = writeln!(r.text, "+++ {b}");
@@ -235,14 +238,15 @@ fn render(base: Option<&Tree>, cand: &Tree) -> Result<Rendered, Failure> {
                 }
             }
             _ => {
-                let side = |f: Option<&tree::FileEntry>| {
+                let digest_of = |f: Option<&tree::FileEntry>| {
                     f.map_or("none".to_string(), |f| f.sha256.clone())
                 };
                 let _ = writeln!(
                     r.text,
-                    "Binary file {name} changed (sha256 {} -> {})",
-                    side(old),
-                    side(new)
+                    "Binary file {} changed (sha256 {} -> {})",
+                    quoted(&name),
+                    digest_of(old),
+                    digest_of(new)
                 );
             }
         }
@@ -1128,6 +1132,27 @@ mod tests {
         cf.path = ".".to_string();
         let r = review(None, (c.0.path(), &modes), "demo", &cf, 1).unwrap();
         assert_eq!((cand, diff), (r.scope.candidate, r.scope.diff));
+    }
+
+    #[test]
+    fn paths_with_spaces_are_quoted_and_still_agree() {
+        let files = [
+            ("infra/x b/y.tf", "x = 1\n", 0o644),
+            ("infra/shoephone-schema.toml", SCHEMA, 0o644),
+            ("infra/q\"s\\.txt", "hi\n", 0o644),
+        ];
+        let c = checkout(&files);
+        let r = run(None, &c).unwrap();
+        let diff = r.diff.clone().unwrap();
+        assert!(
+            diff.contains("diff --git /dev/null \"b/infra/x b/y.tf\"\n"),
+            "{diff}"
+        );
+        assert!(diff.contains("--- /dev/null\n+++ \"b/infra/x b/y.tf\"\n"));
+        assert!(diff.contains("+++ \"b/infra/q\\\"s\\\\.txt\"\n"), "{diff}");
+        assert!(diff.contains("+++ b/infra/shoephone-schema.toml\n"));
+        let (cand, d) = diff_digest(None, None, c.0.path(), "infra").unwrap();
+        assert_eq!((cand, d), (r.scope.candidate, r.scope.diff));
     }
 
     #[test]

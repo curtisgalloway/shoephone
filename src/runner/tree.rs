@@ -172,6 +172,9 @@ fn clean_path(raw: &[u8]) -> Result<Vec<String>, String> {
             }
         }
     }
+    if parts.first().is_some_and(|p| p == ".git") {
+        return Err("a .git entry at the archive root is refused".into());
+    }
     Ok(parts)
 }
 
@@ -423,15 +426,18 @@ fn walk(
         let Ok(name) = e.file_name().into_string() else {
             return Err(fail("input_file_refused", "a file name is not UTF-8"));
         };
+        if dir.is_empty() && name == ".git" {
+            continue;
+        }
         let mut path = dir.to_vec();
         path.push(name.clone());
         let rel = path.join("/");
+        if rel.chars().count() > MAX_PATH_CHARS {
+            return Err(fail("input_file_refused", "a path is too long"));
+        }
         let meta = fs::symlink_metadata(e.path())
             .map_err(|err| fail("input_file_refused", format!("{}: {err}", shown(&rel))))?;
         if meta.is_dir() {
-            if dir.is_empty() && name == ".git" {
-                continue;
-            }
             if name == ".terraform" {
                 return Err(fail(
                     "input_file_refused",
@@ -459,9 +465,6 @@ fn walk(
                 format!("{} has no recorded mode", shown(&rel)),
             ));
         };
-        if rel.chars().count() > MAX_PATH_CHARS {
-            return Err(fail("input_file_refused", "a path is too long"));
-        }
         let mut hasher = Sha256::new();
         let mut f = fs::File::open(e.path())
             .map_err(|err| fail("input_file_refused", format!("{}: {err}", shown(&rel))))?;
@@ -710,6 +713,23 @@ mod tests {
         fs::write(deep.join("main.tf"), "x = 1\n").unwrap();
         let err = execution_input_from_disk(dir.path(), "p").unwrap_err();
         assert_eq!(err.category, "input_file_refused");
+    }
+
+    #[test]
+    fn git_file_at_the_root_is_skipped_and_archive_git_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".git"), "gitdir: /elsewhere\n").unwrap();
+        fs::write(dir.path().join("main.tf"), "x = 1\n").unwrap();
+        let t = execution_input_from_disk(dir.path(), ".").unwrap();
+        assert_eq!(t.files.keys().collect::<Vec<_>>(), vec!["main.tf"]);
+        let into = tempfile::tempdir().unwrap();
+        let err = unpack(
+            &archive(&[("main.tf", "x"), (".git/HEAD", "ref")]),
+            into.path(),
+            &Limits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.category, "archive_entry_refused");
     }
 
     #[test]
