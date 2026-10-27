@@ -1,0 +1,70 @@
+# SPDX-FileCopyrightText: 2026 Curtis Galloway
+# SPDX-License-Identifier: Apache-2.0
+#
+# shoephone-runner as a systemd service on the runner host.
+#
+# Install:  cp contrib/systemd/shoephone-runner.service /etc/systemd/system/
+#           install -m 0600 shoephone-runner.toml /etc/shoephone-runner/shoephone-runner.toml
+#           systemctl enable --now shoephone-runner
+#           (contrib/runner/README.md has the users, directories and firewall.)
+#
+# The runner runs as root because it must drop to two unprivileged users
+# (review_user and terraform_user), chown job directories to them, and read
+# the secrets identity. This unit therefore cannot be as tight as
+# shoephoned.service. What it does take away: a read-only system, a private
+# /tmp, no home directories, and every capability except the six the runner
+# and bubblewrap use. State and logs are the only writable paths; keep
+# ReadWritePaths= equal to state_dir and log_dir in the config.
+
+[Unit]
+Description=shoephone runner (Terraform with phone-approved plans)
+Documentation=https://github.com/curtisgalloway/shoephone
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/shoephone-runner --config /etc/shoephone-runner/shoephone-runner.toml run
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=30s
+UMask=0077
+
+ReadWritePaths=/var/lib/shoephone-runner /var/log/shoephone-runner
+
+# Capabilities, and why each is kept:
+#   CAP_SETUID CAP_SETGID  drop to review_user and terraform_user.
+#   CAP_CHOWN CAP_FOWNER   hand a job directory to the worker user.
+#   CAP_DAC_OVERRIDE       read and clean up files a worker user owns.
+#   CAP_SYS_ADMIN          bubblewrap needs it to create its mount, PID and
+#                          user namespaces when it is not allowed to use
+#                          unprivileged user namespaces on this kernel.
+# Drop CAP_SYS_ADMIN only after testing on the runner host that
+# `cargo test bwrap_hides_runner_secrets -- --ignored` still passes.
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_SYS_ADMIN
+
+# bubblewrap is installed setuid root on some distributions and gets its
+# privilege from that bit. NoNewPrivileges=yes would turn the bit off, and
+# RestrictSUIDSGID=yes would forbid it. Both must stay "no" for that setup.
+# If bwrap on this host uses unprivileged user namespaces instead, set both
+# to yes and rerun the ignored sandbox test.
+NoNewPrivileges=no
+RestrictSUIDSGID=no
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

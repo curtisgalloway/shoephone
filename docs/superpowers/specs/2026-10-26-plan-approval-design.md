@@ -5,8 +5,9 @@
 
 # Plan approval: an agent applies Terraform after one phone tap
 
-Status: design, 2026-10-26, revised the same day after an outside review (see
-Review history). Not built. Decisions marked **(operator)** were made by the
+Status: built, 2026-10-26. Revised the same day after an outside review (see
+Review history); corrected afterward to match what was built (see Changes
+during the build). Decisions marked **(operator)** were made by the
 operator; **(builder's call)** marks the author's defaults, open to change in
 review.
 
@@ -35,8 +36,8 @@ review.
 - **Released secret**: a runtime secret the trusted code deliberately places
   on a machine the agent may administer, such as a service token in a VM's
   cloud-init. Placing it there discloses it to that machine's administrators.
-- **Bundle**: a `git bundle` of one commit, which the CLI uploads so that
-  the agent does not have to push.
+- **Archive**: a gzip tar from `git archive` of HEAD (tracked files, no
+  history), which the CLI uploads so that the agent does not have to push.
 
 The rest of shoephone's vocabulary is in [DESIGN.md](../../DESIGN.md) → Terms.
 
@@ -111,8 +112,9 @@ the operator has reviewed it.
 shoephone trust <project> --reason "..."
 ```
 
-1. The CLI refuses a dirty tree, bundles HEAD and uploads it with the reason.
-2. A **credential-free review worker** on the runner unpacks the bundle. It
+1. The CLI refuses uncommitted changes to tracked files, archives HEAD and
+   uploads it with the reason.
+2. A **credential-free review worker** on the runner unpacks the archive. It
    computes the full diff of the execution input against the current trusted
    revision, or the full content if this is the first one, and records any
    change to the schema. It also lists the warnings described below. It
@@ -227,9 +229,9 @@ classification, the result, and on failure a category plus vetted messages.
 - **Pinned context.** A pending approval is void if the runner's policy, its
   provider binaries, the backend identity or the project config changed
   after the plan was made.
-- **Bounded input.** The bundle is limited in compressed size, unpacked size,
-  object count, file count and processing time. The runner refuses
-  `.terraform/`, state files and plan files inside it.
+- **Bounded input.** The archive is limited in compressed size, unpacked size,
+  file count, path length (255 characters) and processing time. The runner refuses
+  `.terraform/`, state files, plan files and a root `.git` inside it.
 
 ## The runner
 
@@ -238,9 +240,9 @@ separate Unix user:
 
 - **The resolver** holds the secrets token, talks to the daemon, and starts
   the other two. It resolves the project's secret references and passes the
-  values to the Terraform worker's environment. It never parses repository
-  content.
-- **The review worker** has no credentials. It unpacks bundles, computes
+  values to the Terraform worker's environment. It also re-reviews every
+  trust itself (see Changes during the build).
+- **The review worker** has no credentials. It unpacks archives, computes
   trust diffs and validates manifests.
 - **The Terraform worker** owns only the job directory. It cannot read the
   token, the runner's config, or other jobs, and it runs in a filesystem
@@ -255,6 +257,9 @@ hooks.
 Full Terraform output stays in a root-only log directory on the runner, kept
 for a set number of days. The operator reads it over their own SSH session.
 
+Terraform sees only the execution-input files: the trusted tree and every
+run contain nothing else, so a read outside them fails the plan.
+
 Per-project configuration: name, path in the repository, Terraform version,
 backend, the secret references it resolves, the endpoints, and the Terraform
 variables it supplies itself.
@@ -268,7 +273,7 @@ variables it supplies itself.
   `[projects.<name>]` (which runner serves the project).
 - Signed runner endpoints: poll, post review, post plan, claim, post result.
   The agent-side endpoints stay unauthenticated as they are today, with a
-  size cap on bundles.
+  size cap on archives.
 - Ledger and push: `trust requested`, `trust waiting`, `trusted`,
   `apply requested`, `plan started`, `plan refused`, `apply waiting`,
   `applied`, `apply failed`, `outcome unknown`, plus the existing declined
@@ -277,7 +282,7 @@ variables it supplies itself.
 - The ledger and `/api/pending` have no read authentication today. So
   nothing that could hold a credential may go into them: categories and
   digests only. Full output stays on the runner.
-- The daemon holds no credential. It relays bundles, manifests, summaries
+- The daemon holds no credential. It relays archives, manifests, summaries
   and digests only.
 
 ## Approver changes
@@ -372,3 +377,57 @@ amendment to the vault-split design that records the new identity.
   from both signed manifest digests. Three builder-level items were also
   fixed: non-local modules refused, the `.json` tfvars variants refused, and
   operator SSH ingress specified.
+
+## Changes during the build
+
+Each item is a place where the built system differs from the text above, and
+why.
+
+- **Archive, not bundle.** The upload is a gzip tar from `git archive` of
+  HEAD. A tar has no object graph to bound and carries no history. `trust`
+  refuses only tracked changes, since untracked files never reach the archive,
+  and refuses an archive over 16 MiB compressed.
+- **Execution input is all Terraform sees.** The trusted tree and every
+  Terraform run hold only the execution-input files (the project directory and
+  its local module directories), so a read outside them fails the plan
+  instead of running unreviewed content. A file the configuration reads must
+  live in a module directory.
+- **Archive limits.** Paths are limited to 255 characters, and a root `.git`
+  entry is refused, since `git archive` never emits one.
+- **Exact variable comparison.** The approve page compares each variable's raw
+  canonical text, never a reparsed number, so an unchanged value cannot look
+  changed. Integers beyond 2^53-1 and non-finite numbers are refused in a
+  manifest.
+- **Trust diff format.** Files are separated by `diff --git` lines, and a path
+  with a space, double quote or backslash is quoted in git's C-style form on
+  every header line.
+- **Operator verification command.** The command is `shoephone-runner
+  diff-digest <baseline-digest|none> <baseline-checkout|-> <candidate-checkout>
+  <project-path>`, run on clean exports. A digest alone cannot rebuild the
+  baseline tree, so the command takes the baseline checkout and refuses unless
+  it matches the digest.
+- **Root parses repository content.** The design had the resolver never parse
+  repository content. As built, root unpacks each trust archive itself, scans
+  the HCL for local modules and recomputes the diff, and refuses
+  `review_inconsistent` on any mismatch with the review worker, both at
+  submit and again at install. This is a deliberate deviation: otherwise a
+  compromised worker could forge the diff the operator approves. The parsers
+  are memory-safe Rust under the same size, file-count and time limits.
+- **Authenticated daemon channel.** The runner refuses a daemon URL that is
+  not `https://`, except loopback, because it acts on the daemon's replies.
+- **Claim lapse.** A claimed job the daemon never hears from is recorded as
+  `outcome_unknown` after `claim_ttl` (default 3 hours), which frees the
+  one-job slot. The runner journals every claim and result and re-sends them
+  at startup.
+- **Outputs count like resources.** Output changes appear as `output.<name>`
+  addresses and count toward the totals and the destructive flag, so one
+  counting rule serves the runner, the daemon and the page. Removing an
+  output needs `--allow-destroy`.
+- **Unknown plan actions refuse.** A plan action list the runner does not
+  recognize fails the plan (`plan_unknown_action`) rather than passing unseen.
+- **Reviewer warnings are shown, unsigned.** The warnings appear on the trust
+  screen, labeled as unsigned runner findings and capped at 200, because they
+  are advisory and not part of the signed scope.
+- **Test-hooks start guard.** Both binaries built with `test-hooks` refuse to
+  start unless an explicit variable is set, so a deployed build cannot carry
+  the test routes or the no-sandbox path by accident.

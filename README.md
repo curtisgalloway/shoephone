@@ -50,6 +50,9 @@ Deployed.
   approver devices, sends push notifications, and logs every outcome.
 - **`shoephone`**, the CLI, requests, renews and ends access, and loads
   certificates into ssh-agent.
+- **`shoephone-runner`**, a third binary, runs Terraform on a dedicated
+  host that holds the credentials, so an agent can apply a change after a
+  phone approval (see below).
 - **The approver** is the iOS app
   [shoephone-app](https://github.com/curtisgalloway/shoephone-app), with its
   key in the Secure Enclave behind Face ID, or a hardware security key on the
@@ -74,6 +77,21 @@ shoephone disavow web01         # end the window early
 `request` prints the match code, waits for the phone, and loads the
 certificate into ssh-agent. `shoephone --skill` prints the full contract for
 agents, including every exit code.
+
+## Terraform plan approval
+
+An agent can prepare a Terraform change but usually cannot apply it, because
+the credentials Terraform needs are kept from agents. `shoephone trust
+<project>` uploads the project's code (a `git archive` of HEAD) and the
+operator approves its full diff on the phone once. `shoephone apply
+<project> --manifest FILE` then supplies data only, never code: the runner
+plans at the trusted revision, and the phone shows the exact variable diff
+and the resources to be created, changed or destroyed. One tap applies that
+saved plan. The runner is the only place Terraform runs and the only holder
+of credentials; the daemon holds none. See
+[RUNNER.md](RUNNER.md), the
+[design](docs/superpowers/specs/2026-10-26-plan-approval-design.md) and the
+[deployment checklist](contrib/runner/README.md).
 
 ## Deploying the daemon
 

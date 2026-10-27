@@ -398,6 +398,19 @@ smarter one would go in a `ForceCommand` wrapper on the safe-tier account,
 logging every command (useful from day one) and checking it. Nothing else
 changes. A filter you cannot predict is one you will fight.
 
+## Plan approval
+
+The same approver also authorizes Terraform. A separate runner host holds the
+credentials and is the only place Terraform runs. A person approves two
+different things on the phone: a *trust* of a project's reviewed code (rare,
+shown as a full diff), and an *apply* of one saved plan computed from that
+trusted code and a data-only manifest the agent supplies. The agent never
+supplies code to anything holding credentials. The design, its decisions,
+the outside review that shaped it, and the changes made while building it are
+in [the plan approval design](superpowers/specs/2026-10-26-plan-approval-design.md).
+Operating the runner is in [RUNNER.md](../RUNNER.md), and installing it is in
+[contrib/runner/README.md](../contrib/runner/README.md).
+
 ## Build order
 
 0. **Close the perimeters:** the backup server append-only with per-client
