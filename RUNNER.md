@@ -112,7 +112,10 @@ so a crash before `finish` is sent is re-sent at the next start.
   contains a value `secret_command` returned (8 characters or longer) ever
   leaves the runner: such an address is dropped from any failure before it
   is journaled or sent, and a plan whose change list names one is refused
-  `plan_address_refused`. Otherwise the
+  `plan_address_refused`. A plan that imports a resource or moves one from
+  another address is refused `plan_import_refused` or `plan_move_refused`,
+  since the signed change list has no word for either; trust a change
+  without the `import` or `moved` block instead. Otherwise the
   scope (counts, destructive flag and address text from one plan summary)
   and the display (canonical manifest, the `applied.json` baseline, the
   address text) are submitted. The daemon refuses the job `untrusted` at

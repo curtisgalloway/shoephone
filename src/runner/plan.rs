@@ -72,7 +72,9 @@ fn rank(action: Action) -> u8 {
 }
 
 /// Reads `terraform show -json` output into the change list. Resource
-/// changes and non-no-op output changes both count.
+/// changes and non-no-op output changes both count. A resource being
+/// imported (`plan_import_refused`) or moved from another address
+/// (`plan_move_refused`) refuses the plan (Ruling 35).
 pub fn summarize(show_json: &str) -> Result<Summary, Failure> {
     let root: serde_json::Value =
         serde_json::from_str(show_json).map_err(|_| refuse("plan_unreadable"))?;
@@ -80,6 +82,18 @@ pub fn summarize(show_json: &str) -> Result<Summary, Failure> {
     if let Some(list) = root.get("resource_changes").filter(|v| !v.is_null()) {
         let list = list.as_array().ok_or_else(|| refuse("plan_unreadable"))?;
         for rc in list {
+            // The signed format has no word for an import or a move, so
+            // either would change state unseen; refuse before a no-op skip.
+            if rc
+                .get("change")
+                .and_then(|c| c.get("importing"))
+                .is_some_and(|v| !v.is_null())
+            {
+                return Err(refuse("plan_import_refused"));
+            }
+            if rc.get("previous_address").is_some_and(|v| !v.is_null()) {
+                return Err(refuse("plan_move_refused"));
+            }
             let Some(action) = map_actions(rc.get("change").and_then(|c| c.get("actions")))? else {
                 continue;
             };
@@ -322,6 +336,36 @@ mod tests {
     fn null_lists_are_absent() {
         let s = summarize(r#"{"resource_changes":null,"output_changes":null}"#).unwrap();
         assert!(s.changes.is_empty());
+    }
+
+    #[test]
+    fn an_import_refuses_even_as_a_no_op() {
+        for actions in [r#"["no-op"]"#, r#"["create"]"#, r#"["update"]"#] {
+            let j = format!(
+                r#"{{"resource_changes":[{{"address":"a.b","change":{{"actions":{actions},"importing":{{"id":"i-123"}}}}}}]}}"#
+            );
+            assert_eq!(
+                summarize(&j).unwrap_err().category,
+                "plan_import_refused",
+                "{actions}"
+            );
+        }
+        let not_importing = r#"{"resource_changes":[{"address":"a.b","change":{"actions":["create"],"importing":null}}]}"#;
+        assert_eq!(summarize(not_importing).unwrap().counts.create, 1);
+    }
+
+    #[test]
+    fn a_moved_resource_refuses_even_as_a_no_op() {
+        for actions in [r#"["no-op"]"#, r#"["update"]"#] {
+            let j = format!(
+                r#"{{"resource_changes":[{{"address":"a.new","previous_address":"a.old","change":{{"actions":{actions}}}}}]}}"#
+            );
+            assert_eq!(
+                summarize(&j).unwrap_err().category,
+                "plan_move_refused",
+                "{actions}"
+            );
+        }
     }
 
     #[test]

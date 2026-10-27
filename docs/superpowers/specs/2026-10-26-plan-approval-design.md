@@ -430,6 +430,11 @@ why.
   output needs `--allow-destroy`.
 - **Unknown plan actions refuse.** A plan action list the runner does not
   recognize fails the plan (`plan_unknown_action`) rather than passing unseen.
+- **Imports and moves refuse.** A resource change with `change.importing`
+  set fails the plan with `plan_import_refused`, and one with a
+  `previous_address` with `plan_move_refused`, even when its action is a
+  no-op. The signed apply format has no action word for either, and adding
+  one would change the scope format the app vendors (Ruling 35).
 - **Reviewer warnings are shown, unsigned.** The warnings appear on the trust
   screen, labeled as unsigned runner findings and capped at 200, because they
   are advisory and not part of the signed scope.
