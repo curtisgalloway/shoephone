@@ -754,7 +754,8 @@ mod tests {
 
     #[test]
     fn hard_link_device_and_fifo_entries_are_refused() {
-        for kind in [b'1', b'3', b'4', b'6'] {
+        // Tar typeflags: hard link, character device, block device, FIFO.
+        for kind in *b"1346" {
             let mut t = Vec::new();
             raw_entry(&mut t, "odd", kind, 0o644, b"");
             assert_eq!(refused(t).category, "archive_entry_refused", "{kind}");
