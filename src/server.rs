@@ -603,13 +603,15 @@ fn push_for_job(event: &JobEvent) -> Push {
     match event {
         JobEvent::Requested { .. } => Push::JobRequested,
         JobEvent::Started { .. } => Push::PlanStarted,
-        JobEvent::Waiting { kind, .. } => {
-            if *kind == "trust" {
-                Push::TrustWaiting
-            } else {
+        JobEvent::Waiting { kind, .. } => match *kind {
+            "trust" => Push::TrustWaiting,
+            "apply" => Push::ApplyWaiting,
+            other => {
+                // `JobKind::name` returns only the two above.
+                debug_assert!(false, "unknown job kind {other:?}");
                 Push::ApplyWaiting
             }
-        }
+        },
         JobEvent::Approved { .. } => Push::JobApproved,
         JobEvent::Refused { .. } => Push::PlanRefused,
         JobEvent::Applied { .. } => Push::Applied,

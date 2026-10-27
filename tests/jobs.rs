@@ -1394,10 +1394,10 @@ async fn a_trust_job_pushes_one_per_event_and_only_the_waiting_one_asks() {
     assert_eq!(
         push_bodies(&pushes, 4),
         [
-            "A deploy request was filed.",
-            "A deploy plan was started.",
+            "A request was filed.",
+            "Planning started.",
             "A code change is waiting for your approval.",
-            "A deploy was approved.",
+            "A request was approved.",
         ]
     );
 }

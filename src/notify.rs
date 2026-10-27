@@ -55,15 +55,15 @@ pub enum Push {
     ApplyWaiting,
     /// A code change was trusted.
     Trusted,
-    /// A runner began planning a deploy.
+    /// A runner began reviewing a trust or planning an apply.
     PlanStarted,
-    /// Planning ended without a plan for the approver.
+    /// A trust or apply ended without a scope for the approver.
     PlanRefused,
     /// A plan was applied.
     Applied,
-    /// An apply failed.
+    /// A claimed trust or apply failed part way.
     ApplyFailed,
-    /// An apply may have run; the daemon cannot say how it ended.
+    /// A claimed job may have run; the daemon cannot say how it ended.
     OutcomeUnknown,
     /// A trust or apply request was filed. Silent on purpose: nobody is
     /// asked until the plan is ready, and `TrustWaiting` or `ApplyWaiting`
@@ -129,16 +129,16 @@ impl Push {
             Push::RequestDeclined => "A request was declined.",
             Push::RequestTimedOut => "A request expired without an answer.",
             Push::TrustWaiting => "A code change is waiting for your approval.",
-            Push::ApplyWaiting => "A deploy is waiting for your approval.",
+            Push::ApplyWaiting => "A plan is waiting for your approval.",
             Push::Trusted => "A code change was trusted.",
-            Push::PlanStarted => "A deploy plan was started.",
-            Push::PlanRefused => "A deploy plan was refused.",
-            Push::Applied => "A deploy was applied.",
-            Push::ApplyFailed => "A deploy failed.",
-            Push::OutcomeUnknown => "A deploy ended with an unknown outcome.",
-            Push::JobRequested => "A deploy request was filed.",
-            Push::JobApproved => "A deploy was approved.",
-            Push::JobKilled => "A deploy was cancelled.",
+            Push::PlanStarted => "Planning started.",
+            Push::PlanRefused => "A request was refused.",
+            Push::Applied => "A plan was applied.",
+            Push::ApplyFailed => "A change failed part way.",
+            Push::OutcomeUnknown => "A change ended with an unknown outcome.",
+            Push::JobRequested => "A request was filed.",
+            Push::JobApproved => "A request was approved.",
+            Push::JobKilled => "A request was cancelled.",
         }
     }
 
@@ -691,8 +691,25 @@ mod tests {
         assert_eq!(Push::JobRequested.kind(), "job_requested");
         assert_eq!(Push::JobApproved.kind(), "job_approved");
         assert_eq!(Push::JobKilled.kind(), "job_killed");
-        assert_eq!(Push::JobRequested.body(), "A deploy request was filed.");
-        assert_eq!(Push::JobApproved.body(), "A deploy was approved.");
-        assert_eq!(Push::JobKilled.body(), "A deploy was cancelled.");
+        // Trust and apply jobs share these, so none says "deploy".
+        for (push, body) in [
+            (Push::JobRequested, "A request was filed."),
+            (Push::PlanStarted, "Planning started."),
+            (Push::PlanRefused, "A request was refused."),
+            (Push::JobApproved, "A request was approved."),
+            (Push::JobKilled, "A request was cancelled."),
+            (Push::ApplyFailed, "A change failed part way."),
+            (
+                Push::OutcomeUnknown,
+                "A change ended with an unknown outcome.",
+            ),
+            (Push::ApplyWaiting, "A plan is waiting for your approval."),
+            (Push::Applied, "A plan was applied."),
+        ] {
+            assert_eq!(push.body(), body, "{push:?}");
+        }
+        for push in Push::ALL {
+            assert!(!push.body().contains("deploy"), "{push:?}");
+        }
     }
 }

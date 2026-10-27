@@ -153,6 +153,19 @@ impl From<&Event> for LedgerEntry {
     }
 }
 
+/// `trust` or `apply` for a job's `kind`, the only two `JobKind::name`
+/// returns.
+fn job_kind(kind: &str, trust: &'static str, apply: &'static str) -> &'static str {
+    match kind {
+        "trust" => trust,
+        "apply" => apply,
+        other => {
+            debug_assert!(false, "unknown job kind {other:?}");
+            apply
+        }
+    }
+}
+
 impl From<&JobEvent> for LedgerEntry {
     /// `host` carries the project name. Only ids, kinds, times, the stated
     /// reason and the refusal category are copied; nothing that could hold
@@ -168,10 +181,7 @@ impl From<&JobEvent> for LedgerEntry {
                 at,
                 ..
             } => (
-                match *kind {
-                    "trust" => "trust_requested",
-                    _ => "apply_requested",
-                },
+                job_kind(kind, "trust_requested", "apply_requested"),
                 project,
                 at,
                 id,
@@ -182,10 +192,7 @@ impl From<&JobEvent> for LedgerEntry {
                 kind,
                 at,
             } => (
-                match *kind {
-                    "trust" => "review_started",
-                    _ => "plan_started",
-                },
+                job_kind(kind, "review_started", "plan_started"),
                 project,
                 at,
                 id,
@@ -196,10 +203,7 @@ impl From<&JobEvent> for LedgerEntry {
                 kind,
                 at,
             } => (
-                match *kind {
-                    "trust" => "trust_waiting",
-                    _ => "apply_waiting",
-                },
+                job_kind(kind, "trust_waiting", "apply_waiting"),
                 project,
                 at,
                 id,
