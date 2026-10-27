@@ -163,7 +163,7 @@ async function refresh() {
       const li = document.createElement('li');
       const t = document.createElement('time'); t.textContent = when(e.at);
       const s = document.createElement('span');
-      s.textContent = `${e.kind.replace('_', ' ')} ${e.host}` + (e.until ? ` until ${when(e.until)}` : '') + (e.serial ? ` #${e.serial}` : '');
+      s.textContent = visible(`${String(e.kind).replace(/_/g, ' ')} ${e.host}`) + (e.until ? ` until ${when(e.until)}` : '') + (e.serial ? ` #${e.serial}` : '');
       li.append(t, s); return li;
     }));
   } catch (e) {}

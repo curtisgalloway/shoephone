@@ -156,7 +156,9 @@ impl From<&Event> for LedgerEntry {
 impl From<&JobEvent> for LedgerEntry {
     /// `host` carries the project name. Only ids, kinds, times, the stated
     /// reason and the refusal category are copied; nothing that could hold
-    /// a credential reaches the ledger.
+    /// a credential reaches the ledger. A job's approval, decline, timeout
+    /// and kill have `job_` kinds of their own, so the ledger never mixes
+    /// them up with an SSH window's.
     fn from(e: &JobEvent) -> Self {
         let (kind, project, at, id) = match e {
             JobEvent::Requested {
@@ -205,14 +207,14 @@ impl From<&JobEvent> for LedgerEntry {
             JobEvent::Refused {
                 id, project, at, ..
             } => ("plan_refused", project, at, id),
-            JobEvent::Approved { id, project, at } => ("approved", project, at, id),
+            JobEvent::Approved { id, project, at } => ("job_approved", project, at, id),
             JobEvent::Trusted { id, project, at } => ("trusted", project, at, id),
             JobEvent::Applied { id, project, at } => ("applied", project, at, id),
             JobEvent::ApplyFailed { id, project, at } => ("apply_failed", project, at, id),
             JobEvent::OutcomeUnknown { id, project, at } => ("outcome_unknown", project, at, id),
-            JobEvent::Declined { id, project, at } => ("declined", project, at, id),
-            JobEvent::TimedOut { id, project, at } => ("timed_out", project, at, id),
-            JobEvent::Killed { id, project, at } => ("killed", project, at, id),
+            JobEvent::Declined { id, project, at } => ("job_declined", project, at, id),
+            JobEvent::TimedOut { id, project, at } => ("job_timed_out", project, at, id),
+            JobEvent::Killed { id, project, at } => ("job_killed", project, at, id),
         };
         LedgerEntry {
             seq: None,
@@ -1117,7 +1119,7 @@ mod tests {
                     project: p(),
                     at,
                 },
-                "approved",
+                "job_approved",
             ),
             (
                 JobEvent::Trusted {
@@ -1157,7 +1159,7 @@ mod tests {
                     project: p(),
                     at,
                 },
-                "declined",
+                "job_declined",
             ),
             (
                 JobEvent::TimedOut {
@@ -1165,7 +1167,7 @@ mod tests {
                     project: p(),
                     at,
                 },
-                "timed_out",
+                "job_timed_out",
             ),
             (
                 JobEvent::Killed {
@@ -1173,7 +1175,7 @@ mod tests {
                     project: p(),
                     at,
                 },
-                "killed",
+                "job_killed",
             ),
         ];
         for (event, kind) in &cases {

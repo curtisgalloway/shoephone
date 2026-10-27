@@ -274,12 +274,16 @@ variables it supplies itself.
 - Signed runner endpoints: poll, post review, post plan, claim, post result.
   The agent-side endpoints stay unauthenticated as they are today, with a
   size cap on archives.
-- Ledger and push: `trust requested`, `trust waiting`, `trusted`,
-  `apply requested`, `plan started`, `plan refused`, `apply waiting`,
-  `applied`, `apply failed`, `outcome unknown`, `job requested`, `job
-  approved`, `job killed`, `untrusted`, plus the existing declined
-  and timed out. Only the two `waiting` events interrupt. `server::push_for`
-  stays an exhaustive match.
+- Ledger kinds for jobs: `trust_requested`, `apply_requested`,
+  `review_started` (a trust's review began), `plan_started`,
+  `trust_waiting`, `apply_waiting`, `plan_refused`, `job_approved`,
+  `trusted`, `applied`, `apply_failed`, `outcome_unknown`, `job_declined`,
+  `job_timed_out`, `job_killed`, and `untrusted` (written by the console).
+  The SSH kinds `approved`, `declined`, `timed_out` and `killed` stay for
+  windows only, so the ledger never mixes a job's verdict with a window's.
+  Every job event pushes, except `untrusted`, which the console cannot send.
+  Only the two `waiting` events interrupt. `server::push_for` stays an
+  exhaustive match.
 - The ledger and `/api/pending` have no read authentication today. So
   nothing that could hold a credential may go into them: categories and
   digests only. Full output stays on the runner.
@@ -441,7 +445,10 @@ why.
   bytes.
 - **More ledger and push kinds.** `job_requested`, `job_approved`,
   `job_killed` and `untrusted` were added so every event pushes or is
-  ledgered. `untrusted` is written by the console and cannot push.
+  ledgered. `untrusted` is written by the console and cannot push. A job's
+  approval, decline, timeout and kill are ledgered as `job_approved`,
+  `job_declined`, `job_timed_out` and `job_killed`, distinct from the SSH
+  kinds.
 - **Startup reconcile.** A trust record with no `trusted` ledger entry is
   dropped at daemon startup, since the audit trail is authoritative.
 - **Live untrust.** `shoephoned untrust` works while the daemon runs, under an
