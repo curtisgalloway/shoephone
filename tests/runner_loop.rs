@@ -867,3 +867,36 @@ async fn result_for_a_job_the_restarted_daemon_forgot_is_ledgered_outcome_unknow
         "nothing was re-applied"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn daemon_restart_before_the_trust_commit_keeps_the_trust_on_both_sides() {
+    let mut fx = Fx::new("trustrestart", CREATE_ONLY).await;
+    let runner = fx.runner().await;
+    let id = fx.trust(&standard_files()).await;
+    let runner = step(runner).await;
+    fx.approve(id).await;
+    // The daemon records the trust, its reply is lost, and it restarts
+    // before the runner hears back.
+    runner.test_hooks_fault("/api/runner/finish", Fault::LoseReply);
+    let (runner, r) = try_step(runner).await;
+    assert!(r.is_err());
+    assert_eq!(fx.status(id).await.result.as_deref(), Some("trusted"));
+    assert!(fx.project_dir().join("install.json").exists());
+    drop(runner);
+    fx.restart_daemon().await;
+
+    let runner = fx.runner().await;
+    assert!(
+        fx.project_dir().join("trusted.json").exists(),
+        "the runner commits the trust the daemon recorded"
+    );
+    assert!(!fx.project_dir().join("install.json").exists());
+    assert!(!fx.project_dir().join("trusted.prev").exists());
+    let paths = ProjectPaths::new(&fx.cfg.state_dir, "web").unwrap();
+    assert_eq!(Journal::new(&paths).unfinished().unwrap(), None);
+    let ledger = fx.ledger().await;
+    assert_eq!(count(&ledger, "\"trusted\""), 1, "{ledger}");
+    // Both sides agree, so an apply goes through on the new daemon.
+    let (_runner, st) = fx.applied_job(runner, r#"{"region":"west"}"#).await;
+    assert_eq!(st.result.as_deref(), Some("applied"), "{st:?}");
+}

@@ -82,7 +82,10 @@ so a crash before `finish` is sent is re-sent at the next start.
   the execution input as `trusted/` (leaving `install.json` and the previous
   tree as `trusted.prev/` until the daemon has the result), writes
   `trusted.json`, and reports `trusted`; if the daemon refuses it, the
-  previous trust is put back.
+  previous trust is put back. A `trusted` result the daemon already holds
+  (its reply was lost, or the daemon restarted after recording it, so its
+  trust record names this job) is accepted again with no new ledger line,
+  and the runner keeps the trust.
 
   This is a deliberate deviation from the design, which has the root
   process never parse repository content: root parses the tar archive, the

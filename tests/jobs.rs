@@ -1508,3 +1508,42 @@ async fn apply_submitted_after_an_untrust_is_refused_untrusted() {
     assert_eq!(status.failure.unwrap().category, "untrusted");
     assert!(ledger_text(&client).await.contains("\"untrusted\""));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn finish_trusted_again_is_accepted_without_a_second_ledger_line() {
+    let dir = scratch("jobs-trusted-again");
+    let key = runner_key();
+    let (client, d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = claimed_trust(&rig, &client).await;
+    assert_eq!(finish_trusted(&rig, id).await.http, 200);
+
+    // The reply was lost and the runner retries.
+    let again = finish_trusted(&rig, id).await;
+    assert_eq!(again.http, 200, "{}", String::from_utf8_lossy(&again.body));
+    assert_eq!(ledger_text(&client).await.matches("\"trusted\"").count(), 1);
+    drop(d);
+
+    // The daemon restarted before the retry: it no longer knows the job,
+    // but its trust record names it.
+    let ca_key = dir.join("user_ca");
+    let (client2, _d2) =
+        start_everything(&dir, &ca_key, None, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig2 = Rig::new(&client2, "r1", &key);
+    let client2 = Arc::new(client2);
+    let body = json!({ "id": id, "result": "trusted", "project": "net" });
+    let after = rig2.post("/api/runner/finish", body, Some(id)).await;
+    assert_eq!(after.http, 200, "{}", String::from_utf8_lossy(&after.body));
+    assert_eq!(
+        ledger_text(&client2).await.matches("\"trusted\"").count(),
+        1
+    );
+    let records = Store::new(&dir).load_trusted().unwrap();
+    assert_eq!((records.len(), records[0].job), (1, id));
+
+    // A job the record does not name is still refused.
+    let other = json!({ "id": id + 100, "result": "trusted", "project": "net" });
+    let refused = rig2.post("/api/runner/finish", other, Some(id + 100)).await;
+    assert_eq!(refused.http, 404);
+}

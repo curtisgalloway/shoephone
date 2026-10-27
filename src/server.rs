@@ -2376,7 +2376,11 @@ async fn runner_finish(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<
     if result == JobResult::Trusted {
         d.audited_or_undo(
             |inner| finish_trusted(&d, inner, now, &runner, &req),
-            |inner, undo| undo_trust(&d, inner, undo),
+            |inner, undo| {
+                if let Some(undo) = undo {
+                    undo_trust(&d, inner, undo);
+                }
+            },
         )
     } else {
         d.with(|inner| finish_other(inner, now, &runner, &req, result))
@@ -2435,18 +2439,51 @@ struct TrustUndo {
     meta: Option<JobMeta>,
 }
 
+/// Whether the trust this finish reports is already recorded: the
+/// project's trust record names job `req.id` (and, while the daemon still
+/// holds the claimed scope, its candidate), and the job is either done as
+/// `Trusted` or unknown to this instance (it restarted after recording it).
+/// Job ids are never reused, so the record identifies the job.
+fn already_trusted(inner: &mut Inner, now: SystemTime, project: &str, req: &FinishBody) -> bool {
+    let Some(record) = inner.trusted.get(project) else {
+        return false;
+    };
+    if record.job != req.id {
+        return false;
+    }
+    if let Some(scope) = inner.claimed.get(&req.id)
+        && scope.candidate != record.digest
+    {
+        return false;
+    }
+    match inner.jobs.job(now, req.id) {
+        None => true,
+        Some(job) => {
+            matches!(job.kind, JobKind::Trust { .. })
+                && job.state == JobState::Done(JobResult::Trusted)
+        }
+    }
+}
+
 /// Record a trust. It goes on disk before the job is marked done, so a
 /// failed write leaves the job Claimed and the runner can retry; the caller
 /// takes it back with [`undo_trust`] if the ledger then cannot record it.
+/// A retry of a trust already recorded (its reply was lost, or the daemon
+/// restarted since) is accepted again with nothing changed and no ledger
+/// line, so the runner commits instead of undoing what both sides hold.
 fn finish_trusted(
     d: &Daemon,
     inner: &mut Inner,
     now: SystemTime,
     runner: &str,
     req: &FinishBody,
-) -> Result<(Json<serde_json::Value>, TrustUndo), Fail> {
+) -> Result<(Json<serde_json::Value>, Option<TrustUndo>), Fail> {
     refresh_trusted(d, inner)?;
     let project = finish_project(inner, now, req)?;
+    if inner.jobs.runner_of(&project) == Some(runner) && already_trusted(inner, now, &project, req)
+    {
+        return Ok((Json(serde_json::json!({})), None));
+    }
     // Check first that `Jobs::finish` will accept it.
     let (is_trust, claimed) = match inner.jobs.job(now, req.id) {
         Some(job) => (
@@ -2534,7 +2571,7 @@ fn finish_trusted(
     inner.claimed.remove(&req.id);
     sync_trusted(d, inner, records);
     prune_jobs(inner, now);
-    Ok((Json(serde_json::json!({})), undo))
+    Ok((Json(serde_json::json!({})), Some(undo)))
 }
 
 /// Put the project's record in `trusted.json` back as it was, unless
