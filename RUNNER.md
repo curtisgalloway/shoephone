@@ -56,7 +56,12 @@ that result) counts as delivered. A transient failure fetching an archive,
 or sending a refusal, is retried for up to 60 s; an archive still out of
 reach ends the job `plan_failed` with category `archive_unavailable`. If the
 daemon never hears back about a claimed job, it records the outcome as
-unknown after its `claim_ttl` (default 3 h).
+unknown after its `claim_ttl` (default 3 h). Keep `terraform_timeout_minutes`
+well under the daemon's `claim_ttl` (default 180 minutes): the daemon has no
+way to tell a long apply from a lost runner, and an apply still running when
+the claim lapses is recorded as an unknown outcome. The executor writes the
+apply's result into the journal as `reporting` the moment Terraform returns,
+so a crash before `finish` is sent is re-sent at the next start.
 
 - **Trust.** The baseline is the daemon's trusted record, which must match
   the local `trusted.json` and `trusted/` tree (otherwise the job is refused

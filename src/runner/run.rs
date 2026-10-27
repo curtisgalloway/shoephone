@@ -166,6 +166,9 @@ struct Unreported {
     body: FinishBody,
     /// A trust installed locally that stands or falls with this result.
     install: bool,
+    /// Whether the journal already holds this result. Nothing is sent
+    /// until it does.
+    journaled: bool,
 }
 
 /// How a `finish` went.
@@ -341,19 +344,81 @@ fn install_commit(paths: &ProjectPaths) {
     remove_path(&marker_path(paths));
 }
 
-/// Put the previous trust back (or none, for a first trust), if a marker
-/// says an install is open.
-fn install_undo(paths: &ProjectPaths) {
-    let Ok(Some(marker)) = load_json::<InstallMarker>(&marker_path(paths)) else {
-        return;
-    };
-    remove_path(&paths.trusted_dir());
-    remove_path(&paths.trusted_json());
-    if marker.had_old {
-        let _ = fs::rename(prev_dir(paths), paths.trusted_dir());
-        let _ = fs::rename(prev_json(paths), paths.trusted_json());
+fn remove_dir_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
-    install_commit(paths);
+}
+
+fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Put the previous trust back (or none, for a first trust), if a marker
+/// says an install is open. Only what the install had already moved is
+/// moved back: with no `trusted.prev/` the swap never started and
+/// `trusted/` is still the original; `trusted.json` is replaced only when
+/// `trusted.prev.json` holds the original, or there was no old trust. A
+/// failure is logged and the marker kept, so the next start tries again.
+/// Returns whether the install is now closed.
+fn install_undo(paths: &ProjectPaths) -> bool {
+    let marker = match load_json::<InstallMarker>(&marker_path(paths)) {
+        Ok(Some(m)) => m,
+        Ok(None) => return true,
+        Err(e) => {
+            eprintln!("shoephone-runner: {e}; leaving the trust install for the next start");
+            return false;
+        }
+    };
+    let restored = (|| -> io::Result<()> {
+        if marker.had_old {
+            if prev_dir(paths).exists() {
+                remove_dir_if_present(&paths.trusted_dir())?;
+                fs::rename(prev_dir(paths), paths.trusted_dir())?;
+            }
+            if prev_json(paths).exists() {
+                remove_file_if_present(&paths.trusted_json())?;
+                fs::rename(prev_json(paths), paths.trusted_json())?;
+            }
+        } else {
+            remove_dir_if_present(&paths.trusted_dir())?;
+            remove_file_if_present(&paths.trusted_json())?;
+        }
+        remove_dir_if_present(&paths.dir().join("trusted.next"))?;
+        remove_file_if_present(&marker_path(paths))
+    })();
+    if let Err(e) = restored {
+        eprintln!(
+            "shoephone-runner: restoring the previous trust in {}: {e}; the next start retries",
+            paths.dir().display()
+        );
+        return false;
+    }
+    true
+}
+
+/// No install is open, but an older runner (or a commit that could not
+/// finish) may have left `trusted.prev/`. If `trusted/` is missing, that
+/// is the trust: put it back. Otherwise it is a leftover.
+fn recover_unmarked(paths: &ProjectPaths) {
+    let restore = |from: PathBuf, to: PathBuf| {
+        if from.exists()
+            && !to.exists()
+            && let Err(e) = fs::rename(&from, &to)
+        {
+            eprintln!("shoephone-runner: restoring {}: {e}", to.display());
+        }
+    };
+    restore(prev_dir(paths), paths.trusted_dir());
+    restore(prev_json(paths), paths.trusted_json());
+    if paths.trusted_dir().exists() {
+        remove_path(&prev_dir(paths));
+        remove_path(&prev_json(paths));
+    }
 }
 
 impl Runner {
@@ -503,12 +568,13 @@ impl Runner {
             .unfinished()
             .map_err(|e| fatal("the journal is unreadable", &e))?;
         let marker = marker_path(paths).exists();
+        if !marker {
+            recover_unmarked(paths);
+        }
         let (job, result, f, install) = match open {
             None => {
                 if marker {
                     install_undo(paths);
-                } else {
-                    install_commit(paths);
                 }
                 return Ok(None);
             }
@@ -554,6 +620,7 @@ impl Runner {
                 project: Some(project.to_string()),
             },
             install,
+            journaled: true,
         }))
     }
 
@@ -586,7 +653,24 @@ impl Runner {
     /// Delivers every unreported result, oldest first. Stops at the first
     /// transient failure; nothing new is polled until all are through.
     fn deliver(&mut self) -> Result<(), String> {
-        while let Some(u) = self.unreported.first() {
+        while let Some(u) = self.unreported.first_mut() {
+            if !u.journaled {
+                // Journal first: a result sent but never written down would
+                // be lost to a crash after the send.
+                let f = u.body.failure.as_ref().map(|f| Failure {
+                    category: f.category.clone(),
+                    addresses: f.addresses.clone(),
+                    detail: f.detail.clone(),
+                });
+                let journal = ProjectPaths::new(&self.cfg.state_dir, &u.project)
+                    .map(|p| Journal::new(&p))
+                    .map_err(|e| format!("journal for job {}: {e}", u.body.id))?;
+                journal
+                    .report(u.body.id, &u.body.result, f.as_ref())
+                    .map_err(|e| format!("journal for job {}: {e}", u.body.id))?;
+                u.journaled = true;
+            }
+            let u = &self.unreported[0];
             let delivered = match self.send_finish(&u.body) {
                 Sent::Delivered => true,
                 Sent::Refused => false,
@@ -611,7 +695,9 @@ impl Runner {
         Ok(())
     }
 
-    /// Journals a claimed job's result, then tries to deliver it.
+    /// Queues a claimed job's result, then journals and delivers it. If
+    /// the journal cannot be written nothing is sent and the error is
+    /// returned; the next pass tries the journal again first.
     fn report(
         &mut self,
         project: &str,
@@ -620,11 +706,6 @@ impl Runner {
         f: Option<Failure>,
         install: bool,
     ) -> Result<(), String> {
-        if let Some(journal) = self.journal(project)
-            && let Err(e) = journal.report(id, result, f.as_ref())
-        {
-            eprintln!("shoephone-runner: journal for job {id}: {e}");
-        }
         self.unreported.push(Unreported {
             project: project.to_string(),
             body: FinishBody {
@@ -634,6 +715,7 @@ impl Runner {
                 project: Some(project.to_string()),
             },
             install,
+            journaled: false,
         });
         self.deliver()
     }
@@ -1238,28 +1320,17 @@ impl Runner {
         let journal = Journal::new(&paths);
         let outcome = exec::apply(&self.cfg, &job, plan, plan_sha, &resolved, &journal);
         drop(resolved);
-        match outcome {
-            Ok(()) => {
-                let applied = Applied {
-                    manifest: canonical.to_string(),
-                    status: AppliedStatus::Applied,
-                };
-                if let Err(e) = save_json(&paths.applied_json(), &applied) {
-                    eprintln!("shoephone-runner: applied.json for job {}: {e}", p.id);
-                }
-                ("applied", None)
+        if outcome.is_ok() {
+            let applied = Applied {
+                manifest: canonical.to_string(),
+                status: AppliedStatus::Applied,
+            };
+            if let Err(e) = save_json(&paths.applied_json(), &applied) {
+                eprintln!("shoephone-runner: applied.json for job {}: {e}", p.id);
             }
-            // Terraform was stopped partway: nobody knows what it did.
-            Err(f)
-                if matches!(
-                    f.category.as_str(),
-                    "terraform_timeout" | "terraform_crashed"
-                ) =>
-            {
-                ("outcome_unknown", None)
-            }
-            Err(f) => ("apply_failed", Some(f)),
         }
+        // The same mapping exec journaled, so a re-send says the same.
+        exec::finish_result(&outcome)
     }
 }
 
@@ -1371,5 +1442,95 @@ mod tests {
         install_undo(&paths);
         assert!(!paths.trusted_dir().exists());
         assert!(!paths.trusted_json().exists());
+    }
+
+    /// A project with a live trust: `trusted/old.tf` and `trusted.json`.
+    fn live_trust() -> (tempfile::TempDir, ProjectPaths) {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::new(dir.path(), "web").unwrap();
+        fs::create_dir_all(paths.trusted_dir()).unwrap();
+        fs::write(paths.trusted_dir().join("old.tf"), b"old").unwrap();
+        fs::write(paths.trusted_json(), b"{\"old\":1}").unwrap();
+        (dir, paths)
+    }
+
+    fn assert_original(paths: &ProjectPaths) {
+        assert_eq!(
+            fs::read(paths.trusted_dir().join("old.tf")).unwrap(),
+            b"old"
+        );
+        assert_eq!(fs::read(paths.trusted_json()).unwrap(), b"{\"old\":1}");
+    }
+
+    #[test]
+    fn undo_before_any_rename_keeps_the_original_trust() {
+        let (_dir, paths) = live_trust();
+        save_json(&marker_path(&paths), &InstallMarker { had_old: true }).unwrap();
+        assert!(install_undo(&paths));
+        assert_original(&paths);
+        assert!(!marker_path(&paths).exists());
+    }
+
+    #[test]
+    fn undo_after_a_failed_first_rename_keeps_the_original_trust() {
+        let (_dir, paths) = live_trust();
+        // The new tree was copied, the marker written, and renaming
+        // trusted/ to trusted.prev/ failed.
+        let next = paths.dir().join("trusted.next");
+        fs::create_dir_all(&next).unwrap();
+        fs::write(next.join("new.tf"), b"new").unwrap();
+        save_json(&marker_path(&paths), &InstallMarker { had_old: true }).unwrap();
+        assert!(install_undo(&paths));
+        assert_original(&paths);
+        assert!(!next.exists(), "the partial next tree goes");
+        assert!(!marker_path(&paths).exists());
+    }
+
+    #[test]
+    fn undo_after_a_failed_json_rename_restores_both() {
+        let (_dir, paths) = live_trust();
+        save_json(&marker_path(&paths), &InstallMarker { had_old: true }).unwrap();
+        // trusted/ moved to trusted.prev/; moving trusted.json failed, so
+        // it is still the original and trusted/ is absent.
+        fs::rename(paths.trusted_dir(), prev_dir(&paths)).unwrap();
+        assert!(install_undo(&paths));
+        assert_original(&paths);
+        assert!(!prev_dir(&paths).exists());
+        assert!(!marker_path(&paths).exists());
+    }
+
+    #[test]
+    fn a_failed_restore_keeps_the_marker_for_the_next_start() {
+        let (_dir, paths) = live_trust();
+        save_json(&marker_path(&paths), &InstallMarker { had_old: true }).unwrap();
+        fs::rename(paths.trusted_dir(), prev_dir(&paths)).unwrap();
+        // A read-only project directory makes the rename back fail.
+        fs::set_permissions(paths.dir(), fs::Permissions::from_mode(0o500)).unwrap();
+        let first = install_undo(&paths);
+        fs::set_permissions(paths.dir(), fs::Permissions::from_mode(0o700)).unwrap();
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root ignores the mode; nothing to observe
+        }
+        assert!(!first);
+        assert!(marker_path(&paths).exists(), "kept for the next start");
+        assert!(prev_dir(&paths).exists(), "the previous trust is not lost");
+        assert!(install_undo(&paths), "the retry succeeds");
+        assert_original(&paths);
+    }
+
+    #[test]
+    fn an_unmarked_prev_with_no_trusted_tree_is_restored() {
+        let (_dir, paths) = live_trust();
+        fs::rename(paths.trusted_dir(), prev_dir(&paths)).unwrap();
+        fs::rename(paths.trusted_json(), prev_json(&paths)).unwrap();
+        recover_unmarked(&paths);
+        assert_original(&paths);
+        assert!(!prev_dir(&paths).exists());
+
+        // With trusted/ present, an unmarked prev is a leftover.
+        fs::create_dir_all(prev_dir(&paths)).unwrap();
+        recover_unmarked(&paths);
+        assert!(!prev_dir(&paths).exists());
+        assert_original(&paths);
     }
 }

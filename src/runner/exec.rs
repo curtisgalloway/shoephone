@@ -528,8 +528,9 @@ pub fn plan(
 /// Applies the job's root-only plan copy, refusing `plan_changed` unless
 /// it hashes to `expected_sha256`. The descriptor that was hashed is the
 /// one mounted for Terraform. The journal says `applying` before Terraform
-/// starts and `done` with the result after it returns, so a crash in
-/// between leaves the outcome visibly unknown. The copy is deleted when
+/// starts and `reporting` with the [`finish_result`] after it returns, so a
+/// crash in between leaves the outcome visibly unknown, and a crash after
+/// it leaves the result to be re-sent. The copy is deleted when
 /// this returns. The caller must have run `check_context` at claim.
 pub fn apply(
     cfg: &RunnerConfig,
@@ -576,20 +577,37 @@ pub fn apply(
                 Err(categorize(&out.stdout, Phase::Apply))
             }
         });
-        let recorded = match &result {
-            Ok(()) => "applied",
-            Err(f) => f.category.as_str(),
-        };
-        // If this write fails the journal still says `applying`, and the
-        // next start reports the outcome as unknown: wrong in the safe
+        // The result goes straight into the journal as one to report, so a
+        // crash right after Terraform returns is re-sent at startup. If
+        // this write fails the journal still says `applying`, and the next
+        // start reports the outcome as unknown: wrong in the safe
         // direction.
-        if journal.end(job.id, recorded).is_err() {
+        let (reported, failure) = finish_result(&result);
+        if journal.report(job.id, reported, failure.as_ref()).is_err() {
             eprintln!("shoephone-runner: journal_write_failed for job {}", job.id);
         }
         result
     })();
     let _ = remove_if_present(plan_file);
     result
+}
+
+/// The `finish` result for what [`apply`] returned: `applied`;
+/// `outcome_unknown` when Terraform was stopped partway (`terraform_timeout`,
+/// `terraform_crashed`); otherwise `apply_failed` with the failure.
+pub fn finish_result(outcome: &Result<(), Failure>) -> (&'static str, Option<Failure>) {
+    match outcome {
+        Ok(()) => ("applied", None),
+        Err(f)
+            if matches!(
+                f.category.as_str(),
+                "terraform_timeout" | "terraform_crashed"
+            ) =>
+        {
+            ("outcome_unknown", None)
+        }
+        Err(f) => ("apply_failed", Some(f.clone())),
+    }
 }
 
 // ---------------------------------------------------------------------

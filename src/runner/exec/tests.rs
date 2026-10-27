@@ -776,6 +776,15 @@ fn job_dir_plan_edit_does_not_change_what_apply_uses() {
     );
     assert_eq!(journal.pending_unknown().unwrap(), None);
     assert_eq!(journal_result(&fx).as_deref(), Some("applied"));
+    assert_eq!(
+        journal.unfinished().unwrap(),
+        Some(crate::runner::journal::Unfinished::Reporting {
+            job: 7,
+            result: "applied".into(),
+            failure: None,
+        }),
+        "the result is left to report, so a crash now is re-sent at startup"
+    );
     assert!(!copy.exists(), "the copy is deleted when the job ends");
 
     // A copy path other than this job's is refused.
@@ -883,7 +892,7 @@ fn prune_continues_past_an_unreadable_project() {
 }
 
 #[test]
-fn apply_failure_is_journaled_done_with_its_category() {
+fn apply_failure_is_journaled_for_reporting_with_its_category() {
     let mut fx = fixture();
     no_sandbox();
     let dir = fx.job_dir();
@@ -897,6 +906,26 @@ fn apply_failure_is_journaled_done_with_its_category() {
     assert_eq!(err.category, "apply_failed");
     assert_eq!(err.detail, None);
     assert_eq!(journal.pending_unknown().unwrap(), None);
+    match journal.unfinished().unwrap() {
+        Some(crate::runner::journal::Unfinished::Reporting {
+            result, failure, ..
+        }) => {
+            assert_eq!(result, "apply_failed");
+            assert_eq!(failure.unwrap().category, "apply_failed");
+        }
+        other => panic!("expected a result to report, got {other:?}"),
+    }
+}
+
+#[test]
+fn finish_result_maps_interrupted_applies_to_unknown() {
+    let f = |c: &str| Err(refuse(c));
+    assert_eq!(finish_result(&Ok(())), ("applied", None));
+    assert_eq!(finish_result(&f("terraform_timeout")).0, "outcome_unknown");
+    assert_eq!(finish_result(&f("terraform_crashed")).0, "outcome_unknown");
+    let (r, failure) = finish_result(&f("apply_failed"));
+    assert_eq!(r, "apply_failed");
+    assert_eq!(failure.unwrap().category, "apply_failed");
 }
 
 // ---------------------------------------------------------------------

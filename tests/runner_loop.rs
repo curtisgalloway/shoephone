@@ -674,3 +674,34 @@ async fn startup_with_the_daemon_unreachable_retries() {
     .await;
     assert!(ledger.contains("outcome_unknown"), "{ledger}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn result_of_an_apply_cut_off_before_finish_is_resent_at_startup() {
+    let fx = Fx::new("resend", CREATE_ONLY).await;
+    let runner = fx.runner().await;
+    let runner = fx.trusted(runner).await;
+    let id = fx.apply(r#"{"region":"west"}"#).await;
+    let runner = step(runner).await;
+    fx.approve(id).await;
+    runner.test_hooks_fault("/api/runner/finish", Fault::Unreachable);
+    let (runner, r) = try_step(runner).await;
+    assert!(r.is_err());
+    // The runner dies with the result unsent.
+    drop(runner);
+    assert_eq!(fx.status(id).await.state, "claimed");
+    let paths = ProjectPaths::new(&fx.cfg.state_dir, "web").unwrap();
+    assert_eq!(
+        Journal::new(&paths).unfinished().unwrap(),
+        Some(shoephone::runner::journal::Unfinished::Reporting {
+            job: id,
+            result: "applied".into(),
+            failure: None,
+        })
+    );
+
+    let _runner = fx.runner().await;
+    let st = fx.status(id).await;
+    assert_eq!(st.result.as_deref(), Some("applied"), "{st:?}");
+    assert_eq!(count(&fx.record(), "arg:apply"), 1);
+    assert_eq!(Journal::new(&paths).unfinished().unwrap(), None);
+}
