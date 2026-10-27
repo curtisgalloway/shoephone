@@ -39,9 +39,23 @@ pub struct Applied {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Phase {
+    /// The runner is claiming, or has claimed, the job and has not acted.
     Claimed,
+    /// Terraform apply has started.
     Applying,
+    /// The job's result is known and not yet delivered to the daemon.
+    Reporting,
     Done,
+}
+
+/// A failure as the journal keeps it until it is reported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalFailure {
+    pub category: String,
+    #[serde(default)]
+    pub addresses: Vec<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// The crash journal for the job in flight.
@@ -50,6 +64,12 @@ pub struct Journal {
     pub job: String,
     pub phase: Phase,
     pub result: Option<String>,
+    /// `trust` or `apply`, recorded at the claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// The failure to report with `result`, while `Reporting`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<JournalFailure>,
 }
 
 /// Paths under `state_dir/projects/<name>/`.
@@ -208,6 +228,8 @@ mod tests {
             job: "j".into(),
             phase: Phase::Applying,
             result: None,
+            kind: None,
+            failure: None,
         };
         assert_eq!(
             serde_json::to_string(&j).unwrap(),

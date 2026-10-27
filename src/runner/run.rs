@@ -3,29 +3,44 @@
 //! `shoephone-runner run`: the poll loop that ties the runner together.
 //!
 //! One job at a time. A **trust** job is unpacked into a fresh job
-//! directory owned by `review_user`, reviewed there by the credential-free
-//! review worker, and submitted; on approval the runner unpacks the archive
-//! again itself, checks the approved candidate digest, and installs only
-//! the execution input as `trusted/`. An **apply** job is checked against
-//! the local trusted revision and the daemon's record of it, validated
-//! against the trusted schema, planned in a copy of `trusted/` (never the
-//! agent's tree), and submitted with the scope and display built from one
-//! plan summary; on approval it is claimed, its pinned context re-checked,
-//! and applied under the crash journal.
+//! directory owned by `review_user` and reviewed there by the
+//! credential-free review worker. Root then repeats the review on its own
+//! unpack of the archive and refuses `review_inconsistent` unless every
+//! digest and count agrees, so a lying worker cannot change what the
+//! approver signs; the worker's output stays the source of the warnings and
+//! the display text. On approval root unpacks and reviews the archive once
+//! more, against the trusted tree as it is then, and installs only the
+//! execution input as `trusted/`.
+//!
+//! **Accepted deviation from the design** (Ruling 31): the spec has the
+//! resolver never parse repository content. Here the root process does
+//! parse it: the tar archive, the HCL scan for local modules, and the text
+//! diff. Without that, a compromised worker could forge the diff the
+//! operator reads. The parsers are memory-safe Rust, bounded by
+//! [`Limits`].
+//!
+//! An **apply** job is checked against the local trusted revision and the
+//! daemon's record of it, validated against the trusted schema, planned in
+//! a copy of `trusted/` (never the agent's tree), and submitted with the
+//! scope and display built from one plan summary; on approval it is
+//! claimed, its pinned context re-checked, and applied.
+//!
+//! Every claim and every result is journaled before it is sent, and a
+//! result the daemon has not acknowledged is re-sent, before any new work,
+//! until it is delivered or refused for good (see [`Journal`]).
 //!
 //! Job directories live in `state_dir/jobs/<id>/` and are removed when the
 //! job ends, whichever way it ends; the root-only plan copy goes with them.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use ssh_key::PrivateKey;
 
 use crate::api::{
@@ -39,22 +54,23 @@ use crate::runner::POLICY_VERSION;
 use crate::runner::client::RunnerClient;
 use crate::runner::config::{ProjectConfig, RunnerConfig};
 use crate::runner::exec;
-use crate::runner::journal::Journal;
-use crate::runner::review::Warning;
+use crate::runner::journal::{Journal, Unfinished};
+use crate::runner::review::{self, Modes, Review, Warning};
 use crate::runner::schema;
 use crate::runner::state::{Applied, AppliedStatus, ProjectPaths, Trusted, write_atomic};
 use crate::runner::tree::{self, Limits, Tree};
-use crate::scope::Action;
+use crate::scope::{Action, TrustScope};
 use crate::store::sha256_hex;
 
 /// How often the loop polls when all is well.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// The longest wait between polls after repeated errors.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How long a transient failure fetching an archive or sending a refusal
+/// is retried within one job.
+const RETRY_WINDOW: Duration = Duration::from_secs(60);
 /// Largest `review.json` the runner reads back from the worker.
 const MAX_REVIEW_BYTES: u64 = 64 * 1024 * 1024;
-/// How many times a `finish` is tried before the runner gives up on it.
-const FINISH_ATTEMPTS: u32 = 5;
 
 fn failure(category: &str) -> Failure {
     Failure {
@@ -77,8 +93,6 @@ enum Stop {
     /// End the job with `refuse`: `result` is `refused` (policy, bad input)
     /// or `plan_failed` (the runner or Terraform could not plan it).
     Refuse(&'static str, Failure),
-    /// The daemon could not be reached; try again later.
-    Transport(String),
 }
 
 fn refused(category: &str) -> Stop {
@@ -98,7 +112,7 @@ fn plan_failed(f: Failure) -> Stop {
 pub enum StartupError {
     /// Something only the operator can fix, such as an unreadable journal.
     Fatal(String),
-    /// The daemon could not be told about an unknown outcome yet.
+    /// The daemon could not be told about an earlier result yet.
     Retry(String),
 }
 
@@ -116,8 +130,6 @@ enum Work {
     Trust {
         /// The archive as fetched, unpacked again by root on approval.
         archive: Vec<u8>,
-        candidate: String,
-        schema: String,
     },
     Apply {
         plan: PathBuf,
@@ -127,13 +139,40 @@ enum Work {
     },
 }
 
+impl Work {
+    fn kind(&self) -> &'static str {
+        match self {
+            Work::Trust { .. } => "trust",
+            Work::Apply { .. } => "apply",
+        }
+    }
+}
+
 /// The job this runner submitted and is waiting on.
 #[derive(Debug)]
 struct Pending {
     id: u64,
     project: String,
     job_dir: PathBuf,
+    /// Exactly what was submitted; the claim must hand back the same.
+    scope: JobScopeWire,
     work: Work,
+}
+
+/// A result journaled and not yet acknowledged by the daemon.
+#[derive(Debug)]
+struct Unreported {
+    project: String,
+    body: FinishBody,
+    /// A trust installed locally that stands or falls with this result.
+    install: bool,
+}
+
+/// How a `finish` went.
+enum Sent {
+    Delivered,
+    Refused,
+    Transient(String),
 }
 
 /// `review.json`, as the review worker writes it.
@@ -147,12 +186,20 @@ struct ReviewFile {
     failure: Option<FailureView>,
 }
 
+/// `install.json`: written before a trust replaces `trusted/`, removed once
+/// the daemon has recorded it or the old trust is back.
+#[derive(Debug, Serialize, Deserialize)]
+struct InstallMarker {
+    had_old: bool,
+}
+
 /// The poll loop's state. [`run`] drives it; the tests drive
 /// [`Runner::step`] directly.
 pub struct Runner {
     cfg: RunnerConfig,
     client: RunnerClient,
     pending: Option<Pending>,
+    unreported: Vec<Unreported>,
 }
 
 impl fmt::Debug for Runner {
@@ -160,6 +207,7 @@ impl fmt::Debug for Runner {
         f.debug_struct("Runner")
             .field("name", &self.cfg.name)
             .field("pending", &self.pending.as_ref().map(|p| p.id))
+            .field("unreported", &self.unreported.len())
             .finish_non_exhaustive()
     }
 }
@@ -214,7 +262,7 @@ fn under(base: &Path, rel: &str) -> PathBuf {
         .fold(base.to_path_buf(), |p, c| p.join(c))
 }
 
-fn modes_of(tree: &Tree) -> BTreeMap<String, u32> {
+fn modes_of(tree: &Tree) -> Modes {
     tree.files
         .iter()
         .map(|(k, f)| (k.clone(), f.mode))
@@ -231,7 +279,7 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, S
     }
 }
 
-fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> io::Result<()> {
+fn save_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
@@ -239,47 +287,78 @@ fn save_json<T: serde::Serialize>(path: &Path, value: &T) -> io::Result<()> {
     write_atomic(path, &bytes)
 }
 
-/// True for a daemon answer that retrying will not change.
+/// True for a daemon answer that retrying will not change. A stale
+/// signature is not: the retry is signed afresh.
 fn is_permanent(e: &Error) -> bool {
-    matches!(e, Error::Daemon { http, .. } if *http < 500)
+    match e {
+        Error::Daemon { http: 401, reply } if reply.code == "stale_signature" => false,
+        Error::Daemon { http, .. } => *http < 500,
+        _ => false,
+    }
 }
 
-/// How to undo a trust installed locally when the daemon will not record it.
-#[derive(Debug)]
-struct Restore {
-    trusted_dir: PathBuf,
-    trusted_json: PathBuf,
-    prev: Option<PathBuf>,
-    old_json: Option<Vec<u8>>,
+/// True when the root process's own review agrees with the worker's scope
+/// in every signed field.
+fn same_trust_scope(worker: &TrustScopeWire, root: &TrustScope) -> bool {
+    worker.project == root.project
+        && worker.baseline == root.baseline
+        && worker.candidate == root.candidate
+        && worker.diff == root.diff
+        && worker.schema == root.schema
+        && worker.policy_version == root.policy_version
+        && worker.files_changed == root.files_changed
+        && worker.lines_added == root.lines_added
+        && worker.lines_removed == root.lines_removed
+        && worker.schema_changed == root.schema_changed
 }
 
-impl Restore {
-    fn commit(self) {
-        if let Some(prev) = &self.prev {
-            remove_path(prev);
-        }
+fn same_scope(a: &JobScopeWire, b: &JobScopeWire) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
     }
+}
 
-    fn undo(&self) {
-        remove_path(&self.trusted_dir);
-        if let Some(prev) = &self.prev {
-            let _ = fs::rename(prev, &self.trusted_dir);
-        }
-        let restored = match &self.old_json {
-            Some(bytes) => write_atomic(&self.trusted_json, bytes),
-            None => match fs::remove_file(&self.trusted_json) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-                _ => Ok(()),
-            },
-        };
-        if let Err(e) = restored {
-            eprintln!("shoephone-runner: restoring trusted.json: {e}");
-        }
+// ---------------------------------------------------------------------
+// The trust install marker
+
+fn marker_path(paths: &ProjectPaths) -> PathBuf {
+    paths.dir().join("install.json")
+}
+
+fn prev_dir(paths: &ProjectPaths) -> PathBuf {
+    paths.dir().join("trusted.prev")
+}
+
+fn prev_json(paths: &ProjectPaths) -> PathBuf {
+    paths.dir().join("trusted.prev.json")
+}
+
+/// Keep the installed trust: drop the previous one and the marker.
+fn install_commit(paths: &ProjectPaths) {
+    remove_path(&prev_dir(paths));
+    remove_path(&prev_json(paths));
+    remove_path(&marker_path(paths));
+}
+
+/// Put the previous trust back (or none, for a first trust), if a marker
+/// says an install is open.
+fn install_undo(paths: &ProjectPaths) {
+    let Ok(Some(marker)) = load_json::<InstallMarker>(&marker_path(paths)) else {
+        return;
+    };
+    remove_path(&paths.trusted_dir());
+    remove_path(&paths.trusted_json());
+    if marker.had_old {
+        let _ = fs::rename(prev_dir(paths), paths.trusted_dir());
+        let _ = fs::rename(prev_json(paths), paths.trusted_json());
     }
+    install_commit(paths);
 }
 
 impl Runner {
-    /// Reads the runner's signing key; nothing else is touched yet.
+    /// Reads the runner's signing key and checks the daemon URL; nothing
+    /// else is touched yet.
     pub fn new(cfg: RunnerConfig) -> Result<Runner, String> {
         let key = PrivateKey::read_openssh_file(&cfg.key)
             .map_err(|e| format!("cannot read the runner key {}: {e}", cfg.key.display()))?;
@@ -289,12 +368,19 @@ impl Runner {
                 cfg.key.display()
             ));
         }
-        let client = RunnerClient::new(&cfg.daemon, &cfg.name, key);
+        let client = RunnerClient::new(&cfg.daemon, &cfg.name, key)?;
         Ok(Runner {
             cfg,
             client,
             pending: None,
+            unreported: Vec::new(),
         })
+    }
+
+    /// For integration tests only: make the next request to `path` fail.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_hooks_fault(&self, path: &str, fault: crate::runner::client::Fault) {
+        self.client.test_hooks_fault(path, fault);
     }
 
     fn paths(&self, project: &str) -> Result<ProjectPaths, Failure> {
@@ -314,6 +400,10 @@ impl Runner {
             .projects
             .get(name)
             .ok_or_else(|| failure("unknown_project"))
+    }
+
+    fn journal(&self, project: &str) -> Option<Journal> {
+        self.paths(project).ok().map(|p| Journal::new(&p))
     }
 
     /// A fresh job directory, 0700, under `state_dir/jobs` (0711, so a
@@ -348,12 +438,30 @@ impl Runner {
         remove_path(&dir);
     }
 
+    /// Runs `f` until it succeeds, fails for good, or [`RETRY_WINDOW`]
+    /// runs out, backing off between tries.
+    fn retrying<T>(&self, mut f: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
+        let deadline = Instant::now() + RETRY_WINDOW;
+        let mut delay = Duration::from_secs(1);
+        loop {
+            match f() {
+                Ok(v) => return Ok(v),
+                Err(e) if is_permanent(&e) || Instant::now() + delay > deadline => return Err(e),
+                Err(_) => {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(MAX_BACKOFF);
+                }
+            }
+        }
+    }
+
     // -----------------------------------------------------------------
     // Startup
 
     /// Checks the sandbox, prunes old logs, clears what an earlier run left
-    /// behind, and reports any apply the journal says was interrupted as
-    /// `outcome_unknown`. Run it before the first [`Runner::step`].
+    /// behind, turns whatever the journals left open into results, and
+    /// delivers them. Run it before the first [`Runner::step`]; it can be
+    /// run again after a [`StartupError::Retry`].
     pub fn startup(&mut self) -> Result<(), StartupError> {
         exec::preflight(&self.cfg);
         if let Err(e) = exec::prune_logs(&self.cfg.log_dir, self.cfg.log_days) {
@@ -363,6 +471,7 @@ impl Runner {
         // copy from before it can still be used by this process.
         remove_path(&self.jobs_dir());
         self.pending = None;
+        self.unreported.clear();
         let projects: Vec<String> = self.cfg.projects.keys().cloned().collect();
         for name in &projects {
             let paths = self
@@ -371,59 +480,173 @@ impl Runner {
             remove_path(&paths.plans_dir());
             remove_path(&paths.dir().join("incoming"));
             remove_path(&paths.dir().join("trusted.next"));
-            let prev = paths.dir().join("trusted.prev");
-            if prev.exists() && !paths.trusted_dir().exists() {
-                let _ = fs::rename(&prev, paths.trusted_dir());
+            if let Some(u) = self.recover(name, &paths)? {
+                self.unreported.push(u);
             }
-            remove_path(&prev);
-            self.report_unknown(name, &paths)?;
+        }
+        self.deliver().map_err(StartupError::Retry)
+    }
+
+    /// What a project's journal left open, as a result to deliver.
+    fn recover(
+        &self,
+        project: &str,
+        paths: &ProjectPaths,
+    ) -> Result<Option<Unreported>, StartupError> {
+        let fatal = |what: &str, e: &dyn fmt::Display| {
+            StartupError::Fatal(format!(
+                "project {project}: {what} ({e}); check the project's state by hand"
+            ))
+        };
+        let journal = Journal::new(paths);
+        let open = journal
+            .unfinished()
+            .map_err(|e| fatal("the journal is unreadable", &e))?;
+        let marker = marker_path(paths).exists();
+        let (job, result, f, install) = match open {
+            None => {
+                if marker {
+                    install_undo(paths);
+                } else {
+                    install_commit(paths);
+                }
+                return Ok(None);
+            }
+            Some(Unfinished::Reporting {
+                job,
+                result,
+                failure,
+            }) => {
+                let install = marker && result == "trusted";
+                if marker && !install {
+                    install_undo(paths);
+                }
+                (job, result, failure, install)
+            }
+            Some(open) => {
+                if marker {
+                    install_undo(paths);
+                }
+                let (job, result, f) = match open {
+                    Unfinished::Claimed { job, kind } if kind == "trust" => {
+                        (job, "apply_failed", Some(failure("runner_restarted")))
+                    }
+                    Unfinished::Claimed { job, .. } | Unfinished::Applying { job } => {
+                        self.mark_uncertain(paths, None)
+                            .map_err(|e| fatal("applied.json", &e))?;
+                        (job, "outcome_unknown", None)
+                    }
+                    Unfinished::Reporting { .. } => unreachable!("handled above"),
+                };
+                eprintln!("shoephone-runner: job {job} of {project} was open at a restart");
+                journal
+                    .report(job, result, f.as_ref())
+                    .map_err(|e| fatal("the journal is unwritable", &e))?;
+                (job, result.to_string(), f, false)
+            }
+        };
+        Ok(Some(Unreported {
+            project: project.to_string(),
+            body: FinishBody {
+                id: job,
+                result,
+                failure: f.as_ref().map(view),
+                project: Some(project.to_string()),
+            },
+            install,
+        }))
+    }
+
+    // -----------------------------------------------------------------
+    // Results
+
+    /// Sends one `finish`. A permanent refusal of what may be a retry is
+    /// checked against the job's status: if the daemon already has this
+    /// very result, the earlier send arrived and only its reply was lost.
+    fn send_finish(&self, body: &FinishBody) -> Sent {
+        match self.client.finish(body) {
+            Ok(()) => Sent::Delivered,
+            Err(e) if is_permanent(&e) => match self.client.job(body.id) {
+                Ok(Some(st)) if st.result.as_deref() == Some(body.result.as_str()) => {
+                    Sent::Delivered
+                }
+                Ok(_) => {
+                    eprintln!(
+                        "shoephone-runner: finish {} of job {} refused: {e}",
+                        body.result, body.id
+                    );
+                    Sent::Refused
+                }
+                Err(e) => Sent::Transient(format!("job status: {e}")),
+            },
+            Err(e) => Sent::Transient(format!("finish: {e}")),
+        }
+    }
+
+    /// Delivers every unreported result, oldest first. Stops at the first
+    /// transient failure; nothing new is polled until all are through.
+    fn deliver(&mut self) -> Result<(), String> {
+        while let Some(u) = self.unreported.first() {
+            let delivered = match self.send_finish(&u.body) {
+                Sent::Delivered => true,
+                Sent::Refused => false,
+                Sent::Transient(e) => return Err(e),
+            };
+            let u = self.unreported.remove(0);
+            if let Ok(paths) = self.paths(&u.project) {
+                if u.install {
+                    if delivered {
+                        install_commit(&paths);
+                    } else {
+                        // The daemon did not record the trust, so neither
+                        // does the runner.
+                        install_undo(&paths);
+                    }
+                }
+                if let Err(e) = Journal::new(&paths).close(u.body.id) {
+                    eprintln!("shoephone-runner: journal for job {}: {e}", u.body.id);
+                }
+            }
         }
         Ok(())
     }
 
-    /// Reports a job the journal left `applying` as `outcome_unknown`, and
-    /// only then closes the journal entry.
-    fn report_unknown(&self, project: &str, paths: &ProjectPaths) -> Result<(), StartupError> {
-        let journal = Journal::new(paths);
-        let id = match journal.pending_unknown() {
-            Ok(Some(id)) => id,
-            Ok(None) => return Ok(()),
-            Err(e) => {
-                return Err(StartupError::Fatal(format!(
-                    "project {project}: the apply journal is unreadable ({e}); \
-                     check the project's state by hand, then remove journal.json"
-                )));
-            }
-        };
-        eprintln!("shoephone-runner: job {id} of {project} was applying at a restart");
-        self.mark_uncertain(paths, None)
-            .map_err(|e| StartupError::Fatal(format!("project {project}: applied.json: {e}")))?;
-        let body = FinishBody {
-            id,
-            result: "outcome_unknown".into(),
-            failure: None,
-            project: Some(project.to_string()),
-        };
-        match self.client.finish(&body) {
-            Ok(()) => {}
-            Err(e) if is_permanent(&e) => {
-                eprintln!("shoephone-runner: the daemon refused outcome_unknown for job {id}: {e}");
-            }
-            Err(e) => return Err(StartupError::Retry(format!("reporting job {id}: {e}"))),
+    /// Journals a claimed job's result, then tries to deliver it.
+    fn report(
+        &mut self,
+        project: &str,
+        id: u64,
+        result: &str,
+        f: Option<Failure>,
+        install: bool,
+    ) -> Result<(), String> {
+        if let Some(journal) = self.journal(project)
+            && let Err(e) = journal.report(id, result, f.as_ref())
+        {
+            eprintln!("shoephone-runner: journal for job {id}: {e}");
         }
-        journal
-            .end(id, "outcome_unknown")
-            .map_err(|e| StartupError::Fatal(format!("project {project}: journal: {e}")))
+        self.unreported.push(Unreported {
+            project: project.to_string(),
+            body: FinishBody {
+                id,
+                result: result.to_string(),
+                failure: f.as_ref().map(view),
+                project: Some(project.to_string()),
+            },
+            install,
+        });
+        self.deliver()
     }
 
     // -----------------------------------------------------------------
     // The loop
 
-    /// One pass: poll once and act on the answer. An error means the
-    /// daemon could not be reached or refused the conversation, and
-    /// [`run`] backs off. A job's own failure is reported to the daemon,
-    /// not returned.
+    /// One pass: deliver any unreported result, then poll once and act on
+    /// the answer. An error means the daemon could not be reached or
+    /// refused the conversation, and [`run`] backs off. A job's own
+    /// failure is reported to the daemon, not returned.
     pub fn step(&mut self) -> Result<(), String> {
+        self.deliver()?;
         let job = self.client.poll().map_err(|e| format!("poll: {e}"))?;
         match job {
             Some(j) if j.state == "approved" => self.on_approved(j),
@@ -454,10 +677,18 @@ impl Runner {
         match status.as_ref().map(|s| s.state.as_str()) {
             // Our claim reached the daemon but its answer did not reach us.
             Some("claimed") => self.execute(p, None),
-            Some("queued" | "working" | "waiting" | "approved") => self.pending = Some(p),
-            _ => self.cleanup(&p.project, p.id),
+            Some("queued" | "working" | "waiting" | "approved") => {
+                self.pending = Some(p);
+                Ok(())
+            }
+            _ => {
+                if let Some(journal) = self.journal(&p.project) {
+                    let _ = journal.close(p.id);
+                }
+                self.cleanup(&p.project, p.id);
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     fn on_approved(&mut self, j: RunnerJob) -> Result<(), String> {
@@ -470,17 +701,28 @@ impl Runner {
                 return self.orphan(&j);
             }
         };
+        let journal = self.journal(&p.project);
+        if let Some(journal) = &journal
+            && let Err(e) = journal.claim(p.id, p.work.kind())
+        {
+            // Without the record a crash could not be reported; leave the
+            // approval to expire rather than act on it unjournaled.
+            eprintln!("shoephone-runner: journal for job {}: {e}", p.id);
+            self.cleanup(&p.project, p.id);
+            return Err(format!("journal: {e}"));
+        }
         match self.client.claim(p.id) {
-            Ok(scope) => {
-                self.execute(p, Some(scope));
-                Ok(())
-            }
+            Ok(scope) => self.execute(p, Some(scope)),
             Err(e) if is_permanent(&e) => {
                 eprintln!("shoephone-runner: claim of job {} refused: {e}", p.id);
+                if let Some(journal) = &journal {
+                    let _ = journal.close(p.id);
+                }
                 self.cleanup(&p.project, p.id);
                 Ok(())
             }
             Err(e) => {
+                // It may have arrived; `check_pending` finds out.
                 self.pending = Some(p);
                 Err(format!("claim: {e}"))
             }
@@ -489,13 +731,27 @@ impl Runner {
 
     /// An approval this process has no plan for (it restarted after the
     /// submit): claim it and fail it, so it ends now with nothing applied.
-    fn orphan(&self, j: &RunnerJob) -> Result<(), String> {
+    fn orphan(&mut self, j: &RunnerJob) -> Result<(), String> {
+        let journal = self.journal(&j.project);
+        if let Some(journal) = &journal
+            && let Err(e) = journal.claim(j.id, &j.kind)
+        {
+            return Err(format!("journal: {e}"));
+        }
         match self.client.claim(j.id) {
-            Ok(_) => {
-                self.finish(j.id, "apply_failed", Some(failure("plan_lost")));
+            Ok(_) => self.report(
+                &j.project,
+                j.id,
+                "apply_failed",
+                Some(failure("plan_lost")),
+                false,
+            ),
+            Err(e) if is_permanent(&e) => {
+                if let Some(journal) = &journal {
+                    let _ = journal.close(j.id);
+                }
                 Ok(())
             }
-            Err(e) if is_permanent(&e) => Ok(()),
             Err(e) => Err(format!("claim: {e}")),
         }
     }
@@ -516,10 +772,6 @@ impl Runner {
                 self.cleanup(&j.project, j.id);
                 return self.refuse(&j, result, f);
             }
-            Err(Stop::Transport(e)) => {
-                self.cleanup(&j.project, j.id);
-                return Err(e);
-            }
         };
         let body = SubmitBody {
             id: j.id,
@@ -530,6 +782,7 @@ impl Runner {
             id: j.id,
             project: j.project.clone(),
             job_dir,
+            scope: body.scope.clone(),
             work,
         };
         match self.client.submit(&body) {
@@ -556,48 +809,13 @@ impl Runner {
             result: result.to_string(),
             failure: view(&f),
         };
-        match self.client.refuse(&body) {
+        match self.retrying(|| self.client.refuse(&body)) {
             Ok(()) => Ok(()),
             Err(e) if is_permanent(&e) => {
                 eprintln!("shoephone-runner: refuse of job {} refused: {e}", j.id);
                 Ok(())
             }
             Err(e) => Err(format!("refuse: {e}")),
-        }
-    }
-
-    /// Reports how a claimed job ended.
-    fn finish(&self, id: u64, result: &str, f: Option<Failure>) {
-        let body = FinishBody {
-            id,
-            result: result.to_string(),
-            failure: f.as_ref().map(view),
-            project: None,
-        };
-        let _ = self.finish_body(&body);
-    }
-
-    /// [`RunnerClient::finish`], retried while the daemon is unreachable
-    /// or answers 5xx.
-    fn finish_body(&self, body: &FinishBody) -> Result<(), Error> {
-        let mut delay = Duration::from_millis(500);
-        let mut attempt = 1;
-        loop {
-            match self.client.finish(body) {
-                Ok(()) => return Ok(()),
-                Err(e) if is_permanent(&e) || attempt >= FINISH_ATTEMPTS => {
-                    eprintln!(
-                        "shoephone-runner: finish {} of job {} failed: {e}",
-                        body.result, body.id
-                    );
-                    return Err(e);
-                }
-                Err(_) => {
-                    std::thread::sleep(delay);
-                    delay = (delay * 2).min(MAX_BACKOFF);
-                    attempt += 1;
-                }
-            }
         }
     }
 
@@ -610,6 +828,34 @@ impl Runner {
         let local: Trusted = load_json(&paths.trusted_json()).ok().flatten()?;
         let tree = tree::execution_input(&paths.trusted_dir(), &pcfg.path, &local.modes).ok()?;
         (tree::digest(&tree) == local.digest).then_some((local, tree))
+    }
+
+    /// Root's own review of `archive`, unpacked into the fresh directory
+    /// `into`, against `baseline` (the trusted tree). Applies the worker's
+    /// `no_changes` rule too.
+    fn root_review(
+        &self,
+        project: &str,
+        pcfg: &ProjectConfig,
+        paths: &ProjectPaths,
+        baseline: Option<&Trusted>,
+        archive: &[u8],
+        into: &Path,
+    ) -> Result<(Review, Modes), Failure> {
+        fresh_dir(into).map_err(|_| failure("job_dir_unavailable"))?;
+        let modes = tree::unpack(archive, into, &Limits::default())?;
+        let trusted = paths.trusted_dir();
+        let r = review::review(
+            baseline.map(|t| (trusted.as_path(), &t.modes)),
+            (into, &modes),
+            project,
+            pcfg,
+            POLICY_VERSION,
+        )?;
+        if r.scope.baseline.is_some() && r.scope.files_changed == 0 {
+            return Err(failure("no_changes"));
+        }
+        Ok((r, modes))
     }
 
     fn plan_trust(
@@ -629,11 +875,9 @@ impl Runner {
                 _ => return Err(refused("baseline_mismatch")),
             },
         };
-        let archive = match self.client.archive(j.id) {
-            Ok(a) => a,
-            Err(e) if is_permanent(&e) => return Err(plan_failed(failure("archive_unavailable"))),
-            Err(e) => return Err(Stop::Transport(format!("archive: {e}"))),
-        };
+        let archive = self
+            .retrying(|| self.client.archive(j.id))
+            .map_err(|_| plan_failed(failure("archive_unavailable")))?;
         let unavailable = |_: io::Error| plan_failed(failure("job_dir_unavailable"));
         let candidate = job_dir.join("candidate");
         fresh_dir(&candidate).map_err(unavailable)?;
@@ -676,12 +920,28 @@ impl Runner {
         let scope = review
             .scope
             .ok_or_else(|| plan_failed(failure("review_failed")))?;
-        let expected_baseline = baseline.as_ref().map(|(local, _)| local.digest.clone());
-        if scope.project != j.project
-            || scope.baseline != expected_baseline
-            || scope.policy_version != POLICY_VERSION
-        {
-            return Err(plan_failed(failure("review_inconsistent")));
+
+        // The worker's word is not enough: root reviews its own unpack and
+        // every signed field must agree, the shown diff included.
+        let incoming = paths.dir().join("incoming");
+        let root = self.root_review(
+            &j.project,
+            pcfg,
+            &paths,
+            baseline.as_ref().map(|(local, _)| local),
+            &archive,
+            &incoming,
+        );
+        remove_path(&incoming);
+        let inconsistent = || refused("review_inconsistent");
+        let (root, _) = root.map_err(|_| inconsistent())?;
+        let display_ok = match (&review.diff, &root.diff) {
+            (Some(text), Some(_)) => sha256_hex(text) == root.scope.diff,
+            (None, None) => review.verify_command.as_deref() == Some(root.verify_command.as_str()),
+            _ => false,
+        };
+        if !same_trust_scope(&scope, &root.scope) || !display_ok {
+            return Err(inconsistent());
         }
         if !review.warnings.is_empty() {
             eprintln!(
@@ -701,72 +961,65 @@ impl Runner {
                 ..DisplayWire::default()
             },
         };
-        let work = Work::Trust {
-            archive,
-            candidate: scope.candidate.clone(),
-            schema: scope.schema.clone(),
-        };
-        Ok((work, JobScopeWire::Trust(scope), display))
+        Ok((Work::Trust { archive }, JobScopeWire::Trust(scope), display))
     }
 
     /// Installs the approved candidate as `trusted/`, from root's own
-    /// unpack of the archive, never from the directory the review worker
-    /// could write. Returns how to put the previous trust back.
+    /// unpack and review of the archive against the trusted tree as it is
+    /// now, never from the directory the review worker could write. Leaves
+    /// `install.json` until the daemon has recorded it.
     fn install_trust(
         &self,
         project: &str,
         archive: &[u8],
-        candidate: &str,
-        schema_digest: &str,
-    ) -> Result<Restore, Failure> {
+        approved: &TrustScopeWire,
+    ) -> Result<(), Failure> {
         let pcfg = self.project(project)?;
         let paths = self.paths(project)?;
-        let dir = paths.dir();
-        let incoming = dir.join("incoming");
-        let next = dir.join("trusted.next");
-        let prev = dir.join("trusted.prev");
+        let baseline = match &approved.baseline {
+            None => None,
+            Some(digest) => match self.local_trust(pcfg, &paths) {
+                Some((local, _)) if local.digest == *digest => Some(local),
+                _ => return Err(failure("baseline_mismatch")),
+            },
+        };
+        let incoming = paths.dir().join("incoming");
+        let next = paths.dir().join("trusted.next");
         let unavailable = |_: io::Error| failure("trust_install_failed");
         let installed = (|| {
-            fresh_dir(&incoming).map_err(unavailable)?;
-            let modes = tree::unpack(archive, &incoming, &Limits::default())?;
+            let (root, modes) =
+                self.root_review(project, pcfg, &paths, baseline.as_ref(), archive, &incoming)?;
+            if !same_trust_scope(approved, &root.scope) {
+                return Err(failure("review_inconsistent"));
+            }
             let tree = tree::execution_input(&incoming, &pcfg.path, &modes)?;
-            if tree::digest(&tree) != candidate {
-                return Err(failure("candidate_changed"));
-            }
-            let schema_path = under(&under(&incoming, &pcfg.path), &pcfg.schema_file);
-            let schema_text = fs::read(&schema_path)
-                .ok()
-                .and_then(|b| String::from_utf8(b).ok())
-                .ok_or_else(|| failure("schema_missing"))?;
-            if sha256_hex(&schema_text) != schema_digest {
-                return Err(failure("schema_changed"));
-            }
             fresh_dir(&next).map_err(unavailable)?;
             tree::copy_execution_input(&tree, &incoming, &next)?;
-            let old_json = fs::read(paths.trusted_json()).ok();
-            remove_path(&prev);
+
+            remove_path(&prev_dir(&paths));
+            remove_path(&prev_json(&paths));
             let had_old = paths.trusted_dir().exists();
-            if had_old {
-                fs::rename(paths.trusted_dir(), &prev).map_err(unavailable)?;
-            }
-            let restore = Restore {
-                trusted_dir: paths.trusted_dir(),
-                trusted_json: paths.trusted_json(),
-                prev: had_old.then(|| prev.clone()),
-                old_json,
-            };
+            save_json(&marker_path(&paths), &InstallMarker { had_old }).map_err(unavailable)?;
             let record = Trusted {
-                digest: candidate.to_string(),
-                schema: schema_digest.to_string(),
+                digest: approved.candidate.clone(),
+                schema: approved.schema.clone(),
                 modes: modes_of(&tree),
             };
-            let done = fs::rename(&next, paths.trusted_dir())
-                .and_then(|()| save_json(&paths.trusted_json(), &record));
-            if done.is_err() {
-                restore.undo();
+            let swapped = (|| {
+                if had_old {
+                    fs::rename(paths.trusted_dir(), prev_dir(&paths))?;
+                    if paths.trusted_json().exists() {
+                        fs::rename(paths.trusted_json(), prev_json(&paths))?;
+                    }
+                }
+                fs::rename(&next, paths.trusted_dir())?;
+                save_json(&paths.trusted_json(), &record)
+            })();
+            if swapped.is_err() {
+                install_undo(&paths);
                 return Err(failure("trust_install_failed"));
             }
-            Ok(restore)
+            Ok(())
         })();
         remove_path(&incoming);
         remove_path(&next);
@@ -908,63 +1161,38 @@ impl Runner {
     // -----------------------------------------------------------------
     // After the claim
 
-    /// Acts on a claimed job and reports how it ended. `scope` is what the
-    /// claim returned (absent when the claim's reply was lost); it must be
-    /// the scope this runner submitted.
-    fn execute(&mut self, p: Pending, scope: Option<JobScopeWire>) {
-        match &p.work {
-            Work::Trust {
-                archive,
-                candidate,
-                schema,
-            } => {
-                let same = match &scope {
-                    None => true,
-                    Some(JobScopeWire::Trust(t)) => t.candidate == *candidate,
-                    Some(JobScopeWire::Apply(_)) => false,
-                };
-                if !same {
-                    self.finish(p.id, "apply_failed", Some(failure("scope_mismatch")));
-                } else {
-                    match self.install_trust(&p.project, archive, candidate, schema) {
-                        Ok(restore) => {
-                            let body = FinishBody {
-                                id: p.id,
-                                result: "trusted".into(),
-                                failure: None,
-                                project: None,
-                            };
-                            match self.finish_body(&body) {
-                                Ok(()) => restore.commit(),
-                                // The daemon did not record it, so neither
-                                // does the runner.
-                                Err(_) => restore.undo(),
-                            }
-                        }
-                        Err(f) => self.finish(p.id, "apply_failed", Some(f)),
+    /// Acts on a claimed job and reports how it ended. `claimed` is what
+    /// the claim returned (absent when its reply was lost); it must be the
+    /// whole scope this runner submitted.
+    fn execute(&mut self, p: Pending, claimed: Option<JobScopeWire>) -> Result<(), String> {
+        let same = claimed.as_ref().is_none_or(|c| same_scope(c, &p.scope));
+        let (result, f, install) = if !same {
+            ("apply_failed", Some(failure("scope_mismatch")), false)
+        } else {
+            match (&p.work, &p.scope) {
+                (Work::Trust { archive }, JobScopeWire::Trust(approved)) => {
+                    match self.install_trust(&p.project, archive, approved) {
+                        Ok(()) => ("trusted", None, true),
+                        Err(f) => ("apply_failed", Some(f), false),
                     }
                 }
+                (
+                    Work::Apply {
+                        plan,
+                        plan_sha,
+                        context,
+                        canonical,
+                    },
+                    JobScopeWire::Apply(_),
+                ) => {
+                    let (r, f) = self.apply_claimed(&p, plan, plan_sha, context, canonical);
+                    (r, f, false)
+                }
+                _ => ("apply_failed", Some(failure("scope_mismatch")), false),
             }
-            Work::Apply {
-                plan,
-                plan_sha,
-                context,
-                canonical,
-            } => {
-                let same = match &scope {
-                    None => true,
-                    Some(JobScopeWire::Apply(a)) => a.plan == *plan_sha,
-                    Some(JobScopeWire::Trust(_)) => false,
-                };
-                let (result, f) = if same {
-                    self.apply_claimed(&p, plan, plan_sha, context, canonical)
-                } else {
-                    ("apply_failed", Some(failure("scope_mismatch")))
-                };
-                self.finish(p.id, result, f);
-            }
-        }
+        };
         self.cleanup(&p.project, p.id);
+        self.report(&p.project, p.id, result, f, install)
     }
 
     /// Re-checks the pinned context, then applies under the journal.
@@ -1028,9 +1256,6 @@ impl Runner {
                     "terraform_timeout" | "terraform_crashed"
                 ) =>
             {
-                if let Err(e) = journal.end(p.id, "outcome_unknown") {
-                    eprintln!("shoephone-runner: journal for job {}: {e}", p.id);
-                }
                 ("outcome_unknown", None)
             }
             Err(f) => ("apply_failed", Some(f)),
@@ -1100,18 +1325,51 @@ mod tests {
         assert!(read_nofollow(&target, 3).is_err(), "over the limit");
     }
 
-    #[test]
-    fn only_client_errors_are_permanent() {
-        let daemon = |http| Error::Daemon {
+    fn daemon(http: u16, code: &str) -> Error {
+        Error::Daemon {
             http,
             reply: crate::api::ErrorReply {
-                code: "x".into(),
+                code: code.into(),
                 error: String::new(),
                 until: None,
             },
-        };
-        assert!(is_permanent(&daemon(409)));
-        assert!(!is_permanent(&daemon(500)));
+        }
+    }
+
+    #[test]
+    fn only_client_errors_are_permanent() {
+        assert!(is_permanent(&daemon(409, "busy")));
+        assert!(is_permanent(&daemon(401, "wrong_runner")));
+        assert!(
+            !is_permanent(&daemon(401, "stale_signature")),
+            "re-signed on retry"
+        );
+        assert!(!is_permanent(&daemon(500, "x")));
         assert!(!is_permanent(&Error::Unreachable("down".into())));
+    }
+
+    #[test]
+    fn install_undo_restores_the_previous_trust() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = ProjectPaths::new(dir.path(), "web").unwrap();
+        fs::create_dir_all(prev_dir(&paths)).unwrap();
+        fs::write(prev_dir(&paths).join("old.tf"), b"old").unwrap();
+        fs::write(prev_json(&paths), b"{\"old\":1}").unwrap();
+        fs::create_dir_all(paths.trusted_dir()).unwrap();
+        fs::write(paths.trusted_dir().join("new.tf"), b"new").unwrap();
+        fs::write(paths.trusted_json(), b"{\"new\":1}").unwrap();
+        save_json(&marker_path(&paths), &InstallMarker { had_old: true }).unwrap();
+        install_undo(&paths);
+        assert!(paths.trusted_dir().join("old.tf").exists());
+        assert!(!paths.trusted_dir().join("new.tf").exists());
+        assert_eq!(fs::read(paths.trusted_json()).unwrap(), b"{\"old\":1}");
+        assert!(!marker_path(&paths).exists());
+        assert!(!prev_dir(&paths).exists());
+
+        // A first trust undone leaves nothing trusted.
+        save_json(&marker_path(&paths), &InstallMarker { had_old: false }).unwrap();
+        install_undo(&paths);
+        assert!(!paths.trusted_dir().exists());
+        assert!(!paths.trusted_json().exists());
     }
 }

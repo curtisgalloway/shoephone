@@ -27,15 +27,36 @@ example with placeholder values is `contrib/runner/shoephone-runner.toml.example
 ### run
 
 Startup: probe the sandbox (warnings on stderr), prune old logs, remove
-every job directory and plan copy an earlier run left behind, and report any
-apply that `journal.json` still says is `applying` to the daemon as
-`outcome_unknown` (the baseline is marked `uncertain`) before the first
-poll. An unreadable journal stops the runner (exit 3) until the operator
-checks the project by hand.
+every job directory and plan copy an earlier run left behind, then act on
+whatever `journal.json` left open, before the first poll:
+
+- a claimed apply, or one still `applying`, is reported `outcome_unknown`
+  (the baseline is marked `uncertain`);
+- a claimed trust is reported `apply_failed` with category
+  `runner_restarted`, and a half-installed trust is put back;
+- a result journaled but not acknowledged is sent again.
+
+Startup does not finish until the daemon has every one of these (it retries
+with backoff). An unreadable journal stops the runner (exit 3) until the
+operator checks the project by hand.
 
 The loop polls every 2 s, backing off to 30 s while the daemon cannot be
 reached, and handles one job at a time. Every request is signed with the
-runner key over a fresh nonce and the current time.
+runner key over a fresh nonce and the current time; a `stale_signature`
+refusal is retried with a new signature. The daemon URL must be `https://`
+(rustls with the platform verifier, so a private CA in the system trust
+store works); plain `http://` is refused unless the host is `127.0.0.1`,
+`::1` or `localhost`.
+
+Every claim is journaled before it is sent, and every result before
+`finish` is sent. A `finish` that fails transiently is retried on each pass,
+before any new poll, until the daemon has it or refuses it for good; a
+refusal of a retry whose first copy did arrive (the job status already shows
+that result) counts as delivered. A transient failure fetching an archive,
+or sending a refusal, is retried for up to 60 s; an archive still out of
+reach ends the job `plan_failed` with category `archive_unavailable`. If the
+daemon never hears back about a claimed job, it records the outcome as
+unknown after its `claim_ttl` (default 3 h).
 
 - **Trust.** The baseline is the daemon's trusted record, which must match
   the local `trusted.json` and `trusted/` tree (otherwise the job is refused
@@ -43,11 +64,24 @@ runner key over a fresh nonce and the current time.
   unpacked into `state_dir/jobs/<id>/candidate`, the baseline's execution
   input is copied beside it, the directory is handed to `review_user`, and
   `review-worker` runs as that user with no credentials and an environment
-  of only `PATH`. Its scope and diff are submitted. On approval the runner
-  unpacks the archive again itself, checks the approved candidate and
-  schema digests, installs only the execution input as `trusted/`, writes
-  `trusted.json`, and reports `trusted`; if the daemon does not record it,
-  the previous trust is put back.
+  of only `PATH`. The root process then unpacks the archive itself and
+  repeats the review against `trusted/`; unless the candidate, diff and
+  schema digests, the three counts and `schema_changed` all equal the
+  worker's, and the worker's diff text hashes to that digest, the job is
+  refused `review_inconsistent`. The worker's diff text and warnings are
+  what the approver is shown. On approval root unpacks and reviews the
+  archive once more, against the trusted tree as it is then, installs only
+  the execution input as `trusted/` (leaving `install.json` and the previous
+  tree as `trusted.prev/` until the daemon has the result), writes
+  `trusted.json`, and reports `trusted`; if the daemon refuses it, the
+  previous trust is put back.
+
+  This is a deliberate deviation from the design, which has the root
+  process never parse repository content: root parses the tar archive, the
+  HCL that names local modules, and the text diff. Without that, a
+  compromised review worker could forge the diff the operator approves.
+  The parsers are memory-safe Rust with the same size, file-count and time
+  limits as the worker's unpack.
 - **Apply.** Refused `no_trusted_revision` unless the daemon's record, the
   local `trusted.json` and a fresh digest of `trusted/` agree, and the
   schema file still hashes to the recorded schema digest. The manifest is
@@ -60,7 +94,9 @@ runner key over a fresh nonce and the current time.
   and the display (canonical manifest, the `applied.json` baseline, the
   address text) are submitted. On approval the job is claimed and the
   pinned context is recomputed; a change fails the job `apply_failed`
-  with category `context_changed` before anything runs. `applied.json` is
+  with category `context_changed` before anything runs. The scope the claim
+  returns must equal the one submitted, field for field (`scope_mismatch`
+  otherwise). `applied.json` is
   marked `uncertain` (keeping the last applied manifest) before Terraform
   starts and set to `applied` with the new manifest only on success. A
   `terraform_timeout` or a Terraform killed by a signal
@@ -130,8 +166,12 @@ Under `state_dir/projects/<name>/`:
 - `trusted.json`: `{ digest, schema, modes }`, `modes` holding the archive
   header mode of each file of the trusted tree, which the digest covers.
 - `applied.json`: `{ manifest, status }`, status `applied` or `uncertain`.
-- `journal.json`: `{ job, phase, result }`, phase `claimed`, `applying` or
-  `done`.
+- `journal.json`: `{ job, phase, result, kind, failure }`, phase `claimed`
+  (written before the claim is sent; `kind` is `trust` or `apply`),
+  `applying` (Terraform apply started), `reporting` (the `result` and
+  `failure` to send in `finish`, not yet acknowledged) or `done`.
+- `install.json`, `trusted.prev/`, `trusted.prev.json`: present only while a
+  newly installed trust waits for the daemon to record it.
 - `plans/<job>.tfplan`: root's copy of a job's saved plan, taken as soon as
   `terraform plan` writes it. That copy is what is hashed, shown, approved
   and applied (mounted read-only over the job directory's plan file), and

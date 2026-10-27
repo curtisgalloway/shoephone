@@ -15,10 +15,11 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::json;
 use shoephone::api::{ApplyBody, JobStatus, TrustBody};
 use shoephone::client::Client;
+use shoephone::runner::client::Fault;
 use shoephone::runner::config::{ProjectConfig, RunnerConfig, Source};
 use shoephone::runner::exec;
 use shoephone::runner::journal::Journal;
-use shoephone::runner::run::Runner;
+use shoephone::runner::run::{Runner, StartupError};
 use shoephone::runner::state::{Applied, AppliedStatus, ProjectPaths};
 use ssh_key::LineEnding;
 
@@ -251,6 +252,31 @@ fn archive(files: &[(&str, &str)]) -> Vec<u8> {
         tar.append_data(&mut h, path, content.as_bytes()).unwrap();
     }
     tar.into_inner().unwrap().finish().unwrap()
+}
+
+/// One pass of the loop, returning what it returned.
+async fn try_step(mut runner: Runner) -> (Runner, Result<(), String>) {
+    blocking(move || {
+        let r = runner.step();
+        (runner, r)
+    })
+    .await
+}
+
+fn count(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+/// A review worker that lies: it swaps in a harmless-looking diff, with a
+/// digest to match, over the real candidate.
+fn forge_review(job_dir: &Path) {
+    let path = job_dir.join("review.json");
+    let mut review: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let benign = "--- a/infra/main.tf\n+++ b/infra/main.tf\n+# a comment\n";
+    review["diff"] = json!(benign);
+    review["scope"]["diff"] = json!(shoephone::store::sha256_hex(benign));
+    std::fs::write(&path, serde_json::to_vec(&review).unwrap()).unwrap();
 }
 
 /// One pass of the loop.
@@ -504,4 +530,147 @@ async fn second_trust_reviews_against_the_trusted_baseline() {
     assert_ne!(second["digest"], first["digest"]);
     assert!(!fx.project_dir().join("trusted.prev").exists());
     fx.assert_no_job_leftovers();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forged_review_is_refused_review_inconsistent() {
+    let fx = Fx::new("forged", CREATE_ONLY).await;
+    exec::test_hooks_tamper_review(&fx.cfg.state_dir, forge_review);
+    let runner = fx.runner().await;
+    let id = fx.trust(&standard_files()).await;
+    let _runner = step(runner).await;
+    let st = fx.status(id).await;
+    assert_eq!(st.result.as_deref(), Some("refused"), "{st:?}");
+    assert_eq!(st.failure.unwrap().category, "review_inconsistent");
+    assert!(!fx.project_dir().join("trusted.json").exists());
+    fx.assert_no_job_leftovers();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_without_a_plan_is_failed_plan_lost() {
+    let fx = Fx::new("orphan", CREATE_ONLY).await;
+    let runner = fx.runner().await;
+    let runner = fx.trusted(runner).await;
+    let id = fx.apply(r#"{"region":"west"}"#).await;
+    let runner = step(runner).await;
+    fx.approve(id).await;
+    drop(runner);
+    // A restart between submit and approval: the plan is gone.
+    let runner = fx.runner().await;
+    let _runner = step(runner).await;
+    let st = fx.status(id).await;
+    assert_eq!(st.result.as_deref(), Some("apply_failed"), "{st:?}");
+    assert_eq!(st.failure.unwrap().category, "plan_lost");
+    assert!(!fx.record().contains("arg:apply"), "nothing was applied");
+    fx.assert_no_job_leftovers();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_claim_reply_still_applies_exactly_once() {
+    let fx = Fx::new("lostclaim", CREATE_ONLY).await;
+    let runner = fx.runner().await;
+    let runner = fx.trusted(runner).await;
+    let id = fx.apply(r#"{"region":"west"}"#).await;
+    let runner = step(runner).await;
+    fx.approve(id).await;
+    runner.test_hooks_fault("/api/runner/claim", Fault::LoseReply);
+    let (runner, r) = try_step(runner).await;
+    assert!(r.is_err(), "the lost reply is an error to back off on");
+    assert_eq!(fx.status(id).await.state, "claimed");
+    let _runner = step(runner).await;
+    let st = fx.status(id).await;
+    assert_eq!(st.result.as_deref(), Some("applied"), "{st:?}");
+    assert_eq!(count(&fx.record(), "arg:apply"), 1, "applied exactly once");
+    fx.assert_no_job_leftovers();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_trusted_finish_reply_keeps_the_trust() {
+    let fx = Fx::new("losttrust", CREATE_ONLY).await;
+    let runner = fx.runner().await;
+    let id = fx.trust(&standard_files()).await;
+    let runner = step(runner).await;
+    fx.approve(id).await;
+    runner.test_hooks_fault("/api/runner/finish", Fault::LoseReply);
+    let (runner, r) = try_step(runner).await;
+    assert!(r.is_err());
+    // The daemon recorded it; the runner does not know yet.
+    assert_eq!(fx.status(id).await.result.as_deref(), Some("trusted"));
+    let runner = step(runner).await;
+    assert!(
+        fx.project_dir().join("trusted.json").exists(),
+        "the trust stands"
+    );
+    assert!(!fx.project_dir().join("install.json").exists());
+    let paths = ProjectPaths::new(&fx.cfg.state_dir, "web").unwrap();
+    assert_eq!(Journal::new(&paths).unfinished().unwrap(), None);
+    // Daemon and runner agree, so an apply goes through.
+    let (_runner, st) = fx.applied_job(runner, r#"{"region":"west"}"#).await;
+    assert_eq!(st.result.as_deref(), Some("applied"), "{st:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transient_finish_failure_is_delivered_on_retry() {
+    let fx = Fx::new("retryfinish", CREATE_ONLY).await;
+    let runner = fx.runner().await;
+    let runner = fx.trusted(runner).await;
+    let id = fx.apply(r#"{"region":"west"}"#).await;
+    let runner = step(runner).await;
+    fx.approve(id).await;
+    runner.test_hooks_fault("/api/runner/finish", Fault::Unreachable);
+    runner.test_hooks_fault("/api/runner/finish", Fault::Unreachable);
+    let (runner, r) = try_step(runner).await;
+    assert!(r.is_err());
+    assert_eq!(fx.status(id).await.state, "claimed");
+    let paths = ProjectPaths::new(&fx.cfg.state_dir, "web").unwrap();
+    assert!(
+        matches!(
+            Journal::new(&paths).unfinished().unwrap(),
+            Some(shoephone::runner::journal::Unfinished::Reporting { .. })
+        ),
+        "the result is journaled before it is sent"
+    );
+    // The next pass retries before polling, and fails again.
+    let (runner, r) = try_step(runner).await;
+    assert!(r.is_err());
+    let _runner = step(runner).await;
+    let st = fx.status(id).await;
+    assert_eq!(st.result.as_deref(), Some("applied"), "{st:?}");
+    assert_eq!(count(&fx.record(), "arg:apply"), 1);
+    assert_eq!(Journal::new(&paths).unfinished().unwrap(), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_with_the_daemon_unreachable_retries() {
+    let fx = Fx::new("startretry", CREATE_ONLY).await;
+    let paths = ProjectPaths::new(&fx.cfg.state_dir, "web").unwrap();
+    let journal = Journal::new(&paths);
+    journal.begin(4_242).unwrap();
+    let cfg = fx.cfg.clone();
+    let mut runner = blocking(move || Runner::new(cfg).unwrap()).await;
+    runner.test_hooks_fault("/api/runner/finish", Fault::Unreachable);
+    let (mut runner, first) = blocking(move || {
+        let r = runner.startup();
+        (runner, r)
+    })
+    .await;
+    assert!(matches!(first, Err(StartupError::Retry(_))), "{first:?}");
+    assert!(
+        journal.unfinished().unwrap().is_some(),
+        "kept until delivered"
+    );
+    let second = blocking(move || runner.startup()).await;
+    assert!(second.is_ok(), "{second:?}");
+    assert_eq!(journal.unfinished().unwrap(), None);
+    let base = fx.client.base().to_owned();
+    let ledger = blocking(move || {
+        ureq::get(format!("{base}/api/ledger"))
+            .call()
+            .unwrap()
+            .into_body()
+            .read_to_string()
+            .unwrap()
+    })
+    .await;
+    assert!(ledger.contains("outcome_unknown"), "{ledger}");
 }

@@ -628,6 +628,24 @@ pub fn hand_over(dir: &Path, owner: Option<(u32, u32)>) -> Result<(), Failure> {
     }
 }
 
+/// Test-only stand-ins for a compromised review worker, by job directory
+/// prefix.
+#[cfg(any(test, feature = "test-hooks"))]
+#[allow(clippy::type_complexity)]
+static REVIEW_TAMPER: std::sync::Mutex<Vec<(PathBuf, fn(&Path))>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// For integration tests only: after the in-process review worker runs in
+/// a job directory under `under`, call `tamper` on that directory, as a
+/// worker that lies about its review would. Exists only with `test-hooks`.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_hooks_tamper_review(under: &Path, tamper: fn(&Path)) {
+    REVIEW_TAMPER
+        .lock()
+        .expect("tamper list")
+        .push((under.to_path_buf(), tamper));
+}
+
 /// Runs `shoephone-runner review-worker <job_dir>` as `review_user`, with
 /// no credentials and a cleared environment, and waits up to ten minutes.
 /// The worker's verdict is in `job_dir/review.json`; this returns an error
@@ -637,6 +655,12 @@ pub fn run_review_worker(cfg: &RunnerConfig, job_dir: &Path) -> Result<(), Failu
     let Some((uid, gid)) = review_owner(cfg)? else {
         // A refusal is recorded in review.json, which the caller reads.
         let _ = crate::runner::review::review_worker(job_dir);
+        #[cfg(any(test, feature = "test-hooks"))]
+        for (under, tamper) in REVIEW_TAMPER.lock().expect("tamper list").iter() {
+            if job_dir.starts_with(under) {
+                tamper(job_dir);
+            }
+        }
         return Ok(());
     };
     let program = std::env::current_exe().map_err(|_| refuse("review_unavailable"))?;

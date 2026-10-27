@@ -158,6 +158,10 @@ a stopgap, and the daemon lists each such device at startup.
 | `base_cooldown_minutes` | 5 | wait after a decline or timeout; doubles on each repeat |
 | `max_cooldown_minutes` | 60 | the cap on that doubling |
 | `max_requests_per_hour` | 6 | accepted requests per rolling hour, across all requesters |
+| `plan_timeout_minutes` | 10 | how long a Terraform job may sit queued or planning |
+| `approval_ttl_minutes` | 5 | how long a planned job waits for the phone |
+| `max_plan_age_minutes` | 15 | the oldest a plan may be when it is approved or claimed |
+| `claim_ttl_minutes` | 180 | how long a claimed job may go without a result before its outcome is recorded as unknown |
 
 ### 3. Create the CA and start the service
 
