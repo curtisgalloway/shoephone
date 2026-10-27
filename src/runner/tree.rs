@@ -146,11 +146,18 @@ impl Refusal {
     }
 }
 
+/// Longest path (in characters) the runner accepts, so a path shown to the
+/// approver is never cut.
+pub const MAX_PATH_CHARS: usize = 255;
+
 /// Validates an entry path and returns its normal components.
 fn clean_path(raw: &[u8]) -> Result<Vec<String>, String> {
     let s = std::str::from_utf8(raw).map_err(|_| "path is not UTF-8".to_string())?;
     if s.chars().any(is_hostile_char) {
         return Err("path contains a control or invisible character".into());
+    }
+    if s.chars().count() > MAX_PATH_CHARS {
+        return Err(format!("path is longer than {MAX_PATH_CHARS} characters"));
     }
     let mut parts = Vec::new();
     for c in Path::new(s).components() {
@@ -422,6 +429,9 @@ fn walk(
         let meta = fs::symlink_metadata(e.path())
             .map_err(|err| fail("input_file_refused", format!("{}: {err}", shown(&rel))))?;
         if meta.is_dir() {
+            if dir.is_empty() && name == ".git" {
+                continue;
+            }
             if name == ".terraform" {
                 return Err(fail(
                     "input_file_refused",
@@ -449,6 +459,9 @@ fn walk(
                 format!("{} has no recorded mode", shown(&rel)),
             ));
         };
+        if rel.chars().count() > MAX_PATH_CHARS {
+            return Err(fail("input_file_refused", "a path is too long"));
+        }
         let mut hasher = Sha256::new();
         let mut f = fs::File::open(e.path())
             .map_err(|err| fail("input_file_refused", format!("{}: {err}", shown(&rel))))?;
@@ -682,6 +695,34 @@ mod tests {
     }
 
     #[test]
+    fn long_paths_are_refused_at_unpack_and_in_the_input() {
+        let long = format!("{}/{}", "a".repeat(150), "b".repeat(150));
+        let mut t = Vec::new();
+        gnu_long_file(&mut t, &long, b"x");
+        assert_eq!(refused(t).category, "archive_entry_refused");
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir
+            .path()
+            .join("p")
+            .join("a".repeat(150))
+            .join("b".repeat(150));
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("main.tf"), "x = 1\n").unwrap();
+        let err = execution_input_from_disk(dir.path(), "p").unwrap_err();
+        assert_eq!(err.category, "input_file_refused");
+    }
+
+    #[test]
+    fn git_directory_at_the_root_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".git/objects")).unwrap();
+        fs::write(dir.path().join(".git/HEAD"), "ref\n").unwrap();
+        fs::write(dir.path().join("main.tf"), "x = 1\n").unwrap();
+        let t = execution_input_from_disk(dir.path(), ".").unwrap();
+        assert_eq!(t.files.keys().collect::<Vec<_>>(), vec!["main.tf"]);
+    }
+
+    #[test]
     fn symlink_entry_is_refused() {
         let mut t = Vec::new();
         raw_entry(&mut t, "link", b'2', 0o777, b"");
@@ -801,7 +842,7 @@ mod tests {
         assert_eq!(err.category, "archive_entry_refused");
         let detail = err.detail.unwrap();
         assert!(detail.chars().count() < 400, "{}", detail.len());
-        assert!(detail.contains('\u{2026}'));
+        assert!(detail.contains("longer than 255"), "{detail}");
         let shown_long = shown(&"b".repeat(10_000));
         assert_eq!(shown_long.chars().count(), 257);
     }

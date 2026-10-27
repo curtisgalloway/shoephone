@@ -113,11 +113,25 @@ pub struct Review {
 // ---------------------------------------------------------------------
 // The diff
 
+#[derive(Debug)]
 struct Rendered {
     text: String,
     files_changed: u32,
     added: u32,
     removed: u32,
+}
+
+/// Reads a file of the tree and checks it against the digest recorded when
+/// the tree was built.
+fn read_checked(tree: &Tree, rel: &str) -> Result<Vec<u8>, Failure> {
+    let bytes = read_file(tree, rel)?;
+    match tree.files.get(rel) {
+        Some(f) if f.sha256 == sha256_hex(&bytes) => Ok(bytes),
+        _ => Err(fail(
+            "input_changed",
+            format!("{} changed while it was reviewed", shown(rel)),
+        )),
+    }
 }
 
 fn read_file(tree: &Tree, rel: &str) -> Result<Vec<u8>, Failure> {
@@ -158,6 +172,20 @@ fn render(base: Option<&Tree>, cand: &Tree) -> Result<Rendered, Failure> {
         }
         r.files_changed += 1;
         let name = shown(path);
+        let _ = writeln!(
+            r.text,
+            "diff --git {} {}",
+            if old.is_some() {
+                format!("a/{name}")
+            } else {
+                "/dev/null".to_string()
+            },
+            if new.is_some() {
+                format!("b/{name}")
+            } else {
+                "/dev/null".to_string()
+            },
+        );
         match (old, new) {
             (None, Some(n)) => {
                 let _ = writeln!(r.text, "new file mode {}", mode_text(n.mode));
@@ -171,33 +199,25 @@ fn render(base: Option<&Tree>, cand: &Tree) -> Result<Rendered, Failure> {
             }
             _ => {}
         }
-        let _ = writeln!(
-            r.text,
-            "--- {}",
-            if old.is_some() {
-                format!("a/{name}")
+        let side = |present: bool, prefix: &str| {
+            if present {
+                format!("{prefix}/{name}")
             } else {
                 "/dev/null".to_string()
             }
-        );
-        let _ = writeln!(
-            r.text,
-            "+++ {}",
-            if new.is_some() {
-                format!("b/{name}")
-            } else {
-                "/dev/null".to_string()
-            }
-        );
+        };
+        let (a, b) = (side(old.is_some(), "a"), side(new.is_some(), "b"));
+        let _ = writeln!(r.text, "--- {a}");
+        let _ = writeln!(r.text, "+++ {b}");
         if old.map(|o| &o.sha256) == new.map(|n| &n.sha256) {
             continue;
         }
         let old_bytes = match (base, old) {
-            (Some(t), Some(_)) => read_file(t, path)?,
+            (Some(t), Some(_)) => read_checked(t, path)?,
             _ => Vec::new(),
         };
         let new_bytes = match new {
-            Some(_) => read_file(cand, path)?,
+            Some(_) => read_checked(cand, path)?,
             None => Vec::new(),
         };
         match (str::from_utf8(&old_bytes), str::from_utf8(&new_bytes)) {
@@ -558,11 +578,11 @@ pub struct Request {
     pub schema_file: String,
     /// Names of the runner-supplied variables.
     pub variables: Vec<String>,
-    /// Archive header modes. Absent means read them from permission bits.
+    /// Archive header modes (what `unpack` returned). Absent only when
+    /// there is no baseline.
     #[serde(default)]
     pub baseline_modes: Option<Modes>,
-    #[serde(default)]
-    pub candidate_modes: Option<Modes>,
+    pub candidate_modes: Modes,
 }
 
 #[derive(Debug, Serialize)]
@@ -580,12 +600,6 @@ struct ReviewOut {
     verify_command: Option<String>,
     warnings: Vec<Warning>,
     failure: Option<FailureOut>,
-}
-
-fn disk_modes(dir: &Path, project_path: &str) -> Result<Modes, Failure> {
-    // Header modes are not available: take them from the permission bits.
-    let t = tree::execution_input_from_disk(dir, project_path)?;
-    Ok(t.files.into_iter().map(|(k, f)| (k, f.mode)).collect())
 }
 
 fn run_request(req: &Request) -> Result<Review, Failure> {
@@ -607,24 +621,14 @@ fn run_request(req: &Request) -> Result<Review, Failure> {
         schema_file: req.schema_file.clone(),
     };
     let cand_dir = Path::new(&req.candidate_dir);
-    let cand_modes = match &req.candidate_modes {
-        Some(m) => m.clone(),
-        None => disk_modes(cand_dir, &req.project_path)?,
-    };
-    let base = match &req.baseline_dir {
-        Some(d) => {
-            let dir = Path::new(d);
-            let modes = match &req.baseline_modes {
-                Some(m) => m.clone(),
-                None => disk_modes(dir, &req.project_path)?,
-            };
-            Some((dir, modes))
-        }
-        None => None,
-    };
+    let base = req
+        .baseline_dir
+        .as_deref()
+        .map(Path::new)
+        .zip(req.baseline_modes.as_ref());
     review(
-        base.as_ref().map(|(d, m)| (*d, m)),
-        (cand_dir, &cand_modes),
+        base,
+        (cand_dir, &req.candidate_modes),
         &req.project,
         &cfg,
         req.policy_version,
@@ -639,7 +643,18 @@ pub fn review_worker(job_dir: &Path) -> Result<(), WorkerError> {
         .map_err(|e| WorkerError::Request(format!("cannot read request.json: {e}")))?;
     let req: Request = serde_json::from_str(&text)
         .map_err(|e| WorkerError::Request(format!("request.json: {e}")))?;
-    let (out, result) = match run_request(&req) {
+    if req.baseline_dir.is_some() != req.baseline_modes.is_some() {
+        return Err(WorkerError::Request(
+            "request.json: baseline_dir and baseline_modes go together".to_string(),
+        ));
+    }
+    let (out, result) = match run_request(&req).and_then(|r| {
+        if r.scope.baseline.is_some() && r.scope.files_changed == 0 {
+            Err(fail("no_changes", "the candidate equals the baseline"))
+        } else {
+            Ok(r)
+        }
+    }) {
         Ok(r) => {
             let s = &r.scope;
             (
@@ -971,6 +986,148 @@ mod tests {
         let err = review(None, (c.0.path(), &c.1), "demo", &cfg(&["region"]), 1).unwrap_err();
         assert_eq!(err.category, "schema_overlaps_runner_variables");
         assert_eq!(err.addresses, vec!["region".to_string()]);
+    }
+
+    #[test]
+    fn content_cannot_forge_a_file_header() {
+        let mut bf = base_files("x = 1\n", SCHEMA);
+        bf.push(("infra/notes.txt", "-- a/infra/x.tf\nkeep\n", 0o644));
+        let mut cf = base_files("x = 1\n", SCHEMA);
+        cf.push((
+            "infra/notes.txt",
+            "++ b/other\ndiff --git a/x b/x\nkeep\n",
+            0o644,
+        ));
+        let (b, c) = (checkout(&bf), checkout(&cf));
+        let diff = run(Some(&b), &c).unwrap().diff.unwrap();
+        let headers: Vec<&str> = diff
+            .lines()
+            .filter(|l| l.starts_with("diff --git "))
+            .collect();
+        assert_eq!(
+            headers,
+            vec!["diff --git a/infra/notes.txt b/infra/notes.txt"],
+            "{diff}"
+        );
+        let first = run(None, &c).unwrap().diff.unwrap();
+        assert!(first.contains("diff --git /dev/null b/infra/notes.txt\n"));
+    }
+
+    #[test]
+    fn changed_file_is_refused() {
+        let c = checkout(&base_files("x = 1\n", SCHEMA));
+        let tree = tree::execution_input(c.0.path(), "infra", &c.1).unwrap();
+        std::fs::write(c.0.path().join("infra/main.tf"), "x = 2\n").unwrap();
+        assert_eq!(render(None, &tree).unwrap_err().category, "input_changed");
+    }
+
+    fn tar_gz(entries: &[(&str, &str, u32)]) -> Vec<u8> {
+        let mut b = tar::Builder::new(Vec::new());
+        for (path, content, mode) in entries {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(content.len() as u64);
+            h.set_mode(*mode);
+            h.set_cksum();
+            b.append_data(&mut h, path, content.as_bytes()).unwrap();
+        }
+        let raw = b.into_inner().unwrap();
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut e, &raw).unwrap();
+        e.finish().unwrap()
+    }
+
+    #[test]
+    fn unpacked_archive_and_disk_checkout_agree() {
+        let files = [
+            ("infra/main.tf", "x = 1\n", 0o755),
+            ("infra/shoephone-schema.toml", SCHEMA, 0o644),
+        ];
+        let un = tempfile::tempdir().unwrap();
+        let modes = tree::unpack(&tar_gz(&files), un.path(), &tree::Limits::default()).unwrap();
+        let r = review(None, (un.path(), &modes), "demo", &cfg(&[]), 1).unwrap();
+        let disk = checkout(&files);
+        let (cand, diff) = diff_digest(None, None, disk.0.path(), "infra").unwrap();
+        assert_eq!(cand, r.scope.candidate);
+        assert_eq!(diff, r.scope.diff);
+        assert!(r.diff.unwrap().contains("new file mode 100755"));
+    }
+
+    fn write_request(job: &Path, body: serde_json::Value) {
+        std::fs::write(job.join("request.json"), body.to_string()).unwrap();
+    }
+
+    #[test]
+    fn review_worker_writes_review_json() {
+        let c = checkout(&base_files("x = 1\n", SCHEMA));
+        let job = tempfile::tempdir().unwrap();
+        write_request(
+            job.path(),
+            serde_json::json!({
+                "baseline_dir": null, "candidate_dir": c.0.path(), "project": "demo",
+                "policy_version": 1, "project_path": "infra",
+                "schema_file": "shoephone-schema.toml", "variables": [],
+                "candidate_modes": c.1,
+            }),
+        );
+        review_worker(job.path()).unwrap();
+        let out: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path().join("review.json")).unwrap())
+                .unwrap();
+        assert_eq!(out["scope"]["project"], "demo");
+        assert_eq!(out["scope"]["files_changed"], 2);
+        assert!(out["diff"].as_str().unwrap().contains("diff --git"));
+        assert!(out["failure"].is_null());
+    }
+
+    #[test]
+    fn review_worker_requires_modes_and_refuses_no_changes() {
+        let c = checkout(&base_files("x = 1\n", SCHEMA));
+        let job = tempfile::tempdir().unwrap();
+        let mut req = serde_json::json!({
+            "baseline_dir": null, "candidate_dir": c.0.path(), "project": "demo",
+            "policy_version": 1, "project_path": "infra",
+            "schema_file": "shoephone-schema.toml", "variables": [],
+        });
+        write_request(job.path(), req.clone());
+        assert!(matches!(
+            review_worker(job.path()),
+            Err(WorkerError::Request(_))
+        ));
+        assert!(!job.path().join("review.json").exists());
+
+        req["candidate_modes"] = serde_json::json!(c.1);
+        req["baseline_dir"] = serde_json::json!(c.0.path());
+        write_request(job.path(), req.clone());
+        assert!(
+            matches!(review_worker(job.path()), Err(WorkerError::Request(_))),
+            "baseline needs modes"
+        );
+        req["baseline_modes"] = serde_json::json!(c.1);
+        write_request(job.path(), req);
+        match review_worker(job.path()) {
+            Err(WorkerError::Refused(f)) => assert_eq!(f.category, "no_changes"),
+            other => panic!("{other:?}"),
+        }
+        let out: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(job.path().join("review.json")).unwrap())
+                .unwrap();
+        assert_eq!(out["failure"]["category"], "no_changes");
+    }
+
+    #[test]
+    fn root_project_with_git_directory_verifies() {
+        let c = checkout(&[
+            ("main.tf", "x = 1\n", 0o644),
+            ("shoephone-schema.toml", SCHEMA, 0o644),
+            (".git/HEAD", "ref\n", 0o644),
+        ]);
+        let (cand, diff) = diff_digest(None, None, c.0.path(), ".").unwrap();
+        let mut modes = c.1.clone();
+        modes.retain(|k, _| !k.starts_with(".git"));
+        let mut cf = cfg(&[]);
+        cf.path = ".".to_string();
+        let r = review(None, (c.0.path(), &modes), "demo", &cf, 1).unwrap();
+        assert_eq!((cand, diff), (r.scope.candidate, r.scope.diff));
     }
 
     #[test]

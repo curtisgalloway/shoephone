@@ -348,3 +348,12 @@ fn page_rebuilds_trust_and_apply_bytes() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn page_marks_file_boundaries_and_asks_for_both_digests() {
+    let html = include_str!("../assets/approve.html");
+    assert!(html.contains("startsWith('diff --git ')"));
+    assert!(html.contains(".dfile"));
+    assert!(html.contains("clean exports"));
+    assert!(html.contains("candidate digest and the diff digest"));
+}

@@ -32,6 +32,7 @@
   .band.trust { background: #6d28d9; } .band.apply { background: #0b6bcb; }
   .warn { border: 2px solid var(--no); color: var(--no); border-radius: 8px; padding: .5rem .8rem; margin: 0 0 .8rem; font-weight: 600; }
   .obligation { border-left: 4px solid #6d28d9; padding: .2rem .8rem; margin: 0 0 .8rem; font-size: .95rem; }
+  pre.block .dfile { font-weight: 700; display: inline-block; border-top: 2px solid currentColor; margin-top: .4rem; padding-top: .2rem; }
   pre.block { font: .8rem/1.35 ui-monospace, Menlo, monospace; background: rgba(127,127,127,.12); border-radius: 8px; padding: .6rem; margin: .4rem 0 .8rem; overflow: auto; max-height: 60vh; white-space: pre; }
   .job h2 { font-size: 1.3rem; margin: 0 0 .5rem; }
   .job h3 { font-size: .95rem; margin: .8rem 0 .2rem; color: var(--muted); }
@@ -471,6 +472,20 @@ function block(text) {
   e.textContent = visibleDiff(text);
   return e;
 }
+// The diff, one element per line, so the line that starts each file stands
+// out. Content lines always start with a space, +, - or backslash, so only
+// the diff itself can produce a line starting 'diff --git '.
+function diffBlock(text) {
+  const e = el('pre', undefined, 'block');
+  const lines = visibleDiff(text).split('\n');
+  lines.forEach((line, i) => {
+    const row = document.createElement('span');
+    row.textContent = line + (i < lines.length - 1 ? '\n' : '');
+    if (line.startsWith('diff --git ')) row.className = 'dfile';
+    e.append(row);
+  });
+  return e;
+}
 function kv(pairs) {
   const dl = el('dl', undefined, 'kv');
   for (const [k, v] of pairs) dl.append(el('dt', k), el('dd', v));
@@ -490,11 +505,11 @@ function renderTrust(j) {
     ['lines removed', String(s.lines_removed)], ['schema changed', s.schema_changed ? 'yes' : 'no'],
   ]));
   if (d.external) {
-    nodes.push(el('p', 'This diff is too large to show here. Run this command in your own checkout; it must print the diff digest below.', 'warn'));
+    nodes.push(el('p', 'This diff is too large to show here. Run this command against your own clean exports of both revisions (git worktree add, or git archive | tar x; no .terraform directory, no untracked files) so these are clean exports. It must print the candidate digest and the diff digest below, and both must match.', 'warn'));
     nodes.push(section('verification command', block(verifyCommand(s))));
-    nodes.push(kv([['diff digest', s.diff], ['candidate', s.candidate], ['baseline', s.baseline ?? 'none'], ['schema', s.schema]]));
+    nodes.push(kv([['diff digest', s.diff], ['candidate digest', s.candidate], ['baseline', s.baseline ?? 'none'], ['schema', s.schema]]));
   } else if (isText(d.diff) && d.diff !== '') {
-    nodes.push(section('diff', block(d.diff)));
+    nodes.push(section('diff', diffBlock(d.diff)));
   } else {
     nodes.push(el('p', 'The daemon sent no diff to show. Do not approve.', 'warn'));
   }

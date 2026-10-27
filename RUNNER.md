@@ -14,14 +14,43 @@ runner. Agents do not run it; the operator does.
 
 - `shoephone-runner [--config <file>] run`: the poll loop.
 - `shoephone-runner review-worker <job-dir>`: the credential-free review
-  step, started by `run`.
+  step, started by `run`. Reads `request.json`, writes `review.json`.
+- `shoephone-runner [--json] diff-digest <baseline-digest|none>
+  <baseline-checkout|-> <candidate-checkout> <project-path>`: the operator's
+  check of a trust review whose diff was too large to show.
 - `shoephone-runner --skill`: print this document. `--version` prints the
   version.
 
 `--config` defaults to `/etc/shoephone-runner/shoephone-runner.toml`. An
 example with placeholder values is `contrib/runner/shoephone-runner.toml.example`.
 
-`run` and `review-worker` are not implemented yet; they exit 3.
+`run` is not implemented yet; it exits 3.
+
+### review-worker
+
+`request.json` holds `baseline_dir` (null for a first trust), `candidate_dir`,
+`project`, `policy_version`, `project_path`, `schema_file`, `variables` (the
+runner-supplied variable names only) and the archive header modes that
+`unpack` returned: `candidate_modes`, and `baseline_modes` when there is a
+baseline. A missing field is a bad request (exit 3). `review.json` holds the
+scope, the diff (absent when over 256 KiB), the verification command and the
+warnings, or a `failure`. A refused review (including `no_changes`, a
+candidate equal to the baseline) exits 30.
+
+### diff-digest
+
+Recomputes the execution input of each checkout from the files on disk (modes
+from the permission bits, normalized to 0644 or 0755), refuses unless the
+baseline checkout's digest equals `<baseline-digest>` (use `none` and `-` for
+a first trust), and prints two lines on stdout, `candidate <digest>` and
+`diff <digest>`; with `--json`, `{"candidate": .., "diff": ..}`. Both must
+equal the digests on the approve page. Exit 0 on success; 30 with a message on
+stderr when the baseline does not match or an input is refused; 2 on usage.
+
+Both checkouts must be clean exports of the revisions, made with `git
+worktree add` or `git archive | tar x`: no `.terraform/` directory and no
+untracked files, since every file under the project and its modules is part
+of the digest. A `.git` directory at the checkout root is ignored.
 
 ## Config
 
@@ -57,4 +86,5 @@ Bands follow the house contract: under 100 is portable.
 
 - 0: success.
 - 2: usage error.
-- 3: config missing or invalid, or the verb is not implemented yet.
+- 3: config missing or invalid, a bad `review-worker` request, or the verb is not implemented yet.
+- 30: a review or `diff-digest` was refused.
