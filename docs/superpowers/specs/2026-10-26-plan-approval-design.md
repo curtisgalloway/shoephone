@@ -457,4 +457,8 @@ why.
 - **Startup reconcile.** A trust record with no `trusted` ledger entry is
   dropped at daemon startup, since the audit trail is authoritative.
 - **Live untrust.** `shoephoned untrust` works while the daemon runs, under an
-  advisory flock on `trusted.lock`, which the daemon takes too.
+  advisory flock on `trusted.lock`, which the daemon takes too. It also stops
+  an apply that has not started: the daemon re-reads the trust at submit,
+  approval and claim and refuses the job `untrusted` unless the scope's
+  revision and schema are what the project is trusted at, and the runner
+  checks its local trusted tree against them again before Terraform runs.
