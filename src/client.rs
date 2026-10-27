@@ -199,7 +199,9 @@ impl Client {
     }
 }
 
-fn decode<T: DeserializeOwned>(mut resp: ureq::http::Response<ureq::Body>) -> Result<T, Error> {
+pub(crate) fn decode<T: DeserializeOwned>(
+    mut resp: ureq::http::Response<ureq::Body>,
+) -> Result<T, Error> {
     let http = resp.status().as_u16();
     let text = resp
         .body_mut()

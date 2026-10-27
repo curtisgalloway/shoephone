@@ -569,6 +569,9 @@ pub fn apply(
         .and_then(|out| {
             if out.success() {
                 Ok(())
+            } else if out.code.is_none() {
+                // Killed by a signal: how far it got is unknown.
+                Err(refuse("terraform_crashed"))
             } else {
                 Err(categorize(&out.stdout, Phase::Apply))
             }
@@ -587,6 +590,74 @@ pub fn apply(
     })();
     let _ = remove_if_present(plan_file);
     result
+}
+
+// ---------------------------------------------------------------------
+// Workers and their files
+
+/// How long the review worker may run before its process group is killed.
+const REVIEW_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Who must own a Terraform job directory: `terraform_user`, or `None`
+/// when the tests run without the sandbox.
+pub fn terraform_owner(cfg: &RunnerConfig) -> Result<Option<(u32, u32)>, Failure> {
+    Ok(launch(cfg)?.owner())
+}
+
+/// Who the review worker runs as and who owns its job directory:
+/// `review_user`, or `None` when the tests run without the sandbox.
+pub fn review_owner(cfg: &RunnerConfig) -> Result<Option<(u32, u32)>, Failure> {
+    sandbox::worker_ids(&cfg.review_user)
+}
+
+/// Gives `dir` and everything under it to `owner`, without following a
+/// symlink. Nothing to do when `owner` is `None`.
+pub fn hand_over(dir: &Path, owner: Option<(u32, u32)>) -> Result<(), Failure> {
+    fn walk(p: &Path, uid: u32, gid: u32) -> io::Result<()> {
+        std::os::unix::fs::lchown(p, Some(uid), Some(gid))?;
+        if fs::symlink_metadata(p)?.is_dir() {
+            for entry in fs::read_dir(p)? {
+                walk(&entry?.path(), uid, gid)?;
+            }
+        }
+        Ok(())
+    }
+    match owner {
+        None => Ok(()),
+        Some((uid, gid)) => walk(dir, uid, gid).map_err(|_| refuse("job_dir_unavailable")),
+    }
+}
+
+/// Runs `shoephone-runner review-worker <job_dir>` as `review_user`, with
+/// no credentials and a cleared environment, and waits up to ten minutes.
+/// The worker's verdict is in `job_dir/review.json`; this returns an error
+/// only when the worker could not be run or ran out of time. When the
+/// tests run without the sandbox, the worker runs in this process.
+pub fn run_review_worker(cfg: &RunnerConfig, job_dir: &Path) -> Result<(), Failure> {
+    let Some((uid, gid)) = review_owner(cfg)? else {
+        // A refusal is recorded in review.json, which the caller reads.
+        let _ = crate::runner::review::review_worker(job_dir);
+        return Ok(());
+    };
+    let program = std::env::current_exe().map_err(|_| refuse("review_unavailable"))?;
+    let mut child = sandbox::review_command(&program, job_dir, uid, gid)
+        .spawn()
+        .map_err(|_| refuse("review_unavailable"))?;
+    let deadline = std::time::Instant::now() + REVIEW_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            _ => {
+                secret::kill_group(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(refuse("review_timeout"));
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

@@ -131,6 +131,52 @@ pub(super) fn launch(cfg: &RunnerConfig) -> Result<Launch, Failure> {
     }
 }
 
+/// The uid and gid a worker runs as and owns its job directory as: `user`
+/// from the password database, never root. `None` when the tests run
+/// without the sandbox, where every worker is the current user.
+pub(super) fn worker_ids(user: &str) -> Result<Option<(u32, u32)>, Failure> {
+    #[cfg(test)]
+    if let Some(l) = TEST_LAUNCH.with(|c| c.get()) {
+        return Ok(l.owner());
+    }
+    #[cfg(any(test, feature = "test-hooks"))]
+    if TEST_HOOKS_NO_SANDBOX.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(None);
+    }
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } != 0 {
+        return Err(refuse("sandbox_unavailable"));
+    }
+    match lookup_user(user) {
+        Some((uid, gid)) if uid != 0 && gid != 0 => Ok(Some((uid, gid))),
+        _ => Err(refuse("sandbox_unavailable")),
+    }
+}
+
+/// `program review-worker <job_dir>` as `uid`/`gid`, with an environment
+/// of only `PATH=/usr/bin:/bin`, no stdin and no stdout, in its own
+/// process group. The child refuses to exec unless the drop took.
+pub(super) fn review_command(program: &Path, job_dir: &Path, uid: u32, gid: u32) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.arg("review-worker")
+        .arg(job_dir)
+        .current_dir(job_dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .process_group(0)
+        .uid(uid)
+        .gid(gid);
+    // SAFETY: the closure calls only async-signal-safe functions and does
+    // not allocate.
+    unsafe {
+        cmd.pre_exec(move || verify_dropped(uid, gid));
+    }
+    cmd
+}
+
 /// Runs in the child after std has called setgid, setgroups(0) and setuid
 /// (std ignores EPERM from setgroups, so this check is what makes the drop
 /// certain): refuse to exec unless every id is the target and no

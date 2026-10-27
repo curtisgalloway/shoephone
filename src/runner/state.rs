@@ -3,6 +3,7 @@
 //! The runner's state directory: where each project's files live, and the
 //! one way they are written.
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -10,11 +11,15 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// The recorded baseline: what was trusted and the schema it carried.
+/// The recorded baseline: what was trusted, the schema it carried, and the
+/// archive header mode of each file of the trusted tree (the disk holds
+/// every file 0600, so the digest's modes come from here).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trusted {
     pub digest: String,
     pub schema: String,
+    #[serde(default)]
+    pub modes: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +92,11 @@ impl ProjectPaths {
 
     pub fn journal_json(&self) -> PathBuf {
         self.dir.join("journal.json")
+    }
+
+    /// Root's copies of saved plans, one per job.
+    pub fn plans_dir(&self) -> PathBuf {
+        self.dir.join("plans")
     }
 }
 
