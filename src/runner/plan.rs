@@ -77,7 +77,7 @@ pub fn summarize(show_json: &str) -> Result<Summary, Failure> {
     let root: serde_json::Value =
         serde_json::from_str(show_json).map_err(|_| refuse("plan_unreadable"))?;
     let mut changes: Vec<(Action, String)> = Vec::new();
-    if let Some(list) = root.get("resource_changes") {
+    if let Some(list) = root.get("resource_changes").filter(|v| !v.is_null()) {
         let list = list.as_array().ok_or_else(|| refuse("plan_unreadable"))?;
         for rc in list {
             let Some(action) = map_actions(rc.get("change").and_then(|c| c.get("actions")))? else {
@@ -93,7 +93,7 @@ pub fn summarize(show_json: &str) -> Result<Summary, Failure> {
             changes.push((action, address.to_string()));
         }
     }
-    if let Some(outputs) = root.get("output_changes") {
+    if let Some(outputs) = root.get("output_changes").filter(|v| !v.is_null()) {
         let outputs = outputs
             .as_object()
             .ok_or_else(|| refuse("plan_unreadable"))?;
@@ -147,8 +147,8 @@ pub fn categorize(diagnostics_jsonl: &str, phase: Phase) -> Failure {
             .and_then(|d| d.get("address"))
             .and_then(|a| a.as_str());
         if let Some(a) = address
-            && !a.is_empty()
             && a.chars().count() <= MAX_ADDRESS_CHARS
+            && crate::scope::address_text(&[(Action::Create, a.to_string())]).is_some()
         {
             addresses.insert(a.to_string());
         }
@@ -276,5 +276,57 @@ mod tests {
             .map(|i| format!("{{\"diagnostic\":{{\"address\":\"r.a{i:02}\"}}}}\n"))
             .collect();
         assert_eq!(categorize(&many, Phase::Apply).addresses.len(), 50);
+    }
+
+    #[test]
+    fn categorize_drops_forbidden_addresses() {
+        let d = concat!(
+            "{\"diagnostic\":{\"address\":\"a.b\\nc\"}}\n",
+            "{\"diagnostic\":{\"address\":\"a\\u202eb\"}}\n",
+            "{\"diagnostic\":{\"address\":\"\"}}\n",
+            "{\"diagnostic\":{\"address\":\"ok.x\"}}\n"
+        );
+        assert_eq!(
+            categorize(d, Phase::Plan).addresses,
+            vec!["ok.x".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_address_pair_is_kept_in_stable_order() {
+        let j = r#"{"resource_changes":[
+{"address":"a.b","change":{"actions":["create"]}},
+{"address":"a.b","change":{"actions":["delete"]}}]}"#;
+        let s = summarize(j).unwrap();
+        assert_eq!(s.counts.create, 1);
+        assert_eq!(s.counts.delete, 1);
+        assert_eq!(
+            s.changes,
+            vec![
+                (Action::Delete, "a.b".to_string()),
+                (Action::Create, "a.b".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn data_mode_with_write_action_is_counted() {
+        let j = r#"{"resource_changes":[
+{"address":"data.x.y","mode":"data","change":{"actions":["delete"]}}]}"#;
+        let s = summarize(j).unwrap();
+        assert_eq!(s.counts.delete, 1);
+        assert!(s.destructive);
+    }
+
+    #[test]
+    fn null_lists_are_absent() {
+        let s = summarize(r#"{"resource_changes":null,"output_changes":null}"#).unwrap();
+        assert!(s.changes.is_empty());
+    }
+
+    #[test]
+    fn output_name_with_newline_refuses() {
+        let j = r#"{"output_changes":{"a\nb":{"actions":["create"]}}}"#;
+        assert_eq!(summarize(j).unwrap_err().category, "plan_address_refused");
     }
 }
