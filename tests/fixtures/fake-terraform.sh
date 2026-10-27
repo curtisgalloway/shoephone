@@ -13,7 +13,8 @@
 #          record, then one -json line
 #
 # FAKE_TERRAFORM_FAIL=<subcommand> makes that subcommand print a -json
-# diagnostic whose summary is FAKE_TERRAFORM_TEXT and exit 1.
+# diagnostic whose summary is FAKE_TERRAFORM_TEXT and exit 1. Its address is
+# FAKE_TERRAFORM_ADDRESS, or null_resource.broken.
 # FAKE_TERRAFORM_SLEEP=<subcommand> makes that subcommand sleep 30 s.
 # Only absolute paths are used, because the executor passes no PATH.
 
@@ -50,7 +51,7 @@ if [ "${FAKE_TERRAFORM_SLEEP:-}" = "$sub" ]; then
 fi
 
 if [ "${FAKE_TERRAFORM_FAIL:-}" = "$sub" ]; then
-    printf '{"type":"diagnostic","diagnostic":{"severity":"error","summary":"%s","address":"null_resource.broken"}}\n' "${FAKE_TERRAFORM_TEXT:-}"
+    printf '{"type":"diagnostic","diagnostic":{"severity":"error","summary":"%s","address":"%s"}}\n' "${FAKE_TERRAFORM_TEXT:-}" "${FAKE_TERRAFORM_ADDRESS:-null_resource.broken}"
     exit 1
 fi
 

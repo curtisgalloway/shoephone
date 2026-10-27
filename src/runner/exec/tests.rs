@@ -1034,3 +1034,78 @@ fn bwrap_hides_runner_secrets() {
     assert!(out.status.success());
     assert_eq!(out.stdout, verified_bytes);
 }
+
+// ---------------------------------------------------------------------
+// Secret values never leave in an address
+
+#[test]
+fn reveals_and_scrub_use_only_secrets_of_eight_or_more_characters() {
+    let resolved = Resolved {
+        masks: vec![Secret("s3cr3t-value".into()), Secret("short".into())],
+        ..Resolved::default()
+    };
+    assert!(resolved.reveals("aws_x.a[\"s3cr3t-value\"]"));
+    assert!(!resolved.reveals("aws_x.short"), "under 8 characters");
+    let f = resolved.scrub(Failure {
+        category: "apply_failed".into(),
+        addresses: vec!["ok.a".into(), "x.s3cr3t-value".into(), "x.short".into()],
+        detail: None,
+    });
+    assert_eq!(f.addresses, ["ok.a", "x.short"]);
+    assert_eq!(f.category, "apply_failed");
+}
+
+#[test]
+fn plan_failure_addresses_holding_a_secret_are_dropped() {
+    let mut fx = fixture();
+    fx.set_env("FAKE_TERRAFORM_FAIL", "plan");
+    fx.project
+        .env
+        .insert("FAKE_TERRAFORM_ADDRESS".into(), secret("ref/addr"));
+    no_sandbox();
+    let resolved = resolve(&fx.cfg, &fx.project).unwrap();
+    let dir = fx.job_dir();
+    let err = plan(&fx.cfg, &job(&dir), &Canonical("{}".into()), &resolved).unwrap_err();
+    assert_eq!(err.category, "plan_failed");
+    assert!(err.addresses.is_empty(), "{:?}", err.addresses);
+}
+
+#[test]
+fn a_planned_address_holding_a_secret_refuses_the_plan() {
+    let mut fx = fixture();
+    let show = fx.path("show.json");
+    fs::write(
+        &show,
+        r#"{"resource_changes":[{"address":"null_resource.value-of-ref/token","change":{"actions":["create"]}}]}"#,
+    )
+    .unwrap();
+    fx.set_env("FAKE_TERRAFORM_SHOW", &show.display().to_string());
+    no_sandbox();
+    let resolved = resolve(&fx.cfg, &fx.project).unwrap();
+    let dir = fx.job_dir();
+    let err = plan(&fx.cfg, &job(&dir), &Canonical("{}".into()), &resolved).unwrap_err();
+    assert_eq!(err.category, "plan_address_refused");
+    assert!(err.addresses.is_empty());
+    assert!(!fx.path("state/projects/web/plans/7.tfplan").exists());
+}
+
+#[test]
+fn apply_failure_addresses_holding_a_secret_are_dropped_before_the_journal() {
+    let mut fx = fixture();
+    fx.project
+        .env
+        .insert("FAKE_TERRAFORM_ADDRESS".into(), secret("ref/addr"));
+    let (_, journal, copy, sha) = planned(&fx);
+    fx.set_env("FAKE_TERRAFORM_FAIL", "apply");
+    let resolved = resolve(&fx.cfg, &fx.project).unwrap();
+    let dir = fx.job_dir();
+    let err = apply(&fx.cfg, &job(&dir), &copy, &sha, &resolved, &journal).unwrap_err();
+    assert_eq!(err.category, "apply_failed");
+    assert!(err.addresses.is_empty(), "{:?}", err.addresses);
+    match journal.unfinished().unwrap() {
+        Some(crate::runner::journal::Unfinished::Reporting { failure, .. }) => {
+            assert!(failure.unwrap().addresses.is_empty());
+        }
+        other => panic!("{other:?}"),
+    }
+}

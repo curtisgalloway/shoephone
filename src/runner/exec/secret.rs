@@ -37,7 +37,7 @@ const RESERVED_ENV_PREFIXES: [&str; 3] = ["TF_CLI_ARGS", "TF_VAR_", "TF_LOG"];
 /// A resolved value. `Debug` prints `[redacted]`; there is no `Display`
 /// and no `Serialize`, so a value leaves only through [`Secret::expose`].
 #[derive(Clone, PartialEq, Eq)]
-pub struct Secret(String);
+pub struct Secret(pub(super) String);
 
 impl Secret {
     pub fn expose(&self) -> &str {
@@ -58,9 +58,31 @@ pub struct Resolved {
     pub env: Vec<(String, Secret)>,
     pub tf_vars: Vec<(String, Secret)>,
     pub backend: Vec<(String, Secret)>,
-    /// The values that came from `secret_command`, for masking any text
-    /// that might leave the runner.
+    /// The values that came from `secret_command`. An address that holds
+    /// one never leaves the runner: see [`Resolved::reveals`] and
+    /// [`Resolved::scrub`].
     pub masks: Vec<Secret>,
+}
+
+/// The shortest secret value checked for in addresses. A shorter one would
+/// match ordinary address text by chance and refuse plans for no reason.
+const MIN_MASK_CHARS: usize = 8;
+
+impl Resolved {
+    /// True when `text` contains a resolved secret value of at least
+    /// [`MIN_MASK_CHARS`] characters.
+    pub fn reveals(&self, text: &str) -> bool {
+        self.masks
+            .iter()
+            .any(|m| m.0.chars().count() >= MIN_MASK_CHARS && text.contains(m.0.as_str()))
+    }
+
+    /// `f` without any address that [reveals](Self::reveals) a secret, for
+    /// a failure about to be reported or journaled.
+    pub fn scrub(&self, mut f: Failure) -> Failure {
+        f.addresses.retain(|a| !self.reveals(a));
+        f
+    }
 }
 
 /// `^[A-Za-z_][A-Za-z0-9_]*$`, with `-` allowed after the first byte when

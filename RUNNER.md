@@ -100,7 +100,11 @@ so a crash before `finish` is sent is re-sent at the next start.
   The execution input is copied from `trusted/` into
   `state_dir/jobs/<id>/checkout`, handed to `terraform_user`, and planned.
   A plan that deletes or replaces anything without `--allow-destroy` is
-  refused `destroy_not_requested` with those addresses. Otherwise the
+  refused `destroy_not_requested` with those addresses. No address that
+  contains a value `secret_command` returned (8 characters or longer) ever
+  leaves the runner: such an address is dropped from any failure before it
+  is journaled or sent, and a plan whose change list names one is refused
+  `plan_address_refused`. Otherwise the
   scope (counts, destructive flag and address text from one plan summary)
   and the display (canonical manifest, the `applied.json` baseline, the
   address text) are submitted. The daemon refuses the job `untrusted` at

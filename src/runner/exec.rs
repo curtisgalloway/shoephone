@@ -440,6 +440,38 @@ pub fn plan(
     manifest: &Canonical,
     resolved: &Resolved,
 ) -> Result<(Summary, PathBuf, String), Failure> {
+    plan_checked(cfg, job, manifest, resolved, &mut || true)
+}
+
+/// [`plan`], asking `still_wanted` after `init` and again after `plan`; when
+/// it says no, planning stops with `plan_cancelled` and the plan copy is
+/// removed. A failure's addresses never carry a resolved secret, and a plan
+/// whose change list names one is refused `plan_address_refused`.
+pub fn plan_checked(
+    cfg: &RunnerConfig,
+    job: &Job,
+    manifest: &Canonical,
+    resolved: &Resolved,
+    still_wanted: &mut dyn FnMut() -> bool,
+) -> Result<(Summary, PathBuf, String), Failure> {
+    let planned = plan_steps(cfg, job, manifest, resolved, still_wanted);
+    match planned {
+        Ok((summary, copy, _)) if summary.changes.iter().any(|(_, a)| resolved.reveals(a)) => {
+            let _ = remove_if_present(&copy);
+            Err(refuse("plan_address_refused"))
+        }
+        Ok(x) => Ok(x),
+        Err(f) => Err(resolved.scrub(f)),
+    }
+}
+
+fn plan_steps(
+    cfg: &RunnerConfig,
+    job: &Job,
+    manifest: &Canonical,
+    resolved: &Resolved,
+    still_wanted: &mut dyn FnMut() -> bool,
+) -> Result<(Summary, PathBuf, String), Failure> {
     let launch = launch(cfg)?;
     check_job(cfg, job, resolved)?;
     let timeout = step_timeout(cfg);
@@ -463,6 +495,9 @@ pub fn plan(
     if !init.success() {
         return Err(categorize(&init.stdout, Phase::Init));
     }
+    if !still_wanted() {
+        return Err(refuse("plan_cancelled"));
+    }
 
     let job_plan = job.dir.join(PLAN_FILE);
     let out_arg = format!("-out={}", job_plan.display());
@@ -478,6 +513,9 @@ pub fn plan(
     let planned = run(cfg, launch, job, &args, resolved, None, timeout)?;
     if !planned.success() {
         return Err(categorize(&planned.stdout, Phase::Plan));
+    }
+    if !still_wanted() {
+        return Err(refuse("plan_cancelled"));
     }
 
     let mut bytes = Vec::new();
@@ -576,7 +614,8 @@ pub fn apply(
             } else {
                 Err(categorize(&out.stdout, Phase::Apply))
             }
-        });
+        })
+        .map_err(|f| resolved.scrub(f));
         // The result goes straight into the journal as one to report, so a
         // crash right after Terraform returns is re-sent at startup. If
         // this write fails the journal still says `applying`, and the next
