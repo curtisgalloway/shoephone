@@ -16,6 +16,8 @@
 # diagnostic whose summary is FAKE_TERRAFORM_TEXT and exit 1. Its address is
 # FAKE_TERRAFORM_ADDRESS, or null_resource.broken.
 # FAKE_TERRAFORM_SLEEP=<subcommand> makes that subcommand sleep 30 s.
+# FAKE_TERRAFORM_HOLD=<subcommand>:<file> makes that subcommand wait until
+# <file> exists (at most 30 s), after it has written its record.
 # Only absolute paths are used, because the executor passes no PATH.
 
 rec="${FAKE_TERRAFORM_RECORD:?FAKE_TERRAFORM_RECORD is not set}"
@@ -45,6 +47,15 @@ for a in "$@"; do
 done
 
 printf 'fake-terraform stderr for %s\n' "$sub" >&2
+
+hold="${FAKE_TERRAFORM_HOLD:-}"
+if [ -n "$hold" ] && [ "${hold%%:*}" = "$sub" ]; then
+    i=0
+    while [ ! -e "${hold#*:}" ] && [ "$i" -lt 300 ]; do
+        /bin/sleep 0.1
+        i=$((i + 1))
+    done
+fi
 
 if [ "${FAKE_TERRAFORM_SLEEP:-}" = "$sub" ]; then
     /bin/sleep 30

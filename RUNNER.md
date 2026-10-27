@@ -99,6 +99,14 @@ so a crash before `finish` is sent is re-sent at the next start.
   validated against that schema; Terraform gets only its canonical text.
   The execution input is copied from `trusted/` into
   `state_dir/jobs/<id>/checkout`, handed to `terraform_user`, and planned.
+  After `init` and again after `plan` the runner reads the job's status, and
+  if the job is no longer being planned (killed, or past the daemon's
+  planning timeout) it stops there, removes the job directory and plan copy,
+  and reports nothing. The daemon's `plan_timeout_minutes` (default 10)
+  covers everything from the request to the submit, so it must exceed the
+  expected `init` plus `plan` time; it is independent of
+  `terraform_timeout_minutes`, which limits each Terraform command on its
+  own.
   A plan that deletes or replaces anything without `--allow-destroy` is
   refused `destroy_not_requested` with those addresses. No address that
   contains a value `secret_command` returned (8 characters or longer) ever

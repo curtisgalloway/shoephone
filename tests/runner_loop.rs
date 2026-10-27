@@ -900,3 +900,44 @@ async fn daemon_restart_before_the_trust_commit_keeps_the_trust_on_both_sides() 
     let (_runner, st) = fx.applied_job(runner, r#"{"region":"west"}"#).await;
     assert_eq!(st.result.as_deref(), Some("applied"), "{st:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_during_planning_stops_before_the_next_terraform_step() {
+    let mut fx = Fx::new("killplan", CREATE_ONLY).await;
+    let release = fx.root.join("release-init");
+    let runner = fx.runner().await;
+    let runner = fx.trusted(runner).await;
+    drop(runner);
+    fx.set_env(
+        "FAKE_TERRAFORM_HOLD",
+        Some(&format!("init:{}", release.display())),
+    );
+    let runner = fx.runner().await;
+    let id = fx.apply(r#"{"region":"west"}"#).await;
+    let planning = tokio::spawn(try_step(runner));
+    // Wait until init is running, then kill the job.
+    let root = fx.root.clone();
+    blocking(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !std::fs::read_to_string(root.join("record"))
+            .unwrap_or_default()
+            .contains("arg:init")
+        {
+            assert!(std::time::Instant::now() < deadline, "init never ran");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    })
+    .await;
+    let c = fx.client.clone();
+    blocking(move || c.kill_project("web")).await.unwrap();
+    std::fs::write(&release, b"").unwrap();
+    let (_runner, r) = planning.await.unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(fx.status(id).await.result.as_deref(), Some("killed"));
+    let record = fx.record();
+    assert!(
+        !record.contains("arg:plan"),
+        "no plan after the kill: {record}"
+    );
+    fx.assert_no_job_leftovers();
+}

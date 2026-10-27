@@ -1109,3 +1109,31 @@ fn apply_failure_addresses_holding_a_secret_are_dropped_before_the_journal() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn plan_stops_between_steps_when_the_job_is_no_longer_wanted() {
+    for (allowed, ran) in [(0, vec!["init"]), (1, vec!["init", "plan"])] {
+        let fx = fixture();
+        no_sandbox();
+        let resolved = resolve(&fx.cfg, &fx.project).unwrap();
+        let dir = fx.job_dir();
+        let mut asked = 0;
+        let mut still_wanted = || {
+            asked += 1;
+            asked <= allowed
+        };
+        let err = plan_checked(
+            &fx.cfg,
+            &job(&dir),
+            &Canonical("{}".into()),
+            &resolved,
+            &mut still_wanted,
+        )
+        .unwrap_err();
+        assert_eq!(err.category, "plan_cancelled");
+        let calls = fx.calls();
+        let subcommands: Vec<&str> = calls.iter().map(|(a, _)| a[1].as_str()).collect();
+        assert_eq!(subcommands, ran);
+        assert!(!fx.path("state/projects/web/plans/7.tfplan").exists());
+    }
+}

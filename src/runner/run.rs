@@ -94,6 +94,9 @@ enum Stop {
     /// End the job with `refuse`: `result` is `refused` (policy, bad input)
     /// or `plan_failed` (the runner or Terraform could not plan it).
     Refuse(&'static str, Failure),
+    /// The daemon ended the job while it was being planned (a kill, or the
+    /// planning timeout): clean up and tell it nothing.
+    Cancelled,
 }
 
 fn refused(category: &str) -> Stop {
@@ -911,6 +914,14 @@ impl Runner {
                 self.cleanup(&j.project, j.id);
                 return self.refuse(&j, result, f);
             }
+            Err(Stop::Cancelled) => {
+                eprintln!(
+                    "shoephone-runner: job {} ended while it was planned; stopped",
+                    j.id
+                );
+                self.cleanup(&j.project, j.id);
+                return Ok(());
+            }
         };
         let body = SubmitBody {
             id: j.id,
@@ -1221,10 +1232,22 @@ impl Runner {
             module: &pcfg.path,
         };
         // Terraform reads the canonical text, written by `exec::plan`,
-        // never the agent's manifest.
-        let planned = exec::plan(&self.cfg, &job, &canonical, &resolved);
+        // never the agent's manifest. Between Terraform steps the job's
+        // status is read again, so a kill or the daemon's planning timeout
+        // stops the plan instead of running it to the end. A status that
+        // cannot be read lets planning go on; the submit is refused anyway
+        // if the job is over.
+        let mut still_wanted = || match self.client.job(j.id) {
+            Ok(Some(st)) => st.state == "working",
+            Ok(None) => false,
+            Err(_) => true,
+        };
+        let planned = exec::plan_checked(&self.cfg, &job, &canonical, &resolved, &mut still_wanted);
         drop(resolved);
-        let (summary, plan, plan_sha) = planned.map_err(plan_failed)?;
+        let (summary, plan, plan_sha) = match planned {
+            Err(f) if f.category == "plan_cancelled" => return Err(Stop::Cancelled),
+            other => other.map_err(plan_failed)?,
+        };
 
         if summary.destructive && !j.allow_destroy {
             let addresses = summary
