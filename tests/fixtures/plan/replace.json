@@ -1,0 +1,3 @@
+{"resource_changes":[
+{"address":"null_resource.a","change":{"actions":["delete","create"]}},
+{"address":"module.net.aws_x.b[\"k\"]","change":{"actions":["create","delete"]}}]}
