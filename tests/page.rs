@@ -121,7 +121,7 @@ const withChallenge = async (job, bytes) => {
     counts: {create: 1, update: 0, replace: 1, delete: 1}, addresses: await sha(text),
   };
   const mkApply = async () => {
-    const j = {id: 7, kind: 'apply', nonce: 'n1', scope: {kind: 'apply', ...scope},
+    const j = {id: 7, kind: 'apply', project: 'p', nonce: 'n1', reason: 'r', match_code: 'M', expires: 0, scope: {kind: 'apply', ...scope},
       display: {manifest: next, baseline_manifest: base, address_text: text}};
     return withChallenge(j, applyBytes(j.scope, j.nonce));
   };
@@ -140,6 +140,44 @@ const withChallenge = async (job, bytes) => {
   j = await mkApply(); j.nonce = 'n2'; await refused(j, 'nonce');
   j = await mkApply(); j.challenge = 'AAAA'; await refused(j, 'challenge');
 
+  const bidi = String.fromCharCode(0x202e), c1 = String.fromCharCode(0x85);
+  assert.equal(parseAddressText('create a' + bidi + 'b\n'), null);
+  assert.equal(parseAddressText('create a' + c1 + 'b\n'), null);
+  assert.equal(visible('a' + bidi + 'b' + c1 + String.fromCharCode(0x2028)), 'a\\u202eb\\u0085\\u2028');
+  assert.equal(visible('x\ny', true), 'x\ny');
+  assert.equal(visible('x\ny'), 'x\\u000ay');
+
+  assert.throws(() => variableDiff('{"a":9007199254740992}', '{"a":9007199254740993}'));
+  assert.throws(() => variableDiff(null, '{"a":[1.2345678901234567890]}'));
+  assert.equal(variableDiff('{"a":1.5,"s":"9007199254740993"}', '{"a":2.5,"s":"9007199254740993"}').changed.length, 1);
+
+  j = await mkApply(); j.kind = 'trust'; await refused(j, 'kind differs from scope');
+  j = await mkApply(); j.project = 'other'; await refused(j, 'project differs from scope');
+  j = await mkApply(); j.scope.project = 'bad project'; j = await withChallenge(j, applyBytes(j.scope, j.nonce)); j.project = 'bad project'; await refused(j, 'project not a slug');
+  j = await mkApply(); j.scope.plan = 'A'.repeat(64); j = await withChallenge(j, applyBytes(j.scope, j.nonce)); await refused(j, 'digest not lowercase hex');
+  j = await mkApply(); j.scope.baseline_status = 'bogus'; j = await withChallenge(j, applyBytes(j.scope, j.nonce)); await refused(j, 'baseline status');
+
+  const emptyScope = {...scope, destructive: false, counts: {create: 0, update: 0, replace: 0, delete: 0}, addresses: await sha('')};
+  j = {id: 9, kind: 'apply', project: 'p', nonce: 'n4', scope: {kind: 'apply', ...emptyScope}, display: {manifest: next, baseline_manifest: base, address_text: ''}};
+  assert.ok(await verifyJob(await withChallenge(j, applyBytes(j.scope, j.nonce))), 'empty change list is consistent');
+
+  const shown = await mkApply();
+  const later = await mkApply();
+  later.display.manifest = '{"b":"z"}';
+  showJob(shown);
+  assert.equal(jobToSign(), shown);
+  showJob(later);
+  assert.equal(jobToSign(), later, 'a changed display re-renders and is what gets verified');
+  showJob(null);
+  assert.equal(jobToSign(), null);
+  const hostile = await mkApply();
+  hostile.reason = 'a' + bidi + 'b';
+  hostile.scope.project = 'real';
+  showJob(hostile);
+  assert.equal(els.jobreason.textContent, 'a\\u202eb');
+  assert.equal(els.jobheading.textContent, 'Apply to real');
+  assert.equal(els.jobapprove.textContent, 'Apply');
+
   const diff = '+++ b/main.tf\n+resource "x" "y" {}\n';
   const tscope = {
     project: 'p', baseline: null, candidate: 'a'.repeat(64), diff: await sha(diff),
@@ -147,15 +185,16 @@ const withChallenge = async (job, bytes) => {
     lines_removed: 0, schema_changed: false,
   };
   const mkTrust = async display => {
-    const j = {id: 8, kind: 'trust', nonce: 'n3', scope: {kind: 'trust', ...tscope}, display};
+    const j = {id: 8, kind: 'trust', project: 'p', nonce: 'n3', reason: 'r', match_code: 'M', expires: 0, scope: {kind: 'trust', ...tscope}, display};
     return withChallenge(j, trustBytes(j.scope, j.nonce));
   };
   assert.ok(await verifyJob(await mkTrust({diff})));
   await refused(await mkTrust({diff: diff + 'x'}), 'trust diff');
   await refused(await mkTrust({}), 'trust with no diff');
   await refused(await mkTrust({external: false}), 'trust with no diff, not external');
-  await refused(await mkTrust({external: true}), 'external without a command');
-  assert.ok(await verifyJob(await mkTrust({external: true, verify_command: 'shoephone diff-digest p'})));
+  assert.ok(await verifyJob(await mkTrust({external: true})));
+  assert.equal(verifyCommand({baseline: null}), 'shoephone-runner diff-digest none <candidate-dir>');
+  assert.equal(verifyCommand({baseline: 'a'.repeat(64)}), 'shoephone-runner diff-digest ' + 'a'.repeat(64) + ' <candidate-dir>');
   console.log('harness ok');
 })().catch(e => { console.error(e); process.exit(1); });
 "#;

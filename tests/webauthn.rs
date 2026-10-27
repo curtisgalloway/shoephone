@@ -1176,7 +1176,7 @@ const assert = require('node:assert/strict');
 (async () => {
   const j = STATE.job;
   assert.equal(j.id, %ID%);
-  const job = () => structuredClone({kind: j.kind, scope: j.scope, display: j.display, nonce: j.nonce, challenge: CHALLENGE});
+  const job = () => structuredClone({kind: j.kind, project: j.project, scope: j.scope, display: j.display, nonce: j.nonce, challenge: CHALLENGE});
   assert.ok(await verifyJob(job()));
   for (const tamper of [
     x => { x.display.manifest += ' '; },

@@ -279,7 +279,7 @@ fn apply_pair(
     destructive: bool,
 ) -> (Value, Value) {
     let address_text: String = lines.iter().map(|l| format!("{l}\n")).collect();
-    let manifest = "canonical manifest text";
+    let manifest = r#"{"region":"us-east-1"}"#;
     let scope = json!({
         "kind": "apply",
         "project": project,
@@ -918,8 +918,8 @@ async fn baseline_status_must_match_baseline_manifest() {
     );
 
     scope["baseline_status"] = json!("none");
-    scope["baseline_manifest"] = json!(sha256_hex("old"));
-    display["baseline_manifest"] = json!("old");
+    scope["baseline_manifest"] = json!(sha256_hex(r#"{"old":1}"#));
+    display["baseline_manifest"] = json!(r#"{"old":1}"#);
     assert_eq!(
         submit(&rig, id, scope.clone(), display.clone()).await.http,
         400
@@ -927,6 +927,38 @@ async fn baseline_status_must_match_baseline_manifest() {
 
     scope["baseline_status"] = json!("uncertain");
     assert_eq!(submit(&rig, id, scope, display).await.http, 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_manifests_must_be_json_objects() {
+    let dir = scratch("jobs-json");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+    let id = file_apply(&client, "net").await;
+    rig.poll().await;
+
+    let (mut scope, mut display) = apply_pair("net", &["create a.b"], [1, 0, 0, 0], false);
+    for text in ["plain text", "[1]", "null"] {
+        scope["manifest"] = json!(sha256_hex(text));
+        display["manifest"] = json!(text);
+        let reply = submit(&rig, id, scope.clone(), display.clone()).await;
+        assert_eq!(
+            (reply.http, reply.code().as_str()),
+            (400, "inconsistent_scope"),
+            "{text}"
+        );
+    }
+    let (mut scope, mut display) = apply_pair("net", &["create a.b"], [1, 0, 0, 0], false);
+    scope["baseline_status"] = json!("applied");
+    scope["baseline_manifest"] = json!(sha256_hex("not json"));
+    display["baseline_manifest"] = json!("not json");
+    let reply = submit(&rig, id, scope, display).await;
+    assert_eq!(
+        (reply.http, reply.code().as_str()),
+        (400, "inconsistent_scope")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

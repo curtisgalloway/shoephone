@@ -21,7 +21,7 @@
   .kv dt { color: var(--muted); } .kv dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, Menlo, monospace; font-size: .85rem; }
   .row { display: flex; gap: .8rem; margin-top: 1rem; }
   button { flex: 1; font: inherit; font-weight: 650; padding: .9rem; border: 0; border-radius: 10px; color: white; }
-  button.ok { background: var(--ok); } button.no { background: var(--no); } button.plain { background: var(--muted); }
+  button.ok { background: var(--ok); } button.trust { background: #6d28d9; } button.no { background: var(--no); } button.plain { background: var(--muted); }
   button:disabled { opacity: .5; }
   .muted { color: var(--muted); font-size: .92rem; }
   .status { min-height: 1.4em; font-size: .95rem; }
@@ -127,6 +127,7 @@ async function refresh() {
   if (busy) return;
   let s;
   try { s = await api('/api/pending'); } catch (e) { $('idletext').textContent = 'Daemon unreachable: ' + e.message; return; }
+  if (busy) return;
   current = s.pending;
   currentJob = s.job || null;
   $('pending').classList.toggle('hidden', !s.pending);
@@ -137,7 +138,7 @@ async function refresh() {
     $('scope').textContent = `admin on ${p.host} until ${when(p.ends_at)}`;
     $('match').textContent = p.match_code;
     $('reason').textContent = p.reason;
-    $('context').classList.toggle('hidden', !p.context); if (p.context) $('context').href = p.context;
+    setLink($('context'), p.context);
     $('requester').textContent = p.requester || '(unnamed)';
     $('fingerprint').textContent = p.fingerprint;
     $('principal').textContent = p.principal;
@@ -208,15 +209,29 @@ $('decline').onclick = async () => {
 };
 
 // ---- Terraform jobs: trust and apply ------------------------------------
-// Everything below renders untrusted text with textContent only. Before the
-// security key is touched, verifyJob() rebuilds every digest in the scope
-// from the text on screen, rebuilds the bytes the key will sign, and compares
-// their hash with the daemon's challenge, exactly as the SSH path does.
+// Everything below renders untrusted text with textContent only, after
+// escaping bidirectional and control characters. Before the security key is
+// touched, verifyJob() rebuilds every digest in the scope from the text on
+// screen, rebuilds the bytes the key will sign, and compares their hash with
+// the daemon's challenge, exactly as the SSH path does. The job it checks is
+// the very object that was rendered (see jobToSign), never a newer poll.
 
 const MISMATCH = "the daemon's challenge does not match the request on screen";
 const OBLIGATION = 'For every manifest the schema accepts, protected credentials may reach only their provider authentication and the approved destinations, and nothing the agent can see (results, addresses, which actions run) may reveal them.';
 const ACTIONS = ['create', 'update', 'replace', 'delete'];
 const BAD_ADDRESS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+const HIDDEN_ANY = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+const HIDDEN_KEEP_LINES = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+const SLUG = /^[A-Za-z0-9._-]{1,64}$/;
+const DIGEST = /^[0-9a-f]{64}$/;
+
+// Shows control, line-separator and bidirectional characters as \uXXXX so
+// they cannot reorder or hide what the approver reads. keepLines leaves
+// newline and tab alone, for a multi-line block.
+function visible(text, keepLines) {
+  return String(text).replace(keepLines ? HIDDEN_KEEP_LINES : HIDDEN_ANY,
+    c => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
+}
 
 async function sha256Hex(text) {
   const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -267,7 +282,36 @@ function countActions(changes) {
   return c;
 }
 
+// Throws unless every number in the JSON text survives a trip through a
+// double exactly. Otherwise two different numbers could compare equal and a
+// changed value would be hidden from the variable diff.
+function assertNumbersExact(text) {
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '"') {
+      i += 1;
+      while (i < text.length && text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
+      i += 1;
+    } else if (ch === '-' || (ch >= '0' && ch <= '9')) {
+      const m = /^-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?/.exec(text.slice(i));
+      if (!m) throw new Error('bad number');
+      const tok = m[0];
+      if (!m[1] && !m[2]) {
+        if (BigInt(Number(tok)) !== BigInt(tok)) throw new Error('number not exact: ' + tok);
+      } else {
+        const digits = tok.replace(/[eE].*$/, '').replace(/[-.]/g, '').replace(/^0+/, '').replace(/0+$/, '');
+        if (digits.length > 15) throw new Error('number not exact: ' + tok);
+      }
+      i += tok.length;
+    } else {
+      i += 1;
+    }
+  }
+}
+
 function parseManifest(text) {
+  assertNumbersExact(text);
   const v = JSON.parse(text);
   if (v === null || typeof v !== 'object' || Array.isArray(v)) throw new Error('manifest is not an object');
   return v;
@@ -290,6 +334,33 @@ function variableDiff(baseline, manifest) {
 }
 
 const isText = v => typeof v === 'string';
+const isDigest = v => isText(v) && DIGEST.test(v);
+const isCount = v => Number.isInteger(v) && v >= 0;
+
+// The command the operator runs in their own checkout, built here from
+// signed fields so a runner cannot put its own text in front of the key.
+function verifyCommand(s) {
+  return 'shoephone-runner diff-digest ' + (s.baseline ?? 'none') + ' <candidate-dir>';
+}
+
+// True when the scope is shaped the way the daemon's scope.rs requires.
+function scopeWellFormed(s) {
+  if (!s || !isText(s.project) || !SLUG.test(s.project)) return false;
+  if (s.kind === 'trust') {
+    return (s.baseline === null || s.baseline === undefined || isDigest(s.baseline)) &&
+      isDigest(s.candidate) && isDigest(s.diff) && isDigest(s.schema) &&
+      [s.policy_version, s.files_changed, s.lines_added, s.lines_removed].every(isCount) &&
+      typeof s.schema_changed === 'boolean';
+  }
+  if (s.kind === 'apply') {
+    return isDigest(s.revision) && isDigest(s.schema) && isDigest(s.manifest) &&
+      (s.baseline_manifest === null || s.baseline_manifest === undefined || isDigest(s.baseline_manifest)) &&
+      ['none', 'applied', 'uncertain'].includes(s.baseline_status) &&
+      isDigest(s.plan) && isDigest(s.addresses) && typeof s.destructive === 'boolean' &&
+      !!s.counts && ACTIONS.every(k => isCount(s.counts[k]));
+  }
+  return false;
+}
 
 // Checks everything the page can check offline and returns the bytes the key
 // will sign. Throws MISMATCH on any disagreement or missing display field.
@@ -297,16 +368,15 @@ const isText = v => typeof v === 'string';
 async function verifyJob(job) {
   const s = job.scope, d = job.display;
   if (!s || !d || !isText(job.nonce) || !isText(job.challenge)) throw new Error(MISMATCH);
+  if (job.kind !== s.kind || job.project !== s.project || !scopeWellFormed(s)) throw new Error(MISMATCH);
   let bytes;
   if (s.kind === 'trust') {
     if (!d.external) {
       if (!isText(d.diff) || d.diff === '') throw new Error(MISMATCH);
       if (await sha256Hex(d.diff) !== s.diff) throw new Error(MISMATCH);
-    } else if (!isText(d.verify_command) || d.verify_command === '') {
-      throw new Error(MISMATCH);
     }
     bytes = trustBytes(s, job.nonce);
-  } else if (s.kind === 'apply') {
+  } else {
     if (!isText(d.manifest) || !isText(d.address_text)) throw new Error(MISMATCH);
     if (await sha256Hex(d.manifest) !== s.manifest) throw new Error(MISMATCH);
     if (s.baseline_manifest === null || s.baseline_manifest === undefined) {
@@ -322,17 +392,23 @@ async function verifyJob(job) {
     if (s.destructive !== (c.delete > 0 || c.replace > 0)) throw new Error(MISMATCH);
     try { variableDiff(d.baseline_manifest ?? null, d.manifest); } catch (e) { throw new Error(MISMATCH); }
     bytes = applyBytes(s, job.nonce);
-  } else {
-    throw new Error(MISMATCH);
   }
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(bytes));
   if (b64u.enc(digest) !== job.challenge) throw new Error(MISMATCH);
   return bytes;
 }
 
+// Only https links are offered; anything else would be agent-chosen script
+// or a local scheme.
+function setLink(a, url) {
+  const ok = isText(url) && url.startsWith('https://');
+  a.classList.toggle('hidden', !ok);
+  if (ok) a.href = url;
+}
+
 function el(tag, text, cls) {
   const e = document.createElement(tag);
-  if (text !== undefined) e.textContent = text;
+  if (text !== undefined) e.textContent = visible(text);
   if (cls) e.className = cls;
   return e;
 }
@@ -341,7 +417,11 @@ function section(title, ...nodes) {
   box.append(el('h3', title), ...nodes);
   return box;
 }
-function block(text) { return el('pre', text, 'block'); }
+function block(text) {
+  const e = el('pre', undefined, 'block');
+  e.textContent = visible(text, true);
+  return e;
+}
 function kv(pairs) {
   const dl = el('dl', undefined, 'kv');
   for (const [k, v] of pairs) dl.append(el('dt', k), el('dd', v));
@@ -362,7 +442,7 @@ function renderTrust(j) {
   ]));
   if (d.external) {
     nodes.push(el('p', 'This diff is too large to show here. Run this command in your own checkout; it must print the diff digest below.', 'warn'));
-    nodes.push(section('verification command', block(d.verify_command || '(missing)')));
+    nodes.push(section('verification command', block(verifyCommand(s))));
     nodes.push(kv([['diff digest', s.diff], ['candidate', s.candidate], ['baseline', s.baseline ?? 'none'], ['schema', s.schema]]));
   } else if (isText(d.diff) && d.diff !== '') {
     nodes.push(section('diff', block(d.diff)));
@@ -377,19 +457,6 @@ function renderApply(j) {
   const nodes = [];
   const changes = parseAddressText(d.address_text);
   if (s.baseline_status === 'uncertain') nodes.push(el('p', 'last apply did not finish cleanly; this diff may be incomplete', 'warn'));
-  if (changes === null) {
-    nodes.push(el('p', 'The change list is missing or malformed. Do not approve.', 'warn'));
-  } else {
-    const risky = changes.filter(c => c.action === 'delete' || c.action === 'replace');
-    if (s.destructive || risky.length) {
-      nodes.push(el('div', undefined, 'warn'));
-      nodes[nodes.length - 1].append(el('div', 'Deletes and replaces'), lineList(risky.map(c => [c.action + ' ' + c.address, 'del'])));
-    }
-    const c = countActions(changes);
-    nodes.push(kv(ACTIONS.map(k => [k, String(c[k])])));
-    nodes.push(section('changes', lineList(changes.map(c => [c.action + ' ' + c.address, c.action === 'delete' || c.action === 'replace' ? 'del' : undefined]))));
-  }
-  nodes.push(kv([['baseline', s.baseline_status]]));
   try {
     const v = variableDiff(d.baseline_manifest ?? null, d.manifest);
     const rows = [];
@@ -400,39 +467,65 @@ function renderApply(j) {
   } catch (e) {
     nodes.push(el('p', 'The manifest is missing or malformed. Do not approve.', 'warn'));
   }
+  if (changes === null) {
+    nodes.push(el('p', 'The change list is missing or malformed. Do not approve.', 'warn'));
+  } else {
+    const risky = changes.filter(c => c.action === 'delete' || c.action === 'replace');
+    if (s.destructive || risky.length) {
+      const box = el('div', undefined, 'warn');
+      box.append(el('div', 'Deletes and replaces'), lineList(risky.map(c => [c.action + ' ' + c.address, 'del'])));
+      nodes.push(box);
+    }
+    const c = countActions(changes);
+    nodes.push(kv(ACTIONS.map(k => [k, String(c[k])])));
+    nodes.push(section('changes', lineList(changes.map(c => [c.action + ' ' + c.address, c.action === 'delete' || c.action === 'replace' ? 'del' : undefined]))));
+  }
+  nodes.push(kv([['baseline', s.baseline_status]]));
   return nodes;
 }
 
+// The job last rendered, and a serialization of all of it. The key is
+// verified and signed over this object, not over whatever the latest poll
+// returned.
 let shownJob = null;
+function jobToSign() { return shownJob ? shownJob.job : null; }
+
 function showJob(j) {
   $('job').classList.toggle('hidden', !j);
   if (!j) { shownJob = null; return; }
-  const key = j.id + ':' + j.nonce;
-  if (key === shownJob) return;
-  shownJob = key;
-  const trust = j.kind === 'trust';
+  const key = JSON.stringify(j);
+  if (shownJob && shownJob.key === key) return;
+  shownJob = {key, job: j};
+  const s = j.scope || {};
+  const trust = s.kind === 'trust';
   const band = $('jobband');
   band.textContent = trust ? 'TRUST NEW CODE' : 'APPLY';
   band.className = 'band ' + (trust ? 'trust' : 'apply');
-  $('jobheading').textContent = (trust ? 'Trust new code for ' : 'Apply to ') + j.project;
-  $('jobreason').textContent = j.reason;
-  $('jobmatch').textContent = j.match_code;
-  $('jobcontext').classList.toggle('hidden', !j.context); if (j.context) $('jobcontext').href = j.context;
-  $('jobrequester').textContent = j.requester || '(unnamed)';
+  $('jobheading').textContent = visible((trust ? 'Trust new code for ' : 'Apply to ') + s.project);
+  $('jobreason').textContent = visible(j.reason);
+  $('jobmatch').textContent = visible(j.match_code);
+  setLink($('jobcontext'), j.context);
+  $('jobrequester').textContent = visible(j.requester || '(unnamed)');
   $('jobexpires').textContent = `request expires ${when(j.expires)}`;
   $('jobstatus').textContent = '';
-  $('jobbody').replaceChildren(...(trust ? renderTrust(j) : renderApply(j)));
+  $('jobapprove').textContent = trust ? 'Trust this code' : 'Apply';
+  $('jobapprove').className = trust ? 'trust' : 'ok';
+  const body = [];
+  if (j.kind !== s.kind || j.project !== s.project) body.push(el('p', 'The request header disagrees with the signed scope. Do not approve.', 'warn'));
+  try { body.push(...(trust ? renderTrust(j) : renderApply(j))); }
+  catch (e) { body.push(el('p', 'This request cannot be displayed. Do not approve.', 'warn')); }
+  $('jobbody').replaceChildren(...body);
   if (navigator.vibrate) navigator.vibrate(60);
 }
 
 $('jobapprove').onclick = async () => {
-  const j = currentJob;
+  const j = jobToSign();
   if (!j) return;
   busy = true; $('jobapprove').disabled = $('jobdecline').disabled = true; $('jobstatus').textContent = 'Touch your security key…';
   try {
     const opts = await api('/api/approve/start', {id: j.id});
     const pk = opts.publicKey;
-    await verifyJob({kind: j.kind, scope: j.scope, display: j.display, nonce: j.nonce, challenge: pk.challenge});
+    await verifyJob({kind: j.kind, project: j.project, scope: j.scope, display: j.display, nonce: j.nonce, challenge: pk.challenge});
     pk.challenge = b64u.dec(pk.challenge);
     (pk.allowCredentials || []).forEach(c => c.id = b64u.dec(c.id));
     const cred = await navigator.credentials.get({publicKey: pk});
@@ -446,9 +539,10 @@ $('jobapprove').onclick = async () => {
 };
 
 $('jobdecline').onclick = async () => {
-  if (!currentJob) return;
+  const j = jobToSign();
+  if (!j) return;
   busy = true;
-  try { await api('/api/decline', {id: currentJob.id}); $('jobstatus').textContent = 'Declined.'; }
+  try { await api('/api/decline', {id: j.id}); $('jobstatus').textContent = 'Declined.'; }
   catch (e) { $('jobstatus').textContent = e.message; }
   finally { busy = false; setTimeout(refresh, 300); }
 };

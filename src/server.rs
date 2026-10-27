@@ -1875,6 +1875,15 @@ fn parse_address_text(text: &str) -> Option<Vec<(Action, String)>> {
     (scope::address_text(&changes).as_deref() == Some(text)).then_some(changes)
 }
 
+/// True when `text` parses as a JSON object, which the approve page needs in
+/// order to list the variable changes.
+fn is_json_object(text: &str) -> bool {
+    matches!(
+        serde_json::from_str::<serde_json::Value>(text),
+        Ok(serde_json::Value::Object(_))
+    )
+}
+
 /// Check every digest in a submitted scope against the text the approver
 /// will read, and the counts and destructive flag against the addresses.
 fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), Fail> {
@@ -1925,9 +1934,16 @@ fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), 
                     "the manifest digest does not match the display",
                 ));
             }
+            if !is_json_object(manifest) {
+                return Err(inconsistent("the manifest is not a JSON object"));
+            }
             match (&a.baseline_manifest, &display.baseline_manifest) {
                 (None, None) => {}
-                (Some(digest), Some(text)) if store::sha256_hex(text) == *digest => {}
+                (Some(digest), Some(text)) if store::sha256_hex(text) == *digest => {
+                    if !is_json_object(text) {
+                        return Err(inconsistent("the baseline manifest is not a JSON object"));
+                    }
+                }
                 _ => {
                     return Err(inconsistent(
                         "the baseline manifest digest does not match the display",
