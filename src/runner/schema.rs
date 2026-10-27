@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
@@ -25,6 +25,7 @@ pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 /// Largest integer magnitude that survives a round trip through a JSON
 /// double: 2^53 - 1.
 const MAX_SAFE: i64 = 9_007_199_254_740_991;
+const REGEX_LIMIT: usize = 1 << 20;
 const DEFAULT_MAX_LEN: usize = 256;
 const DEFAULT_MAX_ITEMS: usize = 64;
 
@@ -147,12 +148,22 @@ fn invalid(name: &str, why: &str) -> Failure {
 }
 
 fn compile(name: &str, pattern: &str) -> Result<Allowed, Failure> {
+    let build = |src: &str| {
+        RegexBuilder::new(src)
+            .size_limit(REGEX_LIMIT)
+            .dfa_size_limit(REGEX_LIMIT)
+            .build()
+    };
+    let bad = || invalid(name, "pattern does not compile");
+    // The bare pattern must compile on its own, so an unbalanced `)` cannot
+    // close the anchor group and let an alternation escape it.
+    build(pattern).map_err(|_| bad())?;
     // Anchored so a pattern always judges the whole value. The pattern text
-    // and the compiler's message are not repeated: a pattern is trusted, but
-    // the failure is shown to the agent.
-    Regex::new(&format!(r"\A(?:{pattern})\z"))
+    // and the compiler's message are not repeated: the failure is shown to
+    // the agent.
+    build(&format!(r"\A(?:{pattern})\z"))
         .map(Allowed::Pattern)
-        .map_err(|_| invalid(name, "pattern does not compile"))
+        .map_err(|_| bad())
 }
 
 fn allowed(
@@ -162,7 +173,9 @@ fn allowed(
 ) -> Result<Allowed, Failure> {
     match (pattern, choices) {
         (Some(p), None) => compile(name, p),
-        (None, Some(c)) if !c.is_empty() => Ok(Allowed::Choices(c.clone())),
+        (None, Some(c)) if !c.is_empty() && !c.iter().any(|s| s.chars().any(is_forbidden)) => {
+            Ok(Allowed::Choices(c.clone()))
+        }
         _ => Err(invalid(name, "needs exactly one non-empty constraint")),
     }
 }
@@ -170,14 +183,14 @@ fn allowed(
 fn toml_number(name: &str, v: Option<&toml::Value>) -> Result<Option<f64>, Failure> {
     match v {
         None => Ok(None),
-        Some(toml::Value::Integer(i)) if i.abs() <= MAX_SAFE => Ok(Some(*i as f64)),
+        Some(toml::Value::Integer(i)) if i.unsigned_abs() <= MAX_SAFE as u64 => Ok(Some(*i as f64)),
         Some(toml::Value::Float(f)) if f.is_finite() && f.abs() <= MAX_SAFE as f64 => Ok(Some(*f)),
         _ => Err(invalid(name, "min and max must be safe numbers")),
     }
 }
 
 fn toml_default(name: &str, v: &toml::Value) -> Result<Val, Failure> {
-    Ok(match v {
+    Ok(normalize(match v {
         toml::Value::String(s) => Val::Str(s.clone()),
         toml::Value::Boolean(b) => Val::Bool(*b),
         toml::Value::Integer(i) => Val::Int(*i),
@@ -188,7 +201,20 @@ fn toml_default(name: &str, v: &toml::Value) -> Result<Val, Failure> {
                 .collect::<Result<_, _>>()?,
         ),
         _ => return Err(invalid(name, "default has an unsupported type")),
-    })
+    }))
+}
+
+/// Equal numbers must render as equal bytes: an integral value within the
+/// safe range becomes an integer (`1.0`, `1e0` and `-0.0` all become an
+/// integer), and everything else is left as it is.
+fn normalize(v: Val) -> Val {
+    match v {
+        Val::UInt(u) if u <= MAX_SAFE as u64 => Val::Int(u as i64),
+        Val::Float(f) if f.is_finite() && f.fract() == 0.0 && f.abs() <= MAX_SAFE as f64 => {
+            Val::Int(f as i64)
+        }
+        other => other,
+    }
 }
 
 fn build_variable(name: &str, raw: &RawVariable) -> Result<Variable, Failure> {
@@ -209,9 +235,16 @@ fn build_variable(name: &str, raw: &RawVariable) -> Result<Variable, Failure> {
             if stray_string || stray_list || raw.max_len.is_some() || raw.max_items.is_some() {
                 return Err(invalid(name, "key does not apply to a number"));
             }
+            let (min, max) = (
+                toml_number(name, raw.min.as_ref())?,
+                toml_number(name, raw.max.as_ref())?,
+            );
+            if min.zip(max).is_some_and(|(lo, hi)| lo > hi) {
+                return Err(invalid(name, "min is greater than max"));
+            }
             Kind::Number {
-                min: toml_number(name, raw.min.as_ref())?,
-                max: toml_number(name, raw.max.as_ref())?,
+                min,
+                max,
                 integer: raw.integer.unwrap_or(false),
             }
         }
@@ -229,6 +262,9 @@ fn build_variable(name: &str, raw: &RawVariable) -> Result<Variable, Failure> {
         "list_of_strings" => {
             if stray_string || stray_number {
                 return Err(invalid(name, "key does not apply to a list"));
+            }
+            if raw.max_items == Some(0) {
+                return Err(invalid(name, "max_items must be at least 1"));
             }
             Kind::List {
                 item: allowed(name, raw.item_pattern.as_ref(), raw.item_choices.as_ref())?,
@@ -303,7 +339,11 @@ enum Val {
     Obj(Vec<(String, Val)>),
 }
 
-const DUP_MARK: char = '\u{1}';
+thread_local! {
+    /// The key a duplicate-key refusal was raised for, set by the visitor.
+    static DUPLICATE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 struct ValVisitor;
 
@@ -343,7 +383,8 @@ impl<'de> Visitor<'de> for ValVisitor {
         let mut out = Vec::new();
         while let Some(key) = map.next_key::<String>()? {
             if !seen.insert(key.clone()) {
-                return Err(de::Error::custom(format!("dup{DUP_MARK}{key}{DUP_MARK}")));
+                DUPLICATE.with(|d| *d.borrow_mut() = Some(key));
+                return Err(de::Error::custom("duplicate key"));
             }
             out.push((key, map.next_value::<Val>()?));
         }
@@ -355,14 +396,6 @@ impl<'de> Deserialize<'de> for Val {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Val, D::Error> {
         d.deserialize_any(ValVisitor)
     }
-}
-
-/// The key named by a duplicate-key error, if that is what it was.
-fn duplicate_key(err: &serde_json::Error) -> Option<String> {
-    let msg = err.to_string();
-    let start = msg.find(&format!("dup{DUP_MARK}"))? + 4;
-    let rest = &msg[start..];
-    Some(rest[..rest.find(DUP_MARK)?].to_string())
 }
 
 // ---------------------------------------------------------------------
@@ -381,6 +414,12 @@ fn is_forbidden(c: char) -> bool {
         | '\u{2060}'
         | '\u{2066}'..='\u{2069}'
         | '\u{FEFF}'
+        | '\u{034F}'
+        | '\u{115F}'
+        | '\u{180E}'
+        | '\u{3164}'
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{FFF9}'..='\u{FFFB}'
         | '\u{E0000}'..='\u{E007F}')
 }
 
@@ -398,7 +437,7 @@ fn check(name: &str, kind: &Kind, v: &Val) -> Result<(), Failure> {
         (Kind::Bool, Val::Bool(_)) => Ok(()),
         (Kind::Number { min, max, integer }, Val::Int(_) | Val::UInt(_) | Val::Float(_)) => {
             let n = match v {
-                Val::Int(i) if i.abs() <= MAX_SAFE => *i as f64,
+                Val::Int(i) if i.unsigned_abs() <= MAX_SAFE as u64 => *i as f64,
                 Val::UInt(u) if *u <= MAX_SAFE as u64 => *u as f64,
                 Val::Float(f) if f.is_finite() && f.abs() <= MAX_SAFE as f64 => *f,
                 _ => return Err(type_err()),
@@ -472,11 +511,12 @@ pub fn validate(schema: &Schema, manifest: &str) -> Result<Canonical, Failure> {
     if manifest.len() > MAX_MANIFEST_BYTES {
         return Err(fail("manifest_too_large", ""));
     }
+    DUPLICATE.with(|d| *d.borrow_mut() = None);
     let top = match serde_json::from_str::<Val>(manifest) {
         Ok(Val::Obj(entries)) => entries,
         Ok(_) => return Err(detailed("manifest_type", "", "manifest is not an object")),
-        Err(e) => {
-            if let Some(key) = duplicate_key(&e) {
+        Err(_) => {
+            if let Some(key) = DUPLICATE.with(|d| d.borrow_mut().take()) {
                 return Err(fail("manifest_duplicate_key", agent_name(&key)));
             }
             return Err(detailed("manifest_type", "", "manifest is not valid JSON"));
@@ -492,18 +532,18 @@ pub fn validate(schema: &Schema, manifest: &str) -> Result<Canonical, Failure> {
     let mut out = String::from("{");
     for (i, (name, var)) in schema.variables.iter().enumerate() {
         let v = match (given.get(name.as_str()), &var.default) {
-            (Some(v), _) => *v,
-            (None, Some(d)) => d,
+            (Some(v), _) => normalize((*v).clone()),
+            (None, Some(d)) => d.clone(),
             (None, None) => return Err(fail("manifest_missing", name)),
         };
-        check(name, &var.kind, v)?;
+        check(name, &var.kind, &v)?;
         if i > 0 {
             out.push(',');
         }
         out.push('"');
         out.push_str(name);
         out.push_str("\":");
-        render(v, &mut out);
+        render(&v, &mut out);
     }
     out.push('}');
     Ok(Canonical(out))
@@ -661,7 +701,6 @@ default = []
         }
         let si = parse_schema("[variables.n]\ntype = \"number\"\ninteger = true\n").unwrap();
         assert!(validate(&si, r#"{"n":1.5}"#).is_err());
-        assert!(validate(&si, r#"{"n":2.0}"#).is_err());
     }
 
     #[test]
@@ -738,6 +777,62 @@ default = []
         ] {
             let f = parse_schema(bad).unwrap_err();
             assert_eq!(f.category, "schema_invalid", "{bad}");
+        }
+    }
+
+    #[test]
+    fn equal_numbers_render_identically() {
+        let s = parse_schema("[variables.n]\ntype = \"number\"\n").unwrap();
+        for m in ["1", "1.0", "1e0", "10e-1"] {
+            let c = validate(&s, &format!("{{\"n\":{m}}}")).unwrap();
+            assert_eq!(c.0, "{\"n\":1}", "{m}");
+        }
+        for m in ["-0", "-0.0", "0"] {
+            let c = validate(&s, &format!("{{\"n\":{m}}}")).unwrap();
+            assert_eq!(c.0, "{\"n\":0}", "{m}");
+        }
+        assert_eq!(validate(&s, "{\"n\":1.5}").unwrap().0, "{\"n\":1.5}");
+        let si = parse_schema("[variables.n]\ntype = \"number\"\ninteger = true\n").unwrap();
+        assert_eq!(validate(&si, "{\"n\":2.0}").unwrap().0, "{\"n\":2}");
+        assert!(validate(&si, "{\"n\":2.5}").is_err());
+        let d = parse_schema("[variables.n]\ntype = \"number\"\ndefault = 3.0\n").unwrap();
+        assert_eq!(validate(&d, "{}").unwrap().0, "{\"n\":3}");
+    }
+
+    #[test]
+    fn i64_min_and_escaping_patterns_are_refused() {
+        let s = parse_schema("[variables.n]\ntype = \"number\"\n").unwrap();
+        let f = validate(&s, "{\"n\":-9223372036854775808}").unwrap_err();
+        assert_eq!(f.category, "manifest_type");
+        for bad in [
+            "[variables.n]\ntype = \"number\"\ndefault = -9223372036854775808\n",
+            "[variables.n]\ntype = \"number\"\nmin = -9223372036854775808\n",
+            "[variables.s]\ntype = \"string\"\npattern = \"a)|(.*\"\n",
+            "[variables.n]\ntype = \"number\"\nmin = 5\nmax = 1\n",
+            "[variables.l]\ntype = \"list_of_strings\"\nitem_pattern = \"a\"\nmax_items = 0\n",
+            "[variables.s]\ntype = \"string\"\nchoices = [\"a\\u200bb\"]\n",
+            "[variables.l]\ntype = \"list_of_strings\"\nitem_choices = [\"a\\ufe0f\"]\n",
+        ] {
+            assert_eq!(
+                parse_schema(bad).unwrap_err().category,
+                "schema_invalid",
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn more_invisible_characters_are_refused() {
+        let s = parse_schema("[variables.s]\ntype = \"string\"\npattern = \".*\"\n").unwrap();
+        for esc in [
+            "\\u034f", "\\u115f", "\\u180e", "\\u3164", "\\ufe0f", "\\ufff9", "\\ufffb",
+        ] {
+            let bad = format!("{{\"s\":\"a{esc}b\"}}");
+            assert_eq!(
+                validate(&s, &bad).unwrap_err().category,
+                "manifest_constraint",
+                "{bad}"
+            );
         }
     }
 }
