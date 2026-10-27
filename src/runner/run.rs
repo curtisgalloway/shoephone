@@ -436,8 +436,18 @@ fn recover_unmarked(paths: &ProjectPaths) {
     };
     restore(prev_dir(paths), paths.trusted_dir());
     restore(prev_json(paths), paths.trusted_json());
+    remove_leftovers(paths);
+}
+
+/// After [`recover_unmarked`]'s restores: drop what is now a leftover.
+/// Each previous copy goes only once its live counterpart exists, so a
+/// restore that failed for one of them keeps the only copy for the next
+/// start.
+fn remove_leftovers(paths: &ProjectPaths) {
     if paths.trusted_dir().exists() {
         remove_path(&prev_dir(paths));
+    }
+    if paths.trusted_json().exists() {
         remove_path(&prev_json(paths));
     }
 }
@@ -1617,6 +1627,22 @@ mod tests {
         assert!(prev_dir(&paths).exists(), "the previous trust is not lost");
         assert!(install_undo(&paths), "the retry succeeds");
         assert_original(&paths);
+    }
+
+    #[test]
+    fn a_failed_json_restore_keeps_the_previous_record() {
+        let (_dir, paths) = live_trust();
+        // trusted/ is back, but moving trusted.prev.json back failed.
+        fs::rename(paths.trusted_json(), prev_json(&paths)).unwrap();
+        remove_leftovers(&paths);
+        assert_eq!(
+            fs::read(prev_json(&paths)).unwrap(),
+            b"{\"old\":1}",
+            "the only copy of the record is kept for the next start"
+        );
+        recover_unmarked(&paths);
+        assert_original(&paths);
+        assert!(!prev_json(&paths).exists());
     }
 
     #[test]
