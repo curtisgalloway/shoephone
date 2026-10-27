@@ -1,0 +1,8 @@
+{"resource_changes":[
+{"address":"null_resource.n","change":{"actions":["no-op"]}},
+{"address":"data.null_data_source.r","change":{"actions":["read"]}},
+{"address":"null_resource.u","change":{"actions":["update"]}},
+{"address":"null_resource.c","change":{"actions":["create"]}},
+{"address":"null_resource.d","change":{"actions":["delete"]}},
+{"address":"null_resource.a","change":{"actions":["delete","create"]}}],
+"output_changes":{"o1":{"actions":["update"]},"o2":{"actions":["no-op"]}}}

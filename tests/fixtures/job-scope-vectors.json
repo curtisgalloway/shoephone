@@ -1,0 +1,126 @@
+{
+  "note": "Shared between shoephone (Rust daemon) and shoephone-app (Swift approver). Both derive the scope challenge for trust and apply grants independently; each repo has a test asserting its own implementation reproduces every vector here. Edit in the daemon repo and copy to the app; scripts/e2e.sh in the app fails if the two copies differ.",
+  "derivation": "challenge = base64url(sha256(bytes_to_sign)), no padding. addresses = lowercase hex sha256 of the address text: one '<action> <address>\\n' line per change, in order.",
+  "address_texts": {
+    "apply with baseline_status none": "create aws_instance.web\nupdate aws_security_group.web\n",
+    "apply, uncertain and destructive": "delete aws_instance.old\nreplace aws_db_instance.main\ncreate aws_eip.web\n",
+    "apply, applied baseline": "update aws_instance.web\n"
+  },
+  "vectors": [
+    {
+      "name": "first trust, no baseline",
+      "kind": "trust",
+      "scope": {
+        "project": "infra-web",
+        "baseline": null,
+        "candidate": "c4c1d611edf69a251edbb091082bdc3004b8386975599ca840e5b72e86476556",
+        "diff": "0697c0f434f8672811eb1b52d443d0d4cb616fa58e4d10b25e91471b7f45a665",
+        "schema": "f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8",
+        "policy_version": 1,
+        "files_changed": 3,
+        "lines_added": 40,
+        "lines_removed": 0,
+        "schema_changed": true
+      },
+      "nonce": "abc123",
+      "bytes_to_sign": "shoephone-trust-v1\nproject=infra-web\nbaseline=none\ncandidate=c4c1d611edf69a251edbb091082bdc3004b8386975599ca840e5b72e86476556\ndiff=0697c0f434f8672811eb1b52d443d0d4cb616fa58e4d10b25e91471b7f45a665\nschema=f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8\npolicy=1\nfiles=3\nadded=40\nremoved=0\nschema_changed=1\nnonce=abc123\n",
+      "challenge_sha256_hex": "a80ccb5ce59d6710e08ca0aa2ee6e634a41a1d4daa923db56640d25ff8041eab",
+      "challenge_base64url": "qAzLXOWdZxDgjKCqLubmNKQaHU2qkj21ZkDSX_gEHqs"
+    },
+    {
+      "name": "later trust with a baseline",
+      "kind": "trust",
+      "scope": {
+        "project": "infra-web",
+        "baseline": "c4c1d611edf69a251edbb091082bdc3004b8386975599ca840e5b72e86476556",
+        "candidate": "347b2359811edd68fe236eddc0369e76a336f03d345c2d980c5234cb6ff2a59a",
+        "diff": "a9485d17c39b521f9de31b558df98f81dd72a9c7498f57f27b74356ea150fbd9",
+        "schema": "f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8",
+        "policy_version": 1,
+        "files_changed": 1,
+        "lines_added": 2,
+        "lines_removed": 1,
+        "schema_changed": false
+      },
+      "nonce": "def456",
+      "bytes_to_sign": "shoephone-trust-v1\nproject=infra-web\nbaseline=c4c1d611edf69a251edbb091082bdc3004b8386975599ca840e5b72e86476556\ncandidate=347b2359811edd68fe236eddc0369e76a336f03d345c2d980c5234cb6ff2a59a\ndiff=a9485d17c39b521f9de31b558df98f81dd72a9c7498f57f27b74356ea150fbd9\nschema=f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8\npolicy=1\nfiles=1\nadded=2\nremoved=1\nschema_changed=0\nnonce=def456\n",
+      "challenge_sha256_hex": "791fe913917f76eda18b14faceabe4f78c4a58eaddeb14ecb2308e321c50957d",
+      "challenge_base64url": "eR_pE5F_du2hixT6zqvk94xKWOrd6xTssjCOMhxQlX0"
+    },
+    {
+      "name": "apply with baseline_status none",
+      "kind": "apply",
+      "scope": {
+        "project": "infra-web",
+        "revision": "386706bf1f6ba515d60d6a3e5ab8e610177f518a162849c959431cd8535ec1df",
+        "schema": "f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8",
+        "manifest": "70f6cc49a8de8f9668eba173fd3144ca99732ed75587eac25df57edf35b3dd45",
+        "baseline_manifest": null,
+        "baseline_status": "none",
+        "plan": "d4b6f8f490075f4f83a7d7aed5b55b9bf9f32ce5443b65baa74971cce0ff1c69",
+        "destructive": false,
+        "counts": {
+          "create": 1,
+          "update": 1,
+          "replace": 0,
+          "delete": 0
+        },
+        "addresses": "0fad45c5bc62db1d793cdccf6dac290da634fd475f7190383109d755ac310034"
+      },
+      "nonce": "abc123",
+      "bytes_to_sign": "shoephone-apply-v1\nproject=infra-web\nrevision=386706bf1f6ba515d60d6a3e5ab8e610177f518a162849c959431cd8535ec1df\nschema=f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8\nmanifest=70f6cc49a8de8f9668eba173fd3144ca99732ed75587eac25df57edf35b3dd45\nbaseline_manifest=none\nbaseline_status=none\nplan=d4b6f8f490075f4f83a7d7aed5b55b9bf9f32ce5443b65baa74971cce0ff1c69\ndestructive=0\ncreate=1\nupdate=1\nreplace=0\ndelete=0\naddresses=0fad45c5bc62db1d793cdccf6dac290da634fd475f7190383109d755ac310034\nnonce=abc123\n",
+      "challenge_sha256_hex": "830aa9601b8d9898e2e7ba9bc9769e19f322da5a1b234038aac5bcd452d6d064",
+      "challenge_base64url": "gwqpYBuNmJji57qbyXaeGfMi2lobI0A4qsW81FLW0GQ"
+    },
+    {
+      "name": "apply, uncertain and destructive",
+      "kind": "apply",
+      "scope": {
+        "project": "infra-web",
+        "revision": "5e3cf12147cca0b3d28c67be8bd1c482d2a84c03096cebbb57c83963cef60f46",
+        "schema": "f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8",
+        "manifest": "898cf3c5ae4be331b75e97039b1f00229f3452a941bef60aa6b905fd9a81ead5",
+        "baseline_manifest": "70f6cc49a8de8f9668eba173fd3144ca99732ed75587eac25df57edf35b3dd45",
+        "baseline_status": "uncertain",
+        "plan": "f64e033e8e95b74ac794e7af80da30a0ff1bd2315a38993c4ece2220096e155b",
+        "destructive": true,
+        "counts": {
+          "create": 1,
+          "update": 0,
+          "replace": 1,
+          "delete": 1
+        },
+        "addresses": "6f6dbf3dd3704c14e5a3fbc6057bf1bc3934847a639adf38917cf9f6b9d9a6de"
+      },
+      "nonce": "def456",
+      "bytes_to_sign": "shoephone-apply-v1\nproject=infra-web\nrevision=5e3cf12147cca0b3d28c67be8bd1c482d2a84c03096cebbb57c83963cef60f46\nschema=f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8\nmanifest=898cf3c5ae4be331b75e97039b1f00229f3452a941bef60aa6b905fd9a81ead5\nbaseline_manifest=70f6cc49a8de8f9668eba173fd3144ca99732ed75587eac25df57edf35b3dd45\nbaseline_status=uncertain\nplan=f64e033e8e95b74ac794e7af80da30a0ff1bd2315a38993c4ece2220096e155b\ndestructive=1\ncreate=1\nupdate=0\nreplace=1\ndelete=1\naddresses=6f6dbf3dd3704c14e5a3fbc6057bf1bc3934847a639adf38917cf9f6b9d9a6de\nnonce=def456\n",
+      "challenge_sha256_hex": "ec1b458ff0d7d60a565bed9982e60981560948fd5f8e1af9810d25ed39188906",
+      "challenge_base64url": "7BtFj_DX1gpWW-2ZguYJgVYJSP1fjhr5gQ0l7TkYiQY"
+    },
+    {
+      "name": "apply with an applied baseline",
+      "kind": "apply",
+      "scope": {
+        "project": "infra-web",
+        "revision": "815aa351ae1e139bfc60fb6730f72989f82ad59671a83785e87f042d83817d77",
+        "schema": "f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8",
+        "manifest": "d4f65f9553d726b6f63cf36b999aa8aeed00fc600f31cbcc2a6230b349ff78ac",
+        "baseline_manifest": "898cf3c5ae4be331b75e97039b1f00229f3452a941bef60aa6b905fd9a81ead5",
+        "baseline_status": "applied",
+        "plan": "086cd9081c8ca8d97cb1a2734bd40f6ca82ac49d29e41ac6bc604f09c9544750",
+        "destructive": false,
+        "counts": {
+          "create": 0,
+          "update": 1,
+          "replace": 0,
+          "delete": 0
+        },
+        "addresses": "4c69040113aa99f8ba0963ac89feef2356af97f4d2f36f11bb100804ad9d6e31"
+      },
+      "nonce": "0a1b2c",
+      "bytes_to_sign": "shoephone-apply-v1\nproject=infra-web\nrevision=815aa351ae1e139bfc60fb6730f72989f82ad59671a83785e87f042d83817d77\nschema=f5957faf69c7a3a7c1eb328cb75af113a1401845a2ba851dd5ba69caef6d1ea8\nmanifest=d4f65f9553d726b6f63cf36b999aa8aeed00fc600f31cbcc2a6230b349ff78ac\nbaseline_manifest=898cf3c5ae4be331b75e97039b1f00229f3452a941bef60aa6b905fd9a81ead5\nbaseline_status=applied\nplan=086cd9081c8ca8d97cb1a2734bd40f6ca82ac49d29e41ac6bc604f09c9544750\ndestructive=0\ncreate=0\nupdate=1\nreplace=0\ndelete=0\naddresses=4c69040113aa99f8ba0963ac89feef2356af97f4d2f36f11bb100804ad9d6e31\nnonce=0a1b2c\n",
+      "challenge_sha256_hex": "106668c833ad989b81662bb6329178434391bc248e09e24a3f36eca3e09365d1",
+      "challenge_base64url": "EGZoyDOtmJuBZiu2MpF4Q0ORvCSOCeJKPzbso-CTZdE"
+    }
+  ]
+}

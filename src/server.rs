@@ -26,24 +26,31 @@
 //! [`Grants::approve`] when the assertion verifies. A request that changed
 //! underneath the ceremony is rejected there too.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use base64::Engine as _;
 use webauthn_rs::prelude::*;
 
 use crate::api::*;
 use crate::ca::{self, UserCa};
 use crate::config::Config;
 use crate::exit::VERSION;
-use crate::grant::{self, Approval, Entropy, Event, Grants, Pending, Refusal, Scope};
+use crate::grant::{self, Approval, Entropy, Event, Grants, Pending, Policy, Refusal, Scope};
+use crate::job::{
+    Failure, Job, JobEvent, JobKind, JobResult, JobScope, JobState, Jobs, TrustedRevision,
+};
 use crate::notify::{Apns, Delivery, Notifier, Push};
-use crate::store::{self, Device, EnrollCode, LedgerEntry, Store};
+use crate::runner_auth::{self, Verifier};
+use crate::scope::{self, Action, ApplyScope, BaselineStatus, Counts, TrustScope};
+use crate::store::{self, Device, EnrollCode, LedgerEntry, Store, TrustRecord};
 
 pub const PAGE: &str = include_str!("../assets/approve.html");
 
@@ -78,6 +85,36 @@ struct Inner {
     /// window's silent re-request that `Grants::issue` says to reuse gets
     /// back the identical certificate string. See the `issue` handler.
     issued: HashMap<u64, CachedCertificate>,
+    /// Terraform trust and apply jobs.
+    jobs: Jobs,
+    /// The decoded archive of each trust job, by job id, for the runner to
+    /// fetch. Dropped once the job leaves `Queued` and `Working`.
+    archives: HashMap<u64, Vec<u8>>,
+    /// What the approver reads to recompute a submitted scope's digests, by
+    /// job id, as the runner sent it. Dropped once the job leaves `Waiting`.
+    /// The pending view is built from a `Waiting` job and reads this beside
+    /// it, never from an entry here alone.
+    displays: HashMap<u64, DisplayWire>,
+    /// What each submitted apply would do, by job id, for `GET /api/job`.
+    /// Names and counts only. Kept after the job is done; dropped when the
+    /// job itself is gone from `jobs`.
+    summaries: HashMap<u64, SummaryView>,
+    /// The trust scope of each claimed trust job, so `finish` can record
+    /// what was trusted. Dropped when the job finishes.
+    claimed: HashMap<u64, TrustScope>,
+    /// What each project currently trusts; mirrors `trusted.json`.
+    trusted: BTreeMap<String, TrustRecord>,
+    /// Checks the runners' signatures and remembers their nonces.
+    verifier: Verifier,
+    /// What the requester said about itself, sanitized, by job id.
+    job_meta: HashMap<u64, JobMeta>,
+}
+
+/// The display-only fields of a job request, already sanitized.
+#[derive(Debug, Clone)]
+struct JobMeta {
+    requester: String,
+    context: Option<String>,
 }
 
 /// A signed certificate cached under its window's id. `Grants::issue`
@@ -94,10 +131,17 @@ struct CachedCertificate {
     window_ends_at: SystemTime,
 }
 
+/// What an approval ceremony is over: the SSH request or the Terraform job
+/// that was waiting when it started. At most one of the two exists.
+enum CeremonyScope {
+    Ssh(Scope),
+    Job(JobScope),
+}
+
 struct ApproveCeremony {
     id: u64,
     nonce: String,
-    scope: Scope,
+    scope: CeremonyScope,
     auth: SecurityKeyAuthentication,
     started: SystemTime,
 }
@@ -150,6 +194,16 @@ impl From<Refusal> for Fail {
             Refusal::ScopeMismatch => (S::FORBIDDEN, "scope_mismatch", None),
             Refusal::NoWindow => (S::NOT_FOUND, "no_window", None),
             Refusal::KeyMismatch => (S::FORBIDDEN, "key_mismatch", None),
+            Refusal::UnknownProject => (S::BAD_REQUEST, "unknown_project", None),
+            Refusal::ScopeFrozen => (S::CONFLICT, "scope_frozen", None),
+            Refusal::AlreadyClaimed => (S::CONFLICT, "already_claimed", None),
+            Refusal::WrongRunner => (S::FORBIDDEN, "wrong_runner", None),
+            Refusal::Stale => (S::CONFLICT, "stale", None),
+            Refusal::StaleSignature => (S::UNAUTHORIZED, "stale_signature", None),
+            Refusal::StaleBaseline => (S::CONFLICT, "stale_baseline", None),
+            Refusal::PlanTooOld => (S::CONFLICT, "plan_too_old", None),
+            Refusal::Untrusted => (S::CONFLICT, "untrusted", None),
+            Refusal::MalformedScope => (S::BAD_REQUEST, "malformed_scope", None),
         };
         Fail(
             status,
@@ -197,6 +251,32 @@ impl Daemon {
         }
         let next_id = store.load_next_id()?;
         let grants = Grants::new(config.policy(), config.principals.clone(), next_id);
+        let jobs = Jobs::new(
+            config
+                .projects
+                .iter()
+                .map(|(name, p)| (name.clone(), p.runner.clone()))
+                .collect(),
+        );
+        let mut jobs = jobs;
+        let mut trusted = BTreeMap::new();
+        for dropped in store.reconcile_trusted()? {
+            eprintln!(
+                "shoephoned: dropping trust for {:?} (job {}): no matching entry in the ledger",
+                dropped.project, dropped.job
+            );
+        }
+        for record in store.load_trusted()? {
+            jobs.set_trusted(
+                &record.project,
+                Some(TrustedRevision {
+                    digest: record.digest.clone(),
+                    schema: record.schema.clone(),
+                }),
+            );
+            trusted.insert(record.project.clone(), record);
+        }
+        let verifier = Verifier::new(config.runner_keys()?);
         let notifier = config.notify.clone().map(|n| Arc::new(Notifier::new(n)));
         let apns = match config.apns.clone() {
             Some(c) => {
@@ -225,6 +305,14 @@ impl Daemon {
                 ledger_failed: None,
                 persisted_next_id: next_id,
                 issued: HashMap::new(),
+                jobs,
+                archives: HashMap::new(),
+                displays: HashMap::new(),
+                summaries: HashMap::new(),
+                claimed: HashMap::new(),
+                trusted,
+                verifier,
+                job_meta: HashMap::new(),
             }),
         })
     }
@@ -253,11 +341,11 @@ impl Daemon {
     fn with<T>(&self, f: impl FnOnce(&mut Inner) -> T) -> T {
         let mut inner = self.inner.lock().expect("daemon lock");
         let out = f(&mut inner);
-        let events = self.drain_and_append(&mut inner);
+        let pushes = self.drain_and_append(&mut inner);
         let targets = push_targets(&inner);
         let badge = badge_count(&mut inner, SystemTime::now());
         drop(inner);
-        self.dispatch_pushes(&events, targets, badge);
+        self.dispatch_pushes(pushes, targets, badge);
         out
     }
 
@@ -272,17 +360,44 @@ impl Daemon {
     /// result, so nothing further is granted on the strength of a decision
     /// this daemon cannot prove it recorded.
     fn audited<T>(&self, f: impl FnOnce(&mut Inner) -> Result<T, Fail>) -> Result<T, Fail> {
+        self.audited_or_undo(|inner| f(inner).map(|t| (t, ())), |_, ()| ())
+    }
+
+    /// [`Daemon::audited`] for a change the caller can take back. `f` returns
+    /// its result and whatever `undo` needs; if the ledger append then
+    /// fails, `undo` runs under the same lock, before any other caller can
+    /// see the change, and the caller is told `ledger_unavailable`. `undo`
+    /// does not run when `f` itself failed, so `f` must not change state on
+    /// an error path. When `undo` runs, the pushes for the call's events are
+    /// discarded: the ledger holds no line for them and the change no longer
+    /// stands, so the phone is not told.
+    fn audited_or_undo<T, U>(
+        &self,
+        f: impl FnOnce(&mut Inner) -> Result<(T, U), Fail>,
+        undo: impl FnOnce(&mut Inner, U),
+    ) -> Result<T, Fail> {
         let mut inner = self.inner.lock().expect("daemon lock");
         if inner.ledger_failed.is_some() {
             return Err(Self::ledger_unavailable());
         }
         let out = f(&mut inner);
-        let events = self.drain_and_append(&mut inner);
+        let mut pushes = self.drain_and_append(&mut inner);
         let append_failed = inner.ledger_failed.is_some();
+        let out = match out {
+            Ok((_, taken)) if append_failed => {
+                undo(&mut inner, taken);
+                // The change was taken back and its ledger line was not
+                // written, so the phone must not be told it happened.
+                pushes.clear();
+                Err(Self::ledger_unavailable())
+            }
+            Ok((value, _)) => Ok(value),
+            Err(e) => Err(e),
+        };
         let targets = push_targets(&inner);
         let badge = badge_count(&mut inner, SystemTime::now());
         drop(inner);
-        self.dispatch_pushes(&events, targets, badge);
+        self.dispatch_pushes(pushes, targets, badge);
         if append_failed {
             return Err(Self::ledger_unavailable());
         }
@@ -306,10 +421,15 @@ impl Daemon {
     /// `issue` each push one when they call `take_id`), so this never does
     /// avoidable work, but it also never assumes that pairing rather than
     /// re-deriving it, which is one fewer thing to keep in sync by hand.
-    fn drain_and_append(&self, inner: &mut Inner) -> Vec<Event> {
+    fn drain_and_append(&self, inner: &mut Inner) -> Vec<Push> {
         let events = inner.grants.take_events();
-        if !events.is_empty() {
-            let entries: Vec<LedgerEntry> = events.iter().map(LedgerEntry::from).collect();
+        let job_events = inner.jobs.take_events();
+        if !events.is_empty() || !job_events.is_empty() {
+            let entries: Vec<LedgerEntry> = events
+                .iter()
+                .map(LedgerEntry::from)
+                .chain(job_events.iter().map(LedgerEntry::from))
+                .collect();
             if let Err(e) = self.store.append_ledger(&entries) {
                 eprintln!("shoephoned: ledger: {e}");
                 inner.ledger_failed = Some(e);
@@ -326,6 +446,10 @@ impl Daemon {
             }
         }
         events
+            .iter()
+            .map(push_for)
+            .chain(job_events.iter().map(push_for_job))
+            .collect()
     }
 
     /// Send the content-free pushes for this call's events. Always called
@@ -334,14 +458,13 @@ impl Daemon {
     /// caller is waiting on the daemon lock.
     fn dispatch_pushes(
         &self,
-        events: &[Event],
+        pushes: Vec<Push>,
         targets: Vec<(String, Option<Vec<String>>)>,
         badge: u64,
     ) {
-        if events.is_empty() {
+        if pushes.is_empty() {
             return;
         }
-        let pushes: Vec<Push> = events.iter().map(push_for).collect();
         if let Some(n) = &self.notifier
             && !pushes.is_empty()
         {
@@ -397,6 +520,24 @@ impl Daemon {
             .route("/api/request", post(request))
             .route("/api/request/{id}", get(poll))
             .route("/api/issue", post(issue))
+            .route(
+                "/api/trust",
+                post(trust).layer(DefaultBodyLimit::max(TRUST_BODY_LIMIT)),
+            )
+            .route(
+                "/api/apply",
+                post(apply).layer(DefaultBodyLimit::max(APPLY_BODY_LIMIT)),
+            )
+            .route("/api/job/{id}", get(job))
+            .route("/api/runner/poll", post(runner_poll))
+            .route("/api/runner/archive/{id}", get(runner_archive))
+            .route(
+                "/api/runner/submit",
+                post(runner_submit).layer(DefaultBodyLimit::max(SUBMIT_BODY_LIMIT)),
+            )
+            .route("/api/runner/refuse", post(runner_refuse))
+            .route("/api/runner/claim", post(runner_claim))
+            .route("/api/runner/finish", post(runner_finish))
             .route("/api/kill", post(kill))
             .route("/api/pending", get(pending))
             .route("/api/approve/start", post(approve_start))
@@ -407,10 +548,19 @@ impl Daemon {
             .route("/api/push/register", post(push_register))
             .route("/api/ledger", get(ledger));
         #[cfg(feature = "test-hooks")]
-        let router = router.route("/api/test/approve", post(test_approve));
+        let router = router
+            .route("/api/test/approve", post(test_approve))
+            .route("/api/test/approve_job", post(test_approve_job));
         router.with_state(self)
     }
 }
+
+/// Request body limit for `trust`: the archive's base64 form plus JSON.
+const TRUST_BODY_LIMIT: usize = MAX_ARCHIVE_BYTES / 3 * 4 + 4 * 1024 + 4;
+
+/// Request body limit for `apply`: a manifest of 64 KiB can double in size
+/// once JSON-escaped, so leave room for that and the other fields.
+const APPLY_BODY_LIMIT: usize = MAX_MANIFEST_BYTES * 2 + 16 * 1024;
 
 type App = State<Arc<Daemon>>;
 
@@ -423,9 +573,10 @@ fn now() -> SystemTime {
 /// is waiting. Computed under the lock beside the targets, because by the
 /// time the push is sent the lock is gone and the state may have moved.
 ///
-/// The daemon holds at most one pending request, so this is windows + 0 or 1.
+/// The daemon holds at most one pending request or waiting job, so this is
+/// windows + 0 or 1.
 fn badge_count(inner: &mut Inner, now: SystemTime) -> u64 {
-    inner.grants.outstanding(now)
+    inner.grants.outstanding(now) + u64::from(inner.jobs.waiting(now).is_some())
 }
 
 /// Every ledger event becomes a push; the device, not the daemon, keeps the
@@ -440,6 +591,36 @@ fn push_for(event: &Event) -> Push {
         Event::Declined { .. } => Push::RequestDeclined,
         Event::TimedOut { .. } => Push::RequestTimedOut,
         Event::Killed { .. } => Push::WindowKilled,
+    }
+}
+
+/// Every job event becomes a push too, so the audit rule holds for
+/// Terraform jobs as it does for SSH windows. Exhaustive for the same
+/// reason as [`push_for`]. Only a `Waiting` job interrupts; a filed request
+/// is a quiet record, because nobody is asked until a plan is ready.
+/// `kind` is `"trust"` or `"apply"`.
+fn push_for_job(event: &JobEvent) -> Push {
+    match event {
+        JobEvent::Requested { .. } => Push::JobRequested,
+        JobEvent::Started { .. } => Push::PlanStarted,
+        JobEvent::Waiting { kind, .. } => match *kind {
+            "trust" => Push::TrustWaiting,
+            "apply" => Push::ApplyWaiting,
+            other => {
+                // `JobKind::name` returns only the two above.
+                debug_assert!(false, "unknown job kind {other:?}");
+                Push::ApplyWaiting
+            }
+        },
+        JobEvent::Approved { .. } => Push::JobApproved,
+        JobEvent::Refused { .. } => Push::PlanRefused,
+        JobEvent::Applied { .. } => Push::Applied,
+        JobEvent::Trusted { .. } => Push::Trusted,
+        JobEvent::ApplyFailed { .. } => Push::ApplyFailed,
+        JobEvent::OutcomeUnknown { .. } => Push::OutcomeUnknown,
+        JobEvent::Declined { .. } => Push::RequestDeclined,
+        JobEvent::TimedOut { .. } => Push::RequestTimedOut,
+        JobEvent::Killed { .. } => Push::JobKilled,
     }
 }
 
@@ -532,10 +713,16 @@ async fn page() -> Html<&'static str> {
 
 async fn status(State(d): App) -> Reply<StatusReply> {
     let now = now();
-    let (devices, windows) = d.with(|inner| {
+    let policy = d.config.policy();
+    let (devices, windows, job) = d.with(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
         (
             inner.devices.iter().map(|x| x.name.clone()).collect(),
             window_views(inner, now),
+            inner
+                .jobs
+                .active(now)
+                .map(|j| job_status(j, inner.summaries.get(&j.id))),
         )
     });
     Ok(Json(StatusReply {
@@ -544,6 +731,7 @@ async fn status(State(d): App) -> Reply<StatusReply> {
         devices,
         windows,
         ca_fingerprint: d.ca.fingerprint().to_string(),
+        job,
     }))
 }
 
@@ -701,30 +889,376 @@ fn prune_issued_cache(inner: &mut Inner, now: SystemTime) {
 
 async fn kill(State(d): App, Json(body): Json<KillBody>) -> Reply<serde_json::Value> {
     let now = now();
-    d.with(|inner| {
-        inner.grants.kill(now, &body.host)?;
-        // A ceremony for the request that kill just declined is stale.
-        if inner.grants.pending(now).is_none() {
-            inner.approve = None;
+    match (body.host, body.project) {
+        (Some(host), None) => {
+            d.with(|inner| {
+                inner.grants.kill(now, &host)?;
+                // A ceremony for the request that kill just declined is stale.
+                if inner.grants.pending(now).is_none() {
+                    inner.approve = None;
+                }
+                Ok::<_, Refusal>(())
+            })?;
+            Ok(Json(serde_json::json!({ "killed": host })))
         }
-        Ok::<_, Refusal>(())
-    })?;
-    Ok(Json(serde_json::json!({ "killed": body.host })))
+        (None, Some(project)) => {
+            let policy = d.config.policy();
+            d.with(|inner| {
+                inner
+                    .jobs
+                    .kill(now, inner.grants.gate_mut(), &policy, &project)
+            })?;
+            Ok(Json(serde_json::json!({ "killed": project })))
+        }
+        _ => Err(Fail::new(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "kill takes exactly one of host or project",
+        )),
+    }
+}
+
+/// Keep a requester-supplied link only if it is a short https URL without
+/// whitespace, as `Grants::request` does.
+fn clean_context(context: Option<&str>) -> Option<String> {
+    context
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .map(|c| grant::printable(c, 512))
+        .filter(|c| c.starts_with("https://") && !c.chars().any(char::is_whitespace))
+}
+
+fn too_large(code: &str, what: &str) -> Fail {
+    Fail::new(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        code,
+        format!("{what} is too large"),
+    )
+}
+
+/// File a job and keep what goes beside it. `archive` is the decoded trust
+/// archive, if any. The id is taken only once the job is accepted, so a
+/// refusal does not burn one.
+fn file_job(
+    d: &Daemon,
+    project: &str,
+    kind: JobKind,
+    archive: Option<Vec<u8>>,
+    reason: &str,
+    requester: &str,
+    context: Option<&str>,
+) -> Result<(Job, u64), Fail> {
+    let now = now();
+    let policy = d.config.policy();
+    let meta = JobMeta {
+        requester: grant::printable(requester, 64),
+        context: clean_context(context),
+    };
+    d.audited(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        prune_jobs(inner, now);
+        let id = inner.grants.next_id();
+        let mut entropy = ca::OsEntropy;
+        let job = inner.jobs.request(
+            now,
+            inner.grants.gate_mut(),
+            &policy,
+            &mut entropy,
+            id,
+            project,
+            kind,
+            reason,
+        )?;
+        let taken = inner.grants.allocate_id();
+        debug_assert_eq!(taken, id, "the id peeked is the id taken");
+        if let Some(bytes) = archive {
+            inner.archives.insert(id, bytes);
+        }
+        inner.job_meta.insert(id, meta);
+        let expires = store::unix(job.created + policy.plan_timeout);
+        Ok((job, expires))
+    })
+}
+
+/// Drop what the daemon keeps beside a job once the job has moved past the
+/// stage that needs it: the archive once the job is neither `Queued` nor
+/// `Working`, the display once it is not `Waiting`, the claimed trust scope
+/// once it is not `Claimed`, and the requester notes once it is over.
+fn prune_jobs(inner: &mut Inner, now: SystemTime) {
+    let ids: HashSet<u64> = inner
+        .archives
+        .keys()
+        .chain(inner.job_meta.keys())
+        .chain(inner.displays.keys())
+        .chain(inner.summaries.keys())
+        .chain(inner.claimed.keys())
+        .copied()
+        .collect();
+    for id in ids {
+        // (queued or working, waiting, claimed, over)
+        let (early, waiting, claimed, over) = match inner.jobs.job(now, id).map(|j| &j.state) {
+            None => (false, false, false, true),
+            Some(JobState::Queued | JobState::Working { .. }) => (true, false, false, false),
+            Some(JobState::Waiting { .. }) => (false, true, false, false),
+            Some(JobState::Claimed) => (false, false, true, false),
+            Some(JobState::Approved { .. }) => (false, false, false, false),
+            Some(JobState::Done(_)) => (false, false, false, true),
+        };
+        if !early {
+            inner.archives.remove(&id);
+        }
+        if !waiting {
+            inner.displays.remove(&id);
+        }
+        if !claimed {
+            inner.claimed.remove(&id);
+        }
+        if over {
+            inner.job_meta.remove(&id);
+        }
+        if inner.jobs.job(now, id).is_none() {
+            inner.summaries.remove(&id);
+        }
+    }
+}
+
+/// Names of the top-level manifest keys whose values differ between
+/// `manifest` and `baseline` (absent counts as an empty object), sorted.
+/// Names only: a value never leaves this function.
+fn changed_variables(manifest: &str, baseline: Option<&str>) -> Vec<String> {
+    let object = |text: &str| match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let (new, old) = (object(manifest), baseline.map(object).unwrap_or_default());
+    let names: std::collections::BTreeSet<&String> = new.keys().chain(old.keys()).collect();
+    names
+        .into_iter()
+        .filter(|k| new.get(*k) != old.get(*k))
+        .cloned()
+        .collect()
+}
+
+/// The agent's view of a submitted apply, from the scope and display the
+/// daemon has just checked against each other.
+fn apply_summary(scope: &ApplyScopeWire, display: &DisplayWire) -> SummaryView {
+    let lines: Vec<&str> = display
+        .address_text
+        .as_deref()
+        .unwrap_or("")
+        .lines()
+        .collect();
+    SummaryView {
+        create: scope.counts.create,
+        update: scope.counts.update,
+        replace: scope.counts.replace,
+        delete: scope.counts.delete,
+        addresses: lines
+            .iter()
+            .take(MAX_SUMMARY_ADDRESSES)
+            .map(|l| (*l).to_owned())
+            .collect(),
+        addresses_omitted: lines.len().saturating_sub(MAX_SUMMARY_ADDRESSES) as u32,
+        variables: changed_variables(
+            display.manifest.as_deref().unwrap_or("{}"),
+            display.baseline_manifest.as_deref(),
+        ),
+        baseline_status: scope.baseline_status.clone(),
+    }
+}
+
+/// Refuse a request the daemon would refuse anyway before spending any work
+/// on its payload. Read-only; `file_job` still decides, under the lock.
+fn precheck_job(d: &Daemon, project: &str) -> Result<(), Fail> {
+    let (now, policy) = (now(), d.config.policy());
+    d.audited(|inner| {
+        // Settle anything that has timed out first, as `file_job` does, so a
+        // lapsed job does not make this say `busy`.
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        prune_jobs(inner, now);
+        inner
+            .jobs
+            .precheck(now, inner.grants.gate_mut(), &policy, project)
+            .map_err(Fail::from)
+    })
+}
+
+async fn trust(State(d): App, Json(body): Json<TrustBody>) -> Reply<JobReply> {
+    precheck_job(&d, &body.project)?;
+    // Bound the work before doing any of it: base64 grows data by 4/3.
+    if body.archive.len() > MAX_ARCHIVE_BYTES.div_ceil(3) * 4 {
+        return Err(too_large("archive_too_large", "the archive"));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(body.archive.as_bytes())
+        .map_err(|e| Fail::new(StatusCode::BAD_REQUEST, "bad_archive", e.to_string()))?;
+    if bytes.len() > MAX_ARCHIVE_BYTES {
+        return Err(too_large("archive_too_large", "the archive"));
+    }
+    let digest = scope::challenge_of(&bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let (job, expires) = file_job(
+        &d,
+        &body.project,
+        JobKind::Trust {
+            archive_sha256: digest,
+        },
+        Some(bytes),
+        &body.reason,
+        &body.requester,
+        body.context.as_deref(),
+    )?;
+    Ok(Json(JobReply {
+        id: job.id,
+        match_code: job.match_code,
+        expires,
+    }))
+}
+
+async fn apply(State(d): App, Json(body): Json<ApplyBody>) -> Reply<JobReply> {
+    precheck_job(&d, &body.project)?;
+    if body.manifest.len() > MAX_MANIFEST_BYTES {
+        return Err(too_large("manifest_too_large", "the manifest"));
+    }
+    let (job, expires) = file_job(
+        &d,
+        &body.project,
+        JobKind::Apply {
+            manifest: body.manifest,
+            allow_destroy: body.allow_destroy,
+        },
+        None,
+        &body.reason,
+        &body.requester,
+        body.context.as_deref(),
+    )?;
+    Ok(Json(JobReply {
+        id: job.id,
+        match_code: job.match_code,
+        expires,
+    }))
+}
+
+fn result_name(r: &JobResult) -> &'static str {
+    match r {
+        JobResult::Trusted => "trusted",
+        JobResult::Applied => "applied",
+        JobResult::Refused(_) => "refused",
+        JobResult::PlanFailed(_) => "plan_failed",
+        JobResult::ApplyFailed(_) => "apply_failed",
+        JobResult::OutcomeUnknown => "outcome_unknown",
+        JobResult::Declined => "declined",
+        JobResult::TimedOut => "timed_out",
+        JobResult::Killed => "killed",
+    }
+}
+
+/// The agent's view of a job. It names the state and the result and nothing
+/// else about the contents: no manifest, no archive.
+fn job_status(job: &Job, summary: Option<&SummaryView>) -> JobStatus {
+    let (kind, state, result) = (
+        match job.kind {
+            JobKind::Trust { .. } => "trust",
+            JobKind::Apply { .. } => "apply",
+        },
+        match &job.state {
+            JobState::Queued => "queued",
+            JobState::Working { .. } => "working",
+            JobState::Waiting { .. } => "waiting",
+            JobState::Approved { .. } => "approved",
+            JobState::Claimed => "claimed",
+            JobState::Done(_) => "done",
+        },
+        match &job.state {
+            JobState::Done(r) => Some(result_name(r).to_owned()),
+            _ => None,
+        },
+    );
+    JobStatus {
+        id: job.id,
+        project: job.project.clone(),
+        kind: kind.to_owned(),
+        state: state.to_owned(),
+        result,
+        failure: match &job.state {
+            JobState::Done(
+                JobResult::Refused(f) | JobResult::PlanFailed(f) | JobResult::ApplyFailed(f),
+            ) => Some(failure_view(f)),
+            _ => None,
+        },
+        summary: summary.cloned(),
+    }
+}
+
+async fn job(State(d): App, Path(id): Path<u64>) -> Reply<JobStatus> {
+    let now = now();
+    let policy = d.config.policy();
+    let status = d.with(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        inner
+            .jobs
+            .job(now, id)
+            .map(|j| job_status(j, inner.summaries.get(&j.id)))
+    });
+    status
+        .map(Json)
+        .ok_or_else(|| Fail::new(StatusCode::NOT_FOUND, "no_such_job", "no job with that id"))
 }
 
 async fn pending(State(d): App) -> Reply<ApproverState> {
-    let now = now();
-    let ttl = d.config.policy().pending_ttl;
-    let state = d.with(|inner| ApproverState {
-        pending: inner.grants.pending(now).map(|p| pending_view(p, ttl)),
-        enrolled: inner.devices.len(),
-        windows: window_views(inner, now),
+    let (now, policy) = (now(), d.config.policy());
+    let ttl = policy.pending_ttl;
+    let state = d.with(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        prune_jobs(inner, now);
+        ApproverState {
+            pending: inner.grants.pending(now).map(|p| pending_view(p, ttl)),
+            job: job_pending_view(inner, now, &policy),
+            enrolled: inner.devices.len(),
+            windows: window_views(inner, now),
+        }
     });
     Ok(Json(state))
 }
 
+/// The approver's view of the job waiting on them. Built from the job
+/// itself, only while it is `Waiting`; the display text is read beside it
+/// and an entry in `displays` without a waiting job shows nothing.
+fn job_pending_view(inner: &mut Inner, now: SystemTime, policy: &Policy) -> Option<JobPendingView> {
+    let job = inner.jobs.waiting(now)?.clone();
+    let JobState::Waiting {
+        scope,
+        nonce,
+        since,
+    } = &job.state
+    else {
+        return None;
+    };
+    let meta = inner.job_meta.get(&job.id);
+    Some(JobPendingView {
+        id: job.id,
+        project: job.project.clone(),
+        kind: match job.kind {
+            JobKind::Trust { .. } => "trust",
+            JobKind::Apply { .. } => "apply",
+        }
+        .to_owned(),
+        match_code: job.match_code.clone(),
+        nonce: nonce.clone(),
+        reason: job.reason.clone(),
+        requester: meta.map(|m| m.requester.clone()).unwrap_or_default(),
+        context: meta.and_then(|m| m.context.clone()),
+        created: store::unix(job.created),
+        expires: store::unix(*since + policy.approval_ttl),
+        scope: scope_to_wire(scope),
+        display: inner.displays.get(&job.id).cloned().unwrap_or_default(),
+    })
+}
+
 async fn approve_start(State(d): App, Json(body): Json<ById>) -> Reply<RequestChallengeResponse> {
-    let now = now();
+    let (now, policy) = (now(), d.config.policy());
     d.with(|inner| {
         if inner.devices.is_empty() {
             return Err(Fail::new(
@@ -733,23 +1267,41 @@ async fn approve_start(State(d): App, Json(body): Json<ById>) -> Reply<RequestCh
                 "no approver device is enrolled; run `shoephoned enroll` at the console",
             ));
         }
-        let p = inner
-            .grants
-            .pending(now)
-            .filter(|p| p.id == body.id)
-            .cloned()
-            .ok_or(Refusal::NoSuchRequest)?;
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        // At most one of an SSH request and a job is waiting, so whichever
+        // has this id is the subject of the ceremony.
+        let (nonce, scope) = match inner.grants.pending(now).filter(|p| p.id == body.id) {
+            Some(p) => (p.nonce.clone(), CeremonyScope::Ssh(p.scope.clone())),
+            None => match inner.jobs.waiting(now) {
+                Some(Job {
+                    id,
+                    state: JobState::Waiting { scope, nonce, .. },
+                    ..
+                }) if *id == body.id => (nonce.clone(), CeremonyScope::Job(scope.clone())),
+                _ => return Err(Refusal::NoSuchRequest.into()),
+            },
+        };
+        let bound = match &scope {
+            CeremonyScope::Ssh(s) => Some(grant::bound_challenge(s, &nonce)),
+            CeremonyScope::Job(s) => s.bytes_to_sign(&nonce).map(|b| scope::challenge_of(&b)),
+        }
+        .ok_or_else(|| {
+            Fail::new(
+                StatusCode::CONFLICT,
+                "malformed_scope",
+                "the waiting scope is malformed and cannot be signed",
+            )
+        })?;
         let keys: Vec<SecurityKey> = inner.devices.iter().map(|x| x.key.clone()).collect();
         let (challenge, auth) = d
             .webauthn
             .start_securitykey_authentication(&keys)
             .map_err(|e| Fail::internal(format!("webauthn: {e}")))?;
-        let bound = grant::bound_challenge(&p.scope, &p.nonce);
         let (challenge, auth) = bind_challenge(challenge, auth, &bound).map_err(Fail::internal)?;
         inner.approve = Some(ApproveCeremony {
-            id: p.id,
-            nonce: p.nonce,
-            scope: p.scope,
+            id: body.id,
+            nonce,
+            scope,
             auth,
             started: now,
         });
@@ -761,7 +1313,7 @@ async fn approve_finish(
     State(d): App,
     Json(body): Json<ApproveFinish<PublicKeyCredential>>,
 ) -> Reply<serde_json::Value> {
-    let now = now();
+    let (now, policy) = (now(), d.config.policy());
     d.audited(|inner| {
         let ceremony = inner
             .approve
@@ -803,26 +1355,55 @@ async fn approve_finish(
                 .save_devices(&inner.devices)
                 .map_err(Fail::internal)?;
         }
-        let approval = Approval {
-            id: ceremony.id,
-            nonce: ceremony.nonce,
-            scope: ceremony.scope,
-        };
-        let window = inner.grants.approve(now, &approval)?;
-        Ok(Json(serde_json::json!({
-            "approved": window.id,
-            "host": window.scope.host,
-            "ends_at": store::unix(window.scope.ends_at),
-            "device": device_name,
-        })))
+        match ceremony.scope {
+            CeremonyScope::Ssh(scope) => {
+                let approval = Approval {
+                    id: ceremony.id,
+                    nonce: ceremony.nonce,
+                    scope,
+                };
+                let window = inner.grants.approve(now, &approval)?;
+                Ok(Json(serde_json::json!({
+                    "approved": window.id,
+                    "host": window.scope.host,
+                    "ends_at": store::unix(window.scope.ends_at),
+                    "device": device_name,
+                })))
+            }
+            CeremonyScope::Job(scope) => {
+                // A trust is judged against the baseline now on disk, as the
+                // runner endpoints do, so an `untrust` since the last look
+                // counts.
+                refresh_trusted(&d, inner)?;
+                inner.jobs.approve(
+                    now,
+                    inner.grants.gate_mut(),
+                    &policy,
+                    ceremony.id,
+                    &ceremony.nonce,
+                    &scope,
+                )?;
+                Ok(Json(serde_json::json!({
+                    "approved": ceremony.id,
+                    "device": device_name,
+                })))
+            }
+        }
     })
 }
 
 async fn decline(State(d): App, Json(body): Json<ById>) -> Reply<serde_json::Value> {
-    let now = now();
+    let (now, policy) = (now(), d.config.policy());
     d.with(|inner| {
         inner.approve = None;
-        inner.grants.decline(now, body.id)
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        if inner.jobs.waiting(now).is_some_and(|j| j.id == body.id) {
+            inner
+                .jobs
+                .decline(now, inner.grants.gate_mut(), &policy, body.id)
+        } else {
+            inner.grants.decline(now, body.id)
+        }
     })?;
     Ok(Json(serde_json::json!({ "declined": body.id })))
 }
@@ -1128,14 +1709,16 @@ async fn ledger(State(d): App, Query(q): Query<LedgerQuery>) -> Reply<Vec<Ledger
 /// and deployed builds must not.
 #[cfg(feature = "test-hooks")]
 async fn test_approve(State(d): App, Json(body): Json<ById>) -> Reply<serde_json::Value> {
-    let now = now();
+    let (now, policy) = (now(), d.config.policy());
     d.audited(|inner| {
-        let p = inner
+        let Some(p) = inner
             .grants
             .pending(now)
             .filter(|p| p.id == body.id)
             .cloned()
-            .ok_or(Refusal::NoSuchRequest)?;
+        else {
+            return approve_waiting_job(&d, inner, now, &policy, body.id);
+        };
         let window = inner.grants.approve(
             now,
             &Approval {
@@ -1148,8 +1731,949 @@ async fn test_approve(State(d): App, Json(body): Json<ById>) -> Reply<serde_json
     })
 }
 
+// ---------------------------------------------------------------------
+// Runner endpoints
+// ---------------------------------------------------------------------
+
+/// Header carrying the request's Unix time in seconds.
+const TIMESTAMP_HEADER: &str = "shoephone-runner-timestamp";
+/// Header carrying the request's single-use nonce.
+const NONCE_HEADER: &str = "shoephone-runner-nonce";
+
+/// Request body limit for `submit`: a diff and a manifest in JSON.
+const SUBMIT_BODY_LIMIT: usize = 8 * 1024 * 1024;
+
+/// A runner refusal is a 401 whichever way the signature failed; the other
+/// meanings of these refusals keep their statuses elsewhere.
+fn runner_refusal(r: Refusal) -> Fail {
+    match r {
+        Refusal::WrongRunner => Fail::new(
+            StatusCode::UNAUTHORIZED,
+            "wrong_runner",
+            "the request is not signed by a known runner",
+        ),
+        Refusal::StaleSignature => Fail::new(
+            StatusCode::UNAUTHORIZED,
+            "stale_signature",
+            "the request is stale or was replayed",
+        ),
+        other => other.into(),
+    }
+}
+
+/// Verify a runner request and return the runner's name. `job` is the id
+/// the signature covers: the body's, the path's, or none.
+fn authenticate(
+    d: &Daemon,
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    job: Option<u64>,
+) -> Result<String, Fail> {
+    let unsigned = || {
+        Fail::new(
+            StatusCode::UNAUTHORIZED,
+            "unsigned",
+            "the request lacks a runner signature, timestamp or nonce",
+        )
+    };
+    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    let runner = get(runner_auth::RUNNER_HEADER).ok_or_else(unsigned)?;
+    let signature = get(runner_auth::SIGNATURE_HEADER).ok_or_else(unsigned)?;
+    let nonce = get(NONCE_HEADER).ok_or_else(unsigned)?;
+    let timestamp: u64 = get(TIMESTAMP_HEADER)
+        .and_then(|t| t.parse().ok())
+        .ok_or_else(unsigned)?;
+    d.with(|inner| {
+        inner.verifier.verify(
+            now(),
+            Instant::now(),
+            runner,
+            signature,
+            (method, path, body, job, timestamp, nonce),
+        )
+    })
+    .map_err(runner_refusal)?;
+    Ok(runner.to_owned())
+}
+
+/// The `id` a runner request body names, read before the signature is
+/// checked only so the signed message can be rebuilt. Nothing else in the
+/// body is looked at until the signature holds.
+fn body_id(body: &[u8]) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        id: Option<u64>,
+    }
+    serde_json::from_slice::<Peek>(body).ok().and_then(|p| p.id)
+}
+
+fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Fail> {
+    serde_json::from_slice(body)
+        .map_err(|e| Fail::new(StatusCode::BAD_REQUEST, "bad_request", e.to_string()))
+}
+
+fn bad_request(error: impl Into<String>) -> Fail {
+    Fail::new(StatusCode::BAD_REQUEST, "bad_request", error)
+}
+
+fn inconsistent(error: impl Into<String>) -> Fail {
+    Fail::new(StatusCode::BAD_REQUEST, "inconsistent_scope", error)
+}
+
+fn failure_from_view(v: FailureView) -> Result<Failure, Fail> {
+    let category_ok = (1..=64).contains(&v.category.len())
+        && v.category
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+    if !category_ok {
+        return Err(bad_request("failure category must match [a-z0-9_]{1,64}"));
+    }
+    Ok(Failure {
+        category: v.category,
+        addresses: v
+            .addresses
+            .iter()
+            .take(1000)
+            .map(|a| grant::printable(a, 512))
+            .collect(),
+        detail: v.detail.map(|d| grant::printable(&d, 2048)),
+    })
+}
+
+fn failure_view(f: &Failure) -> FailureView {
+    FailureView {
+        category: f.category.clone(),
+        addresses: f.addresses.clone(),
+        detail: f.detail.clone(),
+    }
+}
+
+fn baseline_name(b: BaselineStatus) -> &'static str {
+    match b {
+        BaselineStatus::None => "none",
+        BaselineStatus::Applied => "applied",
+        BaselineStatus::Uncertain => "uncertain",
+    }
+}
+
+fn scope_from_wire(w: JobScopeWire) -> Result<JobScope, Fail> {
+    Ok(match w {
+        JobScopeWire::Trust(t) => JobScope::Trust(TrustScope {
+            project: t.project,
+            baseline: t.baseline,
+            candidate: t.candidate,
+            diff: t.diff,
+            schema: t.schema,
+            policy_version: t.policy_version,
+            files_changed: t.files_changed,
+            lines_added: t.lines_added,
+            lines_removed: t.lines_removed,
+            schema_changed: t.schema_changed,
+        }),
+        JobScopeWire::Apply(a) => JobScope::Apply(ApplyScope {
+            project: a.project,
+            revision: a.revision,
+            schema: a.schema,
+            manifest: a.manifest,
+            baseline_manifest: a.baseline_manifest,
+            baseline_status: match a.baseline_status.as_str() {
+                "none" => BaselineStatus::None,
+                "applied" => BaselineStatus::Applied,
+                "uncertain" => BaselineStatus::Uncertain,
+                other => return Err(bad_request(format!("unknown baseline_status {other:?}"))),
+            },
+            plan: a.plan,
+            destructive: a.destructive,
+            counts: Counts {
+                create: a.counts.create,
+                update: a.counts.update,
+                replace: a.counts.replace,
+                delete: a.counts.delete,
+            },
+            addresses: a.addresses,
+        }),
+    })
+}
+
+fn scope_to_wire(s: &JobScope) -> JobScopeWire {
+    match s {
+        JobScope::Trust(t) => JobScopeWire::Trust(TrustScopeWire {
+            project: t.project.clone(),
+            baseline: t.baseline.clone(),
+            candidate: t.candidate.clone(),
+            diff: t.diff.clone(),
+            schema: t.schema.clone(),
+            policy_version: t.policy_version,
+            files_changed: t.files_changed,
+            lines_added: t.lines_added,
+            lines_removed: t.lines_removed,
+            schema_changed: t.schema_changed,
+        }),
+        JobScope::Apply(a) => JobScopeWire::Apply(ApplyScopeWire {
+            project: a.project.clone(),
+            revision: a.revision.clone(),
+            schema: a.schema.clone(),
+            manifest: a.manifest.clone(),
+            baseline_manifest: a.baseline_manifest.clone(),
+            baseline_status: baseline_name(a.baseline_status).to_owned(),
+            plan: a.plan.clone(),
+            destructive: a.destructive,
+            counts: CountsWire {
+                create: a.counts.create,
+                update: a.counts.update,
+                replace: a.counts.replace,
+                delete: a.counts.delete,
+            },
+            addresses: a.addresses.clone(),
+        }),
+    }
+}
+
+/// Parse `"{action} {address}\n"` lines; `None` unless the text is exactly
+/// what [`scope::address_text`] would write for the changes it names.
+fn parse_address_text(text: &str) -> Option<Vec<(Action, String)>> {
+    let mut changes = Vec::new();
+    for line in text.split_terminator('\n') {
+        let (action, address) = line.split_once(' ')?;
+        let action = match action {
+            "create" => Action::Create,
+            "update" => Action::Update,
+            "replace" => Action::Replace,
+            "delete" => Action::Delete,
+            _ => return None,
+        };
+        changes.push((action, address.to_owned()));
+    }
+    (scope::address_text(&changes).as_deref() == Some(text)).then_some(changes)
+}
+
+/// A JSON value that deserializes only when no object in it repeats a key.
+/// `serde_json::Value` keeps the last duplicate, which would let the approve
+/// page and the runner read different values.
+struct NoDuplicateKeys;
+
+impl<'de> serde::Deserialize<'de> for NoDuplicateKeys {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, SeqAccess, Visitor};
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = NoDuplicateKeys;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("JSON with no duplicate keys")
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<NoDuplicateKeys>()?.is_some() {}
+                Ok(NoDuplicateKeys)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut seen = std::collections::HashSet::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if !seen.insert(key) {
+                        return Err(serde::de::Error::custom("duplicate key"));
+                    }
+                    map.next_value::<NoDuplicateKeys>()?;
+                }
+                Ok(NoDuplicateKeys)
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// True when `text` parses as a JSON object with no duplicate key at any
+/// level, which the approve page needs in order to list the variable changes.
+fn is_json_object(text: &str) -> bool {
+    matches!(
+        serde_json::from_str::<serde_json::Value>(text),
+        Ok(serde_json::Value::Object(_))
+    ) && serde_json::from_str::<NoDuplicateKeys>(text).is_ok()
+}
+
+/// Check the reviewer warnings a trust display carries. They are shown to the
+/// approver but signed over by nothing, so each field is held to the rules for
+/// text the approver reads: a fixed kind, a clean path, a plain identifier.
+fn check_warnings(warnings: &[WarningView], omitted: u32) -> Result<(), Fail> {
+    if warnings.len() > MAX_WARNINGS {
+        return Err(inconsistent("a trust display carries too many warnings"));
+    }
+    if omitted > 0 && warnings.len() != MAX_WARNINGS {
+        return Err(inconsistent("warnings were omitted below the limit"));
+    }
+    for w in warnings {
+        if !WARNING_KINDS.contains(&w.kind.as_str()) {
+            return Err(inconsistent("a warning has an unknown kind"));
+        }
+        if w.file.is_empty()
+            || w.file.chars().count() > crate::runner::tree::MAX_PATH_CHARS
+            || w.file.chars().any(crate::runner::tree::is_hostile_char)
+        {
+            return Err(inconsistent("a warning has an unusable file name"));
+        }
+        let identifier = |v: &str| {
+            let b = v.as_bytes();
+            (1..=64).contains(&b.len())
+                && (b[0].is_ascii_lowercase() || b[0] == b'_')
+                && b.iter()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
+        };
+        let steers = w.kind == "schema_variable_steers";
+        if steers != (w.variable.is_some() && w.into.is_some())
+            || (!steers && (w.variable.is_some() || w.into.is_some()))
+        {
+            return Err(inconsistent("a warning has the wrong variable fields"));
+        }
+        if w.variable.as_deref().is_some_and(|v| !identifier(v)) {
+            return Err(inconsistent("a warning has an unusable variable name"));
+        }
+        if w.into
+            .as_deref()
+            .is_some_and(|i| !WARNING_INTOS.contains(&i))
+        {
+            return Err(inconsistent("a warning reaches an unknown target"));
+        }
+    }
+    Ok(())
+}
+
+/// Check every digest in a submitted scope against the text the approver
+/// will read, and the counts and destructive flag against the addresses.
+fn check_consistency(scope: &JobScopeWire, display: &DisplayWire) -> Result<(), Fail> {
+    match scope {
+        JobScopeWire::Trust(t) => {
+            if display.manifest.is_some()
+                || display.baseline_manifest.is_some()
+                || display.address_text.is_some()
+            {
+                return Err(inconsistent("a trust display carries apply-only fields"));
+            }
+            check_warnings(&display.warnings, display.warnings_omitted)?;
+            if display.external {
+                if display.diff.is_some() {
+                    return Err(inconsistent(
+                        "an external trust display must not carry a diff",
+                    ));
+                }
+                if display.verify_command.as_deref().is_none_or(str::is_empty) {
+                    return Err(inconsistent(
+                        "an external trust display needs a verify_command",
+                    ));
+                }
+                return Ok(());
+            }
+            if display.verify_command.is_some() {
+                return Err(inconsistent(
+                    "a trust display with a diff must not carry a verify_command",
+                ));
+            }
+            let diff = display
+                .diff
+                .as_deref()
+                .ok_or_else(|| inconsistent("the display carries no diff"))?;
+            if store::sha256_hex(diff) != t.diff {
+                return Err(inconsistent("the diff digest does not match the display"));
+            }
+        }
+        JobScopeWire::Apply(a) => {
+            if display.diff.is_some()
+                || display.external
+                || display.verify_command.is_some()
+                || !display.warnings.is_empty()
+                || display.warnings_omitted != 0
+            {
+                return Err(inconsistent("an apply display carries trust-only fields"));
+            }
+            let manifest = display
+                .manifest
+                .as_deref()
+                .ok_or_else(|| inconsistent("the display carries no manifest"))?;
+            if store::sha256_hex(manifest) != a.manifest {
+                return Err(inconsistent(
+                    "the manifest digest does not match the display",
+                ));
+            }
+            if !is_json_object(manifest) {
+                return Err(inconsistent("the manifest is not a JSON object"));
+            }
+            match (&a.baseline_manifest, &display.baseline_manifest) {
+                (None, None) => {}
+                (Some(digest), Some(text)) if store::sha256_hex(text) == *digest => {
+                    if !is_json_object(text) {
+                        return Err(inconsistent("the baseline manifest is not a JSON object"));
+                    }
+                }
+                _ => {
+                    return Err(inconsistent(
+                        "the baseline manifest digest does not match the display",
+                    ));
+                }
+            }
+            if (a.baseline_status == "none") != a.baseline_manifest.is_none() {
+                return Err(inconsistent(
+                    "the baseline status does not match the baseline manifest",
+                ));
+            }
+            let text = display
+                .address_text
+                .as_deref()
+                .ok_or_else(|| inconsistent("the display carries no address text"))?;
+            if store::sha256_hex(text) != a.addresses {
+                return Err(inconsistent(
+                    "the address digest does not match the display",
+                ));
+            }
+            let changes = parse_address_text(text)
+                .ok_or_else(|| inconsistent("the address text is not well formed"))?;
+            let count =
+                |want: Action| changes.iter().filter(|(action, _)| *action == want).count() as u64;
+            let counts = &a.counts;
+            if count(Action::Create) != u64::from(counts.create)
+                || count(Action::Update) != u64::from(counts.update)
+                || count(Action::Replace) != u64::from(counts.replace)
+                || count(Action::Delete) != u64::from(counts.delete)
+            {
+                return Err(inconsistent("the counts do not match the addresses"));
+            }
+            if a.destructive != (counts.delete > 0 || counts.replace > 0) {
+                return Err(inconsistent(
+                    "the destructive flag does not match the counts",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Make `records` what the daemon trusts, in memory and in `Jobs`. A project
+/// with no record is trusted at nothing.
+fn sync_trusted(d: &Daemon, inner: &mut Inner, records: Vec<TrustRecord>) {
+    inner.trusted = records
+        .into_iter()
+        .map(|r| (r.project.clone(), r))
+        .collect();
+    for project in d.config.projects.keys() {
+        let trusted = inner.trusted.get(project).map(|r| TrustedRevision {
+            digest: r.digest.clone(),
+            schema: r.schema.clone(),
+        });
+        inner.jobs.set_trusted(project, trusted);
+    }
+}
+
+/// Read `trusted.json` again, so a `shoephoned untrust` run since the last
+/// look takes effect without a restart. Fails closed: if the file cannot be
+/// read, the caller is refused rather than served from a copy that may be
+/// out of date.
+fn refresh_trusted(d: &Daemon, inner: &mut Inner) -> Result<(), Fail> {
+    let records = d.store.load_trusted().map_err(|e| {
+        eprintln!("shoephoned: trusted: {e}");
+        Fail::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "trust_unreadable",
+            "the trust registry could not be read",
+        )
+    })?;
+    sync_trusted(d, inner, records);
+    Ok(())
+}
+
+fn runner_job(job: &Job, trusted: &BTreeMap<String, TrustRecord>) -> RunnerJob {
+    let (kind, manifest, allow_destroy) = match &job.kind {
+        JobKind::Trust { .. } => ("trust", None, false),
+        JobKind::Apply {
+            manifest,
+            allow_destroy,
+        } => ("apply", Some(manifest.clone()), *allow_destroy),
+    };
+    RunnerJob {
+        id: job.id,
+        project: job.project.clone(),
+        kind: kind.to_owned(),
+        state: match job.state {
+            JobState::Approved { .. } => "approved",
+            _ => "working",
+        }
+        .to_owned(),
+        manifest,
+        allow_destroy,
+        trusted: trusted.get(&job.project).cloned(),
+    }
+}
+
+async fn runner_poll(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<Option<RunnerJob>> {
+    let runner = authenticate(&d, &headers, "POST", "/api/runner/poll", &body, None)?;
+    let (now, policy) = (now(), d.config.policy());
+    d.audited(|inner| {
+        refresh_trusted(&d, inner)?;
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        prune_jobs(inner, now);
+        let job = inner.jobs.poll(now, inner.grants.gate_mut(), &runner);
+        Ok(Json(job.map(|j| runner_job(&j, &inner.trusted))))
+    })
+}
+
+async fn runner_archive(
+    State(d): App,
+    Path(id): Path<u64>,
+    headers: HeaderMap,
+) -> Result<Response, Fail> {
+    let path = format!("/api/runner/archive/{id}");
+    let runner = authenticate(&d, &headers, "GET", &path, b"", Some(id))?;
+    let (now, policy) = (now(), d.config.policy());
+    let bytes = d.with(|inner| {
+        inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
+        prune_jobs(inner, now);
+        let working = inner
+            .jobs
+            .job(now, id)
+            .is_some_and(|j| matches!(&j.state, JobState::Working { runner: r } if *r == runner));
+        if working {
+            inner.archives.get(&id).cloned()
+        } else {
+            None
+        }
+    });
+    match bytes {
+        Some(bytes) => Ok(([(header::CONTENT_TYPE, "application/gzip")], bytes).into_response()),
+        None => Err(Fail::new(
+            StatusCode::NOT_FOUND,
+            "no_archive",
+            "no archive is available for that job",
+        )),
+    }
+}
+
+async fn runner_submit(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<serde_json::Value> {
+    let runner = authenticate(
+        &d,
+        &headers,
+        "POST",
+        "/api/runner/submit",
+        &body,
+        body_id(&body),
+    )?;
+    let req: SubmitBody = parse_body(&body)?;
+    check_consistency(&req.scope, &req.display)?;
+    let summary = match &req.scope {
+        JobScopeWire::Apply(a) => Some(apply_summary(a, &req.display)),
+        JobScopeWire::Trust(_) => None,
+    };
+    let scope = scope_from_wire(req.scope)?;
+    let now = now();
+    d.audited(|inner| {
+        // An apply is judged against the trust now on disk, so an
+        // `untrust` since the plan started counts.
+        refresh_trusted(&d, inner)?;
+        let mut entropy = ca::OsEntropy;
+        inner.jobs.submit(
+            now,
+            inner.grants.gate_mut(),
+            &runner,
+            req.id,
+            scope,
+            &mut entropy,
+        )?;
+        inner.displays.insert(req.id, req.display);
+        if let Some(summary) = summary {
+            inner.summaries.insert(req.id, summary);
+        }
+        prune_jobs(inner, now);
+        Ok(Json(serde_json::json!({})))
+    })
+}
+
+async fn runner_refuse(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<serde_json::Value> {
+    let runner = authenticate(
+        &d,
+        &headers,
+        "POST",
+        "/api/runner/refuse",
+        &body,
+        body_id(&body),
+    )?;
+    let req: RefuseBody = parse_body(&body)?;
+    let failure = failure_from_view(req.failure)?;
+    let result = match req.result.as_str() {
+        "refused" => JobResult::Refused(failure),
+        "plan_failed" => JobResult::PlanFailed(failure),
+        other => return Err(bad_request(format!("unknown result {other:?}"))),
+    };
+    let now = now();
+    d.with(|inner| {
+        inner
+            .jobs
+            .refuse(now, inner.grants.gate_mut(), &runner, req.id, result)?;
+        prune_jobs(inner, now);
+        Ok(Json(serde_json::json!({})))
+    })
+}
+
+async fn runner_claim(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<JobScopeWire> {
+    let runner = authenticate(
+        &d,
+        &headers,
+        "POST",
+        "/api/runner/claim",
+        &body,
+        body_id(&body),
+    )?;
+    let req: ById = parse_body(&body)?;
+    let now = now();
+    d.audited(|inner| {
+        refresh_trusted(&d, inner)?;
+        let scope = inner.jobs.claim(now, &runner, req.id)?;
+        if let JobScope::Trust(t) = &scope {
+            inner.claimed.insert(req.id, t.clone());
+        }
+        prune_jobs(inner, now);
+        Ok(Json(scope_to_wire(&scope)))
+    })
+}
+
+async fn runner_finish(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<serde_json::Value> {
+    let runner = authenticate(
+        &d,
+        &headers,
+        "POST",
+        "/api/runner/finish",
+        &body,
+        body_id(&body),
+    )?;
+    let req: FinishBody = parse_body(&body)?;
+    let result = match (req.result.as_str(), req.failure.clone()) {
+        ("trusted", _) => JobResult::Trusted,
+        ("applied", _) => JobResult::Applied,
+        ("outcome_unknown", _) => JobResult::OutcomeUnknown,
+        ("apply_failed", Some(f)) => JobResult::ApplyFailed(failure_from_view(f)?),
+        ("apply_failed", None) => return Err(bad_request("apply_failed needs a failure")),
+        (other, _) => return Err(bad_request(format!("unknown result {other:?}"))),
+    };
+    let now = now();
+    // Only `trusted` goes through `audited`: it changes what a project may
+    // apply from, so it is refused up front (`ledger_unavailable`, before
+    // any state changes) once the ledger cannot be trusted, and if the
+    // append of its own event fails the trust is taken back (see
+    // `undo_trust`). Every other outcome stays on `with`, as `kill` and
+    // `decline` do, so a job can always be ended and a runner can always say
+    // what happened to an apply.
+    if result == JobResult::Trusted {
+        d.audited_or_undo(
+            |inner| finish_trusted(&d, inner, now, &runner, &req),
+            |inner, undo| {
+                if let Some(undo) = undo {
+                    undo_trust(&d, inner, undo);
+                }
+            },
+        )
+    } else {
+        d.with(|inner| finish_other(inner, now, &runner, &req, result))
+    }
+}
+
+fn finish_failure(e: Refusal) -> Fail {
+    match e {
+        Refusal::ScopeMismatch => Fail::new(
+            StatusCode::BAD_REQUEST,
+            "scope_mismatch",
+            "that result does not fit this kind of job",
+        ),
+        other => other.into(),
+    }
+}
+
+/// The project a finish names: the job's, or, for a job the daemon does not
+/// know, the one the runner says.
+fn finish_project(inner: &mut Inner, now: SystemTime, req: &FinishBody) -> Result<String, Fail> {
+    match inner.jobs.job(now, req.id) {
+        Some(job) => Ok(job.project.clone()),
+        None => req.project.clone().ok_or_else(|| {
+            Fail::new(
+                StatusCode::BAD_REQUEST,
+                "project_required",
+                "the daemon does not know that job; say which project it belongs to",
+            )
+        }),
+    }
+}
+
+fn finish_other(
+    inner: &mut Inner,
+    now: SystemTime,
+    runner: &str,
+    req: &FinishBody,
+    result: JobResult,
+) -> Reply<serde_json::Value> {
+    let project = finish_project(inner, now, req)?;
+    inner
+        .jobs
+        .finish(now, runner, &project, req.id, result)
+        .map_err(finish_failure)?;
+    inner.claimed.remove(&req.id);
+    prune_jobs(inner, now);
+    Ok(Json(serde_json::json!({})))
+}
+
+/// What it takes to put a trust back as it was.
+struct TrustUndo {
+    id: u64,
+    record: TrustRecord,
+    previous: Option<TrustRecord>,
+    scope: TrustScope,
+    meta: Option<JobMeta>,
+}
+
+/// Whether the trust this finish reports is already recorded: the
+/// project's trust record names job `req.id` (and, while the daemon still
+/// holds the claimed scope, its candidate), and the job is either done as
+/// `Trusted` or unknown to this instance (it restarted after recording it).
+/// Job ids are never reused, so the record identifies the job.
+fn already_trusted(inner: &mut Inner, now: SystemTime, project: &str, req: &FinishBody) -> bool {
+    let Some(record) = inner.trusted.get(project) else {
+        return false;
+    };
+    if record.job != req.id {
+        return false;
+    }
+    if let Some(scope) = inner.claimed.get(&req.id)
+        && scope.candidate != record.digest
+    {
+        return false;
+    }
+    match inner.jobs.job(now, req.id) {
+        None => true,
+        Some(job) => {
+            matches!(job.kind, JobKind::Trust { .. })
+                && job.state == JobState::Done(JobResult::Trusted)
+        }
+    }
+}
+
+/// Record a trust. It goes on disk before the job is marked done, so a
+/// failed write leaves the job Claimed and the runner can retry; the caller
+/// takes it back with [`undo_trust`] if the ledger then cannot record it.
+/// A retry of a trust already recorded (its reply was lost, or the daemon
+/// restarted since) is accepted again with nothing changed and no ledger
+/// line, so the runner commits instead of undoing what both sides hold.
+fn finish_trusted(
+    d: &Daemon,
+    inner: &mut Inner,
+    now: SystemTime,
+    runner: &str,
+    req: &FinishBody,
+) -> Result<(Json<serde_json::Value>, Option<TrustUndo>), Fail> {
+    refresh_trusted(d, inner)?;
+    let project = finish_project(inner, now, req)?;
+    if inner.jobs.runner_of(&project) == Some(runner) && already_trusted(inner, now, &project, req)
+    {
+        return Ok((Json(serde_json::json!({})), None));
+    }
+    // Check first that `Jobs::finish` will accept it.
+    let (is_trust, claimed) = match inner.jobs.job(now, req.id) {
+        Some(job) => (
+            matches!(job.kind, JobKind::Trust { .. }),
+            job.state == JobState::Claimed,
+        ),
+        None => return Err(Refusal::NoSuchRequest.into()),
+    };
+    if inner.jobs.runner_of(&project) != Some(runner) {
+        return Err(Refusal::WrongRunner.into());
+    }
+    if !is_trust {
+        return Err(finish_failure(Refusal::ScopeMismatch));
+    }
+    let scope = match inner.claimed.get(&req.id) {
+        Some(scope) if claimed => scope.clone(),
+        _ => return Err(Refusal::NoSuchRequest.into()),
+    };
+    let record = TrustRecord {
+        project: project.clone(),
+        digest: scope.candidate.clone(),
+        schema: scope.schema.clone(),
+        job: req.id,
+        at: store::unix(now),
+    };
+    let mut previous = None;
+    let mut stale = false;
+    // A failed write deliberately does not set `ledger_failed`: that flag
+    // is sticky until restart and would refuse the retry this ordering
+    // exists to allow. Nothing was recorded anywhere, so no audit gap
+    // opened; the job is still Claimed and the runner is told to retry.
+    let written = d.store.update_trusted(|mut records| {
+        previous = records.iter().find(|r| r.project == project).cloned();
+        // The trust may have changed (an `untrust`) since the claim; the
+        // approver signed a change against the baseline in the scope.
+        if previous.as_ref().map(|r| &r.digest) != scope.baseline.as_ref() {
+            stale = true;
+            return (None, records);
+        }
+        records.retain(|r| r.project != project);
+        records.push(record.clone());
+        records.sort_by(|a, b| a.project.cmp(&b.project));
+        (Some(records.clone()), records)
+    });
+    let records = written.map_err(|e| {
+        eprintln!("shoephoned: trusted: {e}");
+        Fail::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "trust_save_failed",
+            "the trust record could not be saved; the job is still claimed, retry",
+        )
+    })?;
+    if stale {
+        sync_trusted(d, inner, records);
+        inner.jobs.refuse_claimed(now, req.id, "stale_baseline");
+        inner.claimed.remove(&req.id);
+        prune_jobs(inner, now);
+        return Err(Refusal::StaleBaseline.into());
+    }
+    let undo = TrustUndo {
+        id: req.id,
+        record: record.clone(),
+        previous,
+        scope,
+        meta: inner.job_meta.get(&req.id).cloned(),
+    };
+    if let Err(e) = inner
+        .jobs
+        .finish(now, runner, &project, req.id, JobResult::Trusted)
+    {
+        if !restore_trusted_file(d, &undo) {
+            // Near-unreachable: the pre-checks above make `Jobs::finish`
+            // accept this. If it fails anyway and the file cannot be put
+            // back, an unaudited record is on disk. Trust nothing for the
+            // project and refuse audited calls (including the reload in
+            // `refresh_trusted`) until a restart, when reconcile drops it.
+            inner.trusted.remove(&project);
+            inner.jobs.set_trusted(&project, None);
+            inner.ledger_failed = Some(format!(
+                "trust for {project:?} could not be rolled back; restart to reconcile"
+            ));
+        }
+        return Err(finish_failure(e));
+    }
+    inner.claimed.remove(&req.id);
+    sync_trusted(d, inner, records);
+    prune_jobs(inner, now);
+    Ok((Json(serde_json::json!({})), Some(undo)))
+}
+
+/// Put the project's record in `trusted.json` back as it was, unless
+/// something else (an `untrust`, a later trust) has changed it since.
+fn restore_trusted_file(d: &Daemon, undo: &TrustUndo) -> bool {
+    let project = &undo.record.project;
+    let restored = d.store.update_trusted(|mut records| {
+        if records.iter().find(|r| &r.project == project) != Some(&undo.record) {
+            return (None, ());
+        }
+        records.retain(|r| &r.project != project);
+        records.extend(undo.previous.clone());
+        records.sort_by(|a, b| a.project.cmp(&b.project));
+        (Some(records), ())
+    });
+    if let Err(e) = restored {
+        eprintln!("shoephoned: trusted: rolling back: {e}");
+        return false;
+    }
+    true
+}
+
+/// The ledger could not record a trust: take it back on disk and in memory,
+/// and leave the job Claimed. The ledger is now marked failed, so the daemon
+/// refuses further approvals until it restarts with a writable one.
+fn undo_trust(d: &Daemon, inner: &mut Inner, undo: TrustUndo) {
+    let restored = restore_trusted_file(d, &undo);
+    inner.jobs.reopen_trusted(undo.id);
+    inner.claimed.insert(undo.id, undo.scope);
+    if let Some(meta) = undo.meta {
+        inner.job_meta.insert(undo.id, meta);
+    }
+    let reloaded = if restored {
+        d.store.load_trusted().ok()
+    } else {
+        None
+    };
+    match reloaded {
+        Some(records) => sync_trusted(d, inner, records),
+        None => {
+            // The file could not be put back, so the trust nobody can audit
+            // may still be on disk (startup reconciliation drops it). Fail
+            // closed for this project in the meantime.
+            let project = undo.record.project;
+            inner.trusted.remove(&project);
+            inner.jobs.set_trusted(&project, None);
+        }
+    }
+}
+
+/// Approve job `id` the way a verified ceremony would, with no ceremony.
+#[cfg(feature = "test-hooks")]
+fn approve_waiting_job(
+    d: &Daemon,
+    inner: &mut Inner,
+    now: SystemTime,
+    policy: &Policy,
+    id: u64,
+) -> Result<Json<serde_json::Value>, Fail> {
+    refresh_trusted(d, inner)?;
+    let (nonce, scope) = match inner.jobs.job(now, id).map(|j| j.state.clone()) {
+        Some(JobState::Waiting { scope, nonce, .. }) => (nonce, scope),
+        _ => return Err(Refusal::NoSuchRequest.into()),
+    };
+    inner
+        .jobs
+        .approve(now, inner.grants.gate_mut(), policy, id, &nonce, &scope)?;
+    Ok(Json(serde_json::json!({ "approved": id })))
+}
+
+/// Approves the job waiting on the approver, as the approver's device would.
+/// Only compiled with `test-hooks`.
+#[cfg(feature = "test-hooks")]
+async fn test_approve_job(State(d): App, Json(body): Json<ById>) -> Reply<serde_json::Value> {
+    let (now, policy) = (now(), d.config.policy());
+    d.audited(|inner| approve_waiting_job(&d, inner, now, &policy, body.id))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn changed_variables_names_changed_added_and_removed_keys() {
+        let new = r#"{"same":1,"changed":"b","added":true,"nested":{"x":1}}"#;
+        let old = r#"{"same":1,"changed":"a","removed":2,"nested":{"x":2}}"#;
+        assert_eq!(
+            super::changed_variables(new, Some(old)),
+            ["added", "changed", "nested", "removed"]
+        );
+        assert!(super::changed_variables(new, Some(new)).is_empty());
+    }
+
+    #[test]
+    fn changed_variables_without_a_baseline_lists_every_key() {
+        assert_eq!(
+            super::changed_variables(r#"{"b":1,"a":"secret-value"}"#, None),
+            ["a", "b"]
+        );
+        assert!(super::changed_variables("{}", None).is_empty());
+    }
+
     use super::*;
 
     #[test]
@@ -1189,6 +2713,131 @@ mod tests {
 
         let missing = check_push_secret(None, "anything").unwrap_err();
         assert_eq!(missing.1.code, "reenroll_required");
+    }
+
+    #[test]
+    fn push_for_job_is_exhaustive() {
+        use crate::job::JobEvent as E;
+        let at = SystemTime::UNIX_EPOCH;
+        let (id, project) = (1, "net".to_owned());
+        let cases = [
+            (
+                E::Requested {
+                    id,
+                    project: project.clone(),
+                    kind: "trust",
+                    reason: "r".into(),
+                    at,
+                },
+                Push::JobRequested,
+            ),
+            (
+                E::Requested {
+                    id,
+                    project: project.clone(),
+                    kind: "apply",
+                    reason: "r".into(),
+                    at,
+                },
+                Push::JobRequested,
+            ),
+            (
+                E::Started {
+                    id,
+                    project: project.clone(),
+                    kind: "apply",
+                    at,
+                },
+                Push::PlanStarted,
+            ),
+            (
+                E::Waiting {
+                    id,
+                    project: project.clone(),
+                    kind: "trust",
+                    at,
+                },
+                Push::TrustWaiting,
+            ),
+            (
+                E::Waiting {
+                    id,
+                    project: project.clone(),
+                    kind: "apply",
+                    at,
+                },
+                Push::ApplyWaiting,
+            ),
+            (
+                E::Approved {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::JobApproved,
+            ),
+            (
+                E::Refused {
+                    id,
+                    project: project.clone(),
+                    category: "plan_too_old".into(),
+                    at,
+                },
+                Push::PlanRefused,
+            ),
+            (
+                E::Applied {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::Applied,
+            ),
+            (
+                E::Trusted {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::Trusted,
+            ),
+            (
+                E::ApplyFailed {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::ApplyFailed,
+            ),
+            (
+                E::OutcomeUnknown {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::OutcomeUnknown,
+            ),
+            (
+                E::Declined {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::RequestDeclined,
+            ),
+            (
+                E::TimedOut {
+                    id,
+                    project: project.clone(),
+                    at,
+                },
+                Push::RequestTimedOut,
+            ),
+            (E::Killed { id, project, at }, Push::JobKilled),
+        ];
+        for (event, expected) in cases {
+            assert_eq!(push_for_job(&event), expected, "{event:?}");
+        }
     }
 
     fn test_webauthn() -> Webauthn {

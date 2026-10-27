@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2026 Curtis Galloway
+# SPDX-License-Identifier: Apache-2.0
+#
+# Example config for shoephone-runner. Every value is a placeholder.
+
+name = "runner-1"
+daemon = "https://approve.example.internal"
+key = "/etc/shoephone-runner/runner.key"
+state_dir = "/var/lib/shoephone-runner"
+log_dir = "/var/log/shoephone-runner"
+log_days = 30
+terraform = "/usr/local/bin/terraform"
+plugin_dir = "/opt/shoephone-runner/plugins"
+bwrap = "/usr/bin/bwrap"
+review_user = "shoephone-review"
+terraform_user = "shoephone-terraform"
+
+# Run with each reference appended as the last argument; stdout, trimmed,
+# is the secret.
+secret_command = ["/usr/local/bin/secret-tool", "read"]
+# Runner environment variables passed through to secret_command, which
+# otherwise gets only PATH=/usr/bin:/bin.
+secret_env = []
+# Minutes one Terraform command may run before it is killed.
+terraform_timeout_minutes = 60
+
+[projects.example]
+path = "infra/example"
+terraform_version = "1.9.8"
+schema_file = "shoephone-schema.toml"
+
+[projects.example.backend_config]
+address = { value = "https://state.example.internal/example" }
+password = { secret = "vault/item/backend-password" }
+
+[projects.example.env]
+PROVIDER_TOKEN = { secret = "vault/item/provider-token" }
+
+[projects.example.variables]
+region = { value = "example-region-1" }
+api_key = { secret = "vault/item/api-key" }

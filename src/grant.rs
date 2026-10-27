@@ -22,11 +22,11 @@
 //! - The rate cap and the cooldown are keyed on nothing the requester chooses.
 //! - Every outcome is appended to an event list for the approver's device.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const HOUR: Duration = Duration::from_secs(60 * 60);
+use crate::gate::{Gate, Occupant};
 
 /// A source of random bytes. The daemon supplies the operating system's;
 /// tests supply a counter.
@@ -58,10 +58,23 @@ pub struct Policy {
     /// requester.
     pub max_requests_per_hour: usize,
     /// The first cooldown after a decline or timeout; it doubles on each
-    /// consecutive strike. See [`Grants::cooldown_after`].
+    /// consecutive strike. See [`Gate::strike_at`].
     pub base_cooldown: Duration,
     /// Where the doubling stops.
     pub max_cooldown: Duration,
+    /// How long a Terraform job may sit queued or planning before it fails.
+    pub plan_timeout: Duration,
+    /// How long a job's scope waits on the approver, counted from the moment
+    /// the runner submitted it.
+    pub approval_ttl: Duration,
+    /// The oldest a plan may be when it is approved or claimed. Older plans
+    /// are refused or expire, so an apply never runs a stale plan.
+    pub max_plan_age: Duration,
+    /// How long a claimed job may go without a result from its runner
+    /// before the daemon records its outcome as unknown and frees the
+    /// one-job slot. Above three Terraform timeouts, so a running apply is
+    /// not cut short.
+    pub claim_ttl: Duration,
 }
 
 impl Default for Policy {
@@ -74,6 +87,10 @@ impl Default for Policy {
             max_requests_per_hour: 6,
             base_cooldown: Duration::from_secs(5 * 60),
             max_cooldown: Duration::from_secs(60 * 60),
+            plan_timeout: Duration::from_secs(10 * 60),
+            approval_ttl: Duration::from_secs(5 * 60),
+            max_plan_age: Duration::from_secs(15 * 60),
+            claim_ttl: Duration::from_secs(3 * 60 * 60),
         }
     }
 }
@@ -122,11 +139,7 @@ impl Scope {
 /// not: there is no separate value a dishonest channel could relay unchanged
 /// while lying about the scope on screen.
 pub fn bound_challenge(scope: &Scope, nonce: &str) -> [u8; 32] {
-    use ssh_key::sha2::{Digest, Sha256};
-    let digest = Sha256::digest(scope.bytes_to_sign(nonce));
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest);
-    out
+    crate::scope::challenge_of(&scope.bytes_to_sign(nonce))
 }
 
 /// A request awaiting a verdict. There is at most one.
@@ -235,6 +248,27 @@ pub enum Refusal {
     NoWindow,
     /// A window is open for that host, but for a different key.
     KeyMismatch,
+    /// No Terraform project of that name is configured.
+    UnknownProject,
+    /// The job's scope was already submitted and cannot change.
+    ScopeFrozen,
+    /// The approved job was already claimed.
+    AlreadyClaimed,
+    /// The caller is not the runner assigned to that project.
+    WrongRunner,
+    /// The job's context moved on since it was planned.
+    Stale,
+    /// A runner request with a timestamp outside the window, a replayed
+    /// nonce, or arriving while the nonce cache is full.
+    StaleSignature,
+    /// The trust baseline in the scope is not the currently trusted one.
+    StaleBaseline,
+    /// The plan is older than the daemon allows for an apply.
+    PlanTooOld,
+    /// An apply's revision or schema is not the project's current trust.
+    Untrusted,
+    /// The scope carries a field that cannot be signed unambiguously.
+    MalformedScope,
 }
 
 impl fmt::Display for Refusal {
@@ -255,6 +289,20 @@ impl fmt::Display for Refusal {
             Refusal::ScopeMismatch => write!(f, "signature does not cover the enforced scope"),
             Refusal::NoWindow => write!(f, "no approved window for that host"),
             Refusal::KeyMismatch => write!(f, "window was approved for a different key"),
+            Refusal::UnknownProject => write!(f, "no Terraform project with that name"),
+            Refusal::ScopeFrozen => write!(f, "the scope was already submitted"),
+            Refusal::AlreadyClaimed => write!(f, "the approval was already claimed"),
+            Refusal::WrongRunner => write!(f, "not the runner assigned to that project"),
+            Refusal::Stale => write!(f, "the job's context changed since it was planned"),
+            Refusal::StaleSignature => write!(f, "runner request is stale or replayed"),
+            Refusal::StaleBaseline => {
+                write!(f, "the trusted baseline moved since the scope was built")
+            }
+            Refusal::PlanTooOld => write!(f, "the plan is too old to approve"),
+            Refusal::Untrusted => {
+                write!(f, "the apply's revision is no longer the trusted one")
+            }
+            Refusal::MalformedScope => write!(f, "the scope has a field that cannot be signed"),
         }
     }
 }
@@ -304,13 +352,6 @@ pub enum Event {
     },
 }
 
-/// How a pending request ended without a certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Outcome {
-    Declined,
-    TimedOut,
-}
-
 /// The state for one approver. The daemon holds one of these per CA.
 #[derive(Debug)]
 pub struct Grants {
@@ -320,11 +361,9 @@ pub struct Grants {
     next_id: u64,
     pending: Option<Pending>,
     windows: Vec<Window>,
-    /// Times of accepted requests in the last hour, oldest first.
-    accepted: VecDeque<SystemTime>,
-    cooldown_until: Option<SystemTime>,
-    /// Consecutive requests that ended without approval.
-    strikes: u32,
+    /// The slot, rate cap and cooldown shared with every other kind of
+    /// request.
+    gate: Gate,
     events: Vec<Event>,
     /// The latest `now` this instance has ever been ticked with. Every
     /// public method clamps its `now` argument up to this before doing
@@ -346,9 +385,7 @@ impl Grants {
             next_id,
             pending: None,
             windows: Vec::new(),
-            accepted: VecDeque::new(),
-            cooldown_until: None,
-            strikes: 0,
+            gate: Gate::new(),
             events: Vec::new(),
             high_water: UNIX_EPOCH,
         }
@@ -403,23 +440,21 @@ impl Grants {
         if public_key.is_empty() || public_key.chars().any(char::is_control) {
             return Err(Refusal::BadKey);
         }
-        if self.pending.is_some() {
-            return Err(Refusal::Busy);
-        }
-        if let Some(until) = self.cooldown_until.filter(|u| *u > now) {
-            return Err(Refusal::Cooldown { until });
-        }
-        if self.accepted.len() >= self.policy.max_requests_per_hour {
-            let oldest = self.accepted.front().copied().unwrap_or(now);
-            return Err(Refusal::RateCapped {
-                until: oldest + HOUR,
-            });
-        }
+        // The id is only taken once the gate lets the request in, so a
+        // refusal does not burn one; `allocate_id` below hands out this same
+        // value.
+        let peeked = Occupant::Ssh(self.next_id);
+        self.gate.admit(now, &self.policy, peeked)?;
 
         let window = wanted
             .unwrap_or(self.policy.default_window)
             .min(self.policy.max_window);
-        let id = self.take_id();
+        let id = self.allocate_id();
+        debug_assert_eq!(
+            Occupant::Ssh(id),
+            peeked,
+            "gate occupant matches the id taken"
+        );
         let pending = Pending {
             id,
             scope: Scope {
@@ -435,7 +470,6 @@ impl Grants {
             reason: reason.clone(),
             context: context.clone(),
         };
-        self.accepted.push_back(now);
         self.events.push(Event::Requested {
             id,
             host: host.to_owned(),
@@ -477,8 +511,8 @@ impl Grants {
             started: now,
             last_issued: None,
         };
-        self.strikes = 0;
-        self.cooldown_until = None;
+        self.gate.release(Occupant::Ssh(window.id));
+        self.gate.approved();
         self.events.push(Event::Approved {
             id: window.id,
             host: window.scope.host.clone(),
@@ -496,12 +530,13 @@ impl Grants {
             .pending
             .take_if(|p| p.id == id)
             .ok_or(Refusal::NoSuchRequest)?;
+        self.gate.release(Occupant::Ssh(pending.id));
+        self.gate.strike_at(now, &self.policy);
         self.events.push(Event::Declined {
             id: pending.id,
             host: pending.scope.host,
             at: now,
         });
-        self.strike(now, Outcome::Declined);
         Ok(())
     }
 
@@ -559,9 +594,9 @@ impl Grants {
         let principal = window.scope.principal.clone();
         let public_key = window.scope.public_key.clone();
         // `window`'s borrow of `self.windows` ends with the clone above;
-        // `take_id` needs `&mut self`.
+        // `allocate_id` needs `&mut self`.
         let valid_before = (now + self.policy.cert_ttl).min(window_ends_at);
-        let serial = self.take_id();
+        let serial = self.allocate_id();
         let cert = Certificate {
             serial,
             principal,
@@ -606,7 +641,8 @@ impl Grants {
                 host: p.scope.host,
                 at: now,
             });
-            self.strike(now, Outcome::Declined);
+            self.gate.release(Occupant::Ssh(p.id));
+            self.gate.strike_at(now, &self.policy);
         }
         for w in closed {
             self.events.push(Event::Killed {
@@ -641,39 +677,6 @@ impl Grants {
         std::mem::take(&mut self.events)
     }
 
-    /// How long requests are refused after a request ends without approval.
-    /// `self.strikes` has already been incremented for this outcome and is
-    /// reset to zero by an approval, and only by an approval.
-    ///
-    /// The rule: the base cooldown, doubling with each consecutive strike,
-    /// capped at [`Policy::max_cooldown`]. A timeout counts exactly like a
-    /// decline. The person did not say no, but an agent that files requests
-    /// nobody answers is the habituation pattern this cap exists to break,
-    /// and `SKILL.md` already tells the agent both cost a cooldown. With the
-    /// defaults, strikes cost 5, 10, 20, 40, then 60 minutes each; the cap
-    /// keeps a bad afternoon from becoming a locked-out week, while five
-    /// unanswered requests still cost over two hours.
-    fn cooldown_after(&self, outcome: Outcome) -> Duration {
-        let _ = outcome;
-        let doublings = self.strikes.saturating_sub(1).min(16);
-        (self.policy.base_cooldown * 2u32.pow(doublings)).min(self.policy.max_cooldown)
-    }
-
-    fn strike(&mut self, now: SystemTime, outcome: Outcome) {
-        self.strike_at(now, outcome);
-    }
-
-    /// Record a strike as of `at` and start the cooldown counting from
-    /// there. `decline` and `kill` pass `now`, since the person's verdict
-    /// (or the kill) happened right then; a timeout passes the moment the
-    /// pending request actually expired, which is earlier than `now` when
-    /// nothing polled the daemon between expiry and this tick. See
-    /// [`Grants::tick`].
-    fn strike_at(&mut self, at: SystemTime, outcome: Outcome) {
-        self.strikes = self.strikes.saturating_add(1);
-        self.cooldown_until = Some(at + self.cooldown_after(outcome));
-    }
-
     /// Advance time: expire the pending request, drop closed windows, and
     /// forget accepted requests older than an hour. Returns `now` clamped to
     /// never run behind the latest time this instance has already seen
@@ -698,16 +701,22 @@ impl Grants {
                 host: p.scope.host,
                 at: expired_at,
             });
-            self.strike_at(expired_at, Outcome::TimedOut);
+            self.gate.release(Occupant::Ssh(p.id));
+            self.gate.strike_at(expired_at, &self.policy);
         }
         self.windows.retain(|w| w.scope.ends_at > now);
-        while self.accepted.front().is_some_and(|t| *t + HOUR <= now) {
-            self.accepted.pop_front();
-        }
+        self.gate.tick(now);
         now
     }
 
-    fn take_id(&mut self) -> u64 {
+    /// The shared gate, for request kinds other than SSH grants.
+    pub fn gate_mut(&mut self) -> &mut Gate {
+        &mut self.gate
+    }
+
+    /// Hand out the next id. Grant ids, certificate serials and job ids all
+    /// come from this one counter, so none repeats in the ledger.
+    pub fn allocate_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         id
@@ -720,7 +729,7 @@ fn unix(t: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn hex_nonce(entropy: &mut dyn Entropy) -> String {
+pub(crate) fn hex_nonce(entropy: &mut dyn Entropy) -> String {
     let mut buf = [0u8; 32];
     entropy.fill(&mut buf);
     buf.iter().map(|b| format!("{b:02x}")).collect()
@@ -728,7 +737,7 @@ fn hex_nonce(entropy: &mut dyn Entropy) -> String {
 
 /// Eight characters from an alphabet without look-alikes, as `XXXX-XXXX`.
 /// The alphabet has 32 symbols so one masked byte maps uniformly.
-fn match_code(entropy: &mut dyn Entropy) -> String {
+pub(crate) fn match_code(entropy: &mut dyn Entropy) -> String {
     const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     let mut buf = [0u8; 8];
     entropy.fill(&mut buf);
@@ -742,11 +751,11 @@ fn match_code(entropy: &mut dyn Entropy) -> String {
     code
 }
 
-fn printable(s: &str, max: usize) -> String {
+pub(crate) fn printable(s: &str, max: usize) -> String {
     s.chars().filter(|c| !c.is_control()).take(max).collect()
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -760,6 +769,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gate::HOUR;
 
     const KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExampl session";
@@ -890,7 +900,10 @@ mod tests {
             None,
         );
         assert_eq!(r, Err(Refusal::BadKey));
-        assert!(g.accepted.is_empty(), "refusals do not spend the rate cap");
+        assert!(
+            g.gate.accepted.is_empty(),
+            "refusals do not spend the rate cap"
+        );
         assert!(g.take_events().is_empty());
     }
 
@@ -1160,7 +1173,7 @@ mod tests {
             Err(Refusal::NoSuchRequest)
         );
         assert!(
-            g.cooldown_until.is_some(),
+            g.gate.cooldown_until.is_some(),
             "a kill costs the requester a cooldown"
         );
         let kinds: Vec<bool> = g
@@ -1381,8 +1394,8 @@ mod tests {
         g.decline(t(10), p.id).unwrap();
         let after = t(10) + 5 * MIN;
         approved(&mut g, after);
-        assert_eq!(g.strikes, 0);
-        assert_eq!(g.cooldown_until, None);
+        assert_eq!(g.gate.strikes, 0);
+        assert_eq!(g.gate.cooldown_until, None);
     }
 
     #[test]
@@ -1409,7 +1422,7 @@ mod tests {
                 assert!(g.pending(now + 5 * MIN).is_none(), "timed out");
                 now += 5 * MIN;
             }
-            let until = g.cooldown_until.unwrap();
+            let until = g.gate.cooldown_until.unwrap();
             seen.push(until.duration_since(now).unwrap());
             now = until;
         }
@@ -1616,7 +1629,7 @@ mod tests {
                 .unwrap();
             assert_eq!(p.context.as_deref(), kept, "{given:?}");
             g.decline(t(1), p.id).unwrap();
-            g.cooldown_until = None;
+            g.gate.cooldown_until = None;
         }
     }
 }

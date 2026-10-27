@@ -1,0 +1,507 @@
+// SPDX-FileCopyrightText: 2026 Curtis Galloway
+// SPDX-License-Identifier: Apache-2.0
+//! Runner identity: every request a Terraform runner makes is signed with
+//! that runner's ed25519 key and cannot be replayed.
+//!
+//! The runner signs a canonical rendering of the request (method, path,
+//! body hash, job, timestamp, nonce) as an SSHSIG in the `shoephone-runner`
+//! namespace, so a signature made for any other purpose, such as a login
+//! challenge, never verifies here. The daemon checks, in this order: the
+//! runner is known, the timestamp is within 60 s of its clock, the
+//! signature verifies, and only then that the nonce is new. A nonce is
+//! recorded only after the signature verifies, so a caller without a key
+//! cannot fill the cache.
+
+use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+use ssh_key::sha2::{Digest, Sha256};
+use ssh_key::{HashAlg, LineEnding, PrivateKey, PublicKey, SshSig};
+
+use crate::grant::Refusal;
+
+/// Header carrying the base64url SSHSIG.
+pub const SIGNATURE_HEADER: &str = "shoephone-runner-signature";
+/// Header carrying the runner's configured name.
+pub const RUNNER_HEADER: &str = "shoephone-runner";
+
+/// SSHSIG namespace for runner requests.
+const NAMESPACE: &str = "shoephone-runner";
+/// How far a request's timestamp may be from the daemon's clock.
+const MAX_SKEW_SECS: u64 = 60;
+/// How long a nonce is remembered. A timestamp stays valid for up to
+/// 2 x 60 s of real time (recorded at its early edge, replayed at its late
+/// edge), plus 1 s because the skew check floors the clock to whole
+/// seconds; 130 s leaves slack beyond that, so a nonce cannot be evicted
+/// while its timestamp is still acceptable.
+const NONCE_TTL: Duration = Duration::from_secs(130);
+/// Longest nonce accepted, checked before any cryptography.
+const MAX_NONCE_LEN: usize = 128;
+/// Most nonces held at once; past it the cache refuses rather than grows.
+const MAX_NONCES: usize = 10_000;
+
+/// The exact bytes a runner signs and the daemon verifies.
+pub fn canonical(
+    method: &str,
+    path: &str,
+    body: &[u8],
+    job: Option<u64>,
+    timestamp: u64,
+    nonce: &str,
+) -> Vec<u8> {
+    let digest: String = Sha256::digest(body)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let job = job.map_or_else(|| "-".to_owned(), |j| j.to_string());
+    format!("shoephone-runner-v1\n{method}\n{path}\n{digest}\n{job}\n{timestamp}\n{nonce}\n")
+        .into_bytes()
+}
+
+/// Signs `message`, returning the SSHSIG as PEM then base64url, which is
+/// one line and header-safe.
+pub fn sign(key: &PrivateKey, message: &[u8]) -> Result<String, String> {
+    let sig = key
+        .sign(NAMESPACE, HashAlg::Sha512, message)
+        .map_err(|e| format!("signing: {e}"))?;
+    let pem = sig
+        .to_pem(LineEnding::LF)
+        .map_err(|e| format!("encoding signature: {e}"))?;
+    Ok(URL_SAFE_NO_PAD.encode(pem.as_bytes()))
+}
+
+/// The pieces of a request that [`canonical`] covers, in its argument order.
+pub type MessageParts<'a> = (&'a str, &'a str, &'a [u8], Option<u64>, u64, &'a str);
+
+/// Checks runner signatures and remembers recent nonces.
+#[derive(Debug, Default)]
+pub struct Verifier {
+    keys: BTreeMap<String, PublicKey>,
+    /// (monotonic and wall time recorded, "runner\nnonce"), oldest first.
+    /// An entry is evicted only when both clocks say it is older than
+    /// `NONCE_TTL`, so a jump of either clock cannot evict it early.
+    seen: VecDeque<(Instant, SystemTime, String)>,
+}
+
+impl Verifier {
+    pub fn new(keys: BTreeMap<String, PublicKey>) -> Self {
+        Self {
+            keys,
+            seen: VecDeque::new(),
+        }
+    }
+
+    /// Verifies one request. `WrongRunner` for an unknown runner, a
+    /// malformed or invalid signature; `StaleSignature` for a timestamp
+    /// outside the window, a replayed nonce, or a full nonce cache.
+    pub fn verify(
+        &mut self,
+        now: SystemTime,
+        now_mono: Instant,
+        runner: &str,
+        signature: &str,
+        parts: MessageParts<'_>,
+    ) -> Result<(), Refusal> {
+        let (method, path, body, job, timestamp, nonce) = parts;
+        let now_secs = now.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        while self.seen.front().is_some_and(|(mono, wall, _)| {
+            now_mono.saturating_duration_since(*mono) > NONCE_TTL
+                && now.duration_since(*wall).is_ok_and(|age| age > NONCE_TTL)
+        }) {
+            self.seen.pop_front();
+        }
+
+        let key = self.keys.get(runner).ok_or(Refusal::WrongRunner)?;
+        if now_secs.abs_diff(timestamp) > MAX_SKEW_SECS {
+            return Err(Refusal::StaleSignature);
+        }
+        // The nonce is one line of the canonical text; a newline in it
+        // would let one request's bytes read as another's.
+        if nonce.is_empty()
+            || nonce.len() > MAX_NONCE_LEN
+            || nonce.contains('\n')
+            || method.contains('\n')
+            || path.contains('\n')
+        {
+            return Err(Refusal::WrongRunner);
+        }
+        let pem = URL_SAFE_NO_PAD
+            .decode(signature)
+            .map_err(|_| Refusal::WrongRunner)?;
+        let sig = SshSig::from_pem(pem).map_err(|_| Refusal::WrongRunner)?;
+        let message = canonical(method, path, body, job, timestamp, nonce);
+        key.verify(NAMESPACE, &message, &sig)
+            .map_err(|_| Refusal::WrongRunner)?;
+
+        let tag = format!("{runner}\n{nonce}");
+        if self.seen.iter().any(|(_, _, t)| *t == tag) || self.seen.len() >= MAX_NONCES {
+            return Err(Refusal::StaleSignature);
+        }
+        self.seen.push_back((now_mono, now, tag));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ssh_key::Algorithm;
+    use ssh_key::rand_core::OsRng;
+
+    use super::*;
+
+    fn key() -> PrivateKey {
+        PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap()
+    }
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    fn mono(secs: u64) -> Instant {
+        static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        *BASE.get_or_init(Instant::now) + Duration::from_secs(secs.saturating_sub(NOW))
+    }
+
+    const NOW: u64 = 1_800_000_000;
+
+    fn verifier(runners: &[(&str, &PrivateKey)]) -> Verifier {
+        Verifier::new(
+            runners
+                .iter()
+                .map(|(n, k)| ((*n).to_owned(), k.public_key().clone()))
+                .collect(),
+        )
+    }
+
+    fn signed(k: &PrivateKey, body: &[u8], ts: u64, nonce: &str) -> String {
+        sign(
+            k,
+            &canonical("POST", "/api/runner/jobs", body, Some(7), ts, nonce),
+        )
+        .unwrap()
+    }
+
+    fn parts<'a>(body: &'a [u8], ts: u64, nonce: &'a str) -> MessageParts<'a> {
+        ("POST", "/api/runner/jobs", body, Some(7), ts, nonce)
+    }
+
+    #[test]
+    fn canonical_format_is_exact() {
+        let got = canonical("GET", "/x", b"", None, 5, "n1");
+        let want = "shoephone-runner-v1\nGET\n/x\n\
+            e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n-\n5\nn1\n";
+        assert_eq!(String::from_utf8(got).unwrap(), want);
+    }
+
+    #[test]
+    fn signed_request_verifies() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        assert!(!sig.contains(['\n', ' ']));
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, "n1")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn tampered_body_is_refused() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        assert_eq!(
+            v.verify(
+                at(NOW),
+                mono(NOW),
+                "r1",
+                &sig,
+                parts(b"{\"x\":1}", NOW, "n1")
+            ),
+            Err(Refusal::WrongRunner)
+        );
+    }
+
+    #[test]
+    fn replayed_nonce_is_refused() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, "n1")),
+            Ok(())
+        );
+        assert_eq!(
+            v.verify(
+                at(NOW + 5),
+                mono(NOW + 5),
+                "r1",
+                &sig,
+                parts(b"{}", NOW, "n1")
+            ),
+            Err(Refusal::StaleSignature)
+        );
+    }
+
+    #[test]
+    fn old_timestamp_is_refused() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let old = signed(&k, b"{}", NOW - 61, "n1");
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &old, parts(b"{}", NOW - 61, "n1")),
+            Err(Refusal::StaleSignature)
+        );
+        let future = signed(&k, b"{}", NOW + 61, "n2");
+        assert_eq!(
+            v.verify(
+                at(NOW),
+                mono(NOW),
+                "r1",
+                &future,
+                parts(b"{}", NOW + 61, "n2")
+            ),
+            Err(Refusal::StaleSignature)
+        );
+        let edge = signed(&k, b"{}", NOW - 60, "n3");
+        assert_eq!(
+            v.verify(
+                at(NOW),
+                mono(NOW),
+                "r1",
+                &edge,
+                parts(b"{}", NOW - 60, "n3")
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn other_runners_key_is_refused() {
+        let (k1, k2) = (key(), key());
+        let mut v = verifier(&[("r1", &k1), ("r2", &k2)]);
+        let sig = signed(&k2, b"{}", NOW, "n1");
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, "n1")),
+            Err(Refusal::WrongRunner)
+        );
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "nobody", &sig, parts(b"{}", NOW, "n1")),
+            Err(Refusal::WrongRunner)
+        );
+    }
+
+    #[test]
+    fn signature_from_another_namespace_is_refused() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let msg = canonical("POST", "/api/runner/jobs", b"{}", Some(7), NOW, "n1");
+        let pem = k
+            .sign("file", HashAlg::Sha512, &msg)
+            .unwrap()
+            .to_pem(LineEnding::LF)
+            .unwrap();
+        let sig = URL_SAFE_NO_PAD.encode(pem.as_bytes());
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, "n1")),
+            Err(Refusal::WrongRunner)
+        );
+    }
+
+    #[test]
+    fn bad_signature_does_not_burn_the_nonce() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", "bogus", parts(b"{}", NOW, "n1")),
+            Err(Refusal::WrongRunner)
+        );
+        assert!(v.seen.is_empty());
+        let sig = signed(&k, b"{}", NOW, "n1");
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, "n1")),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn nonces_expire_and_the_cache_is_bounded() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, "n1")),
+            Ok(())
+        );
+        let later = signed(&k, b"{}", NOW + 200, "n2");
+        assert_eq!(
+            v.verify(
+                at(NOW + 200),
+                mono(NOW + 200),
+                "r1",
+                &later,
+                parts(b"{}", NOW + 200, "n2")
+            ),
+            Ok(())
+        );
+        assert_eq!(v.seen.len(), 1, "the old nonce is dropped on verify");
+
+        for i in v.seen.len()..MAX_NONCES {
+            v.seen
+                .push_back((mono(NOW + 200), at(NOW + 200), format!("r1\nfill{i}")));
+        }
+        let full = signed(&k, b"{}", NOW + 200, "n3");
+        assert_eq!(
+            v.verify(
+                at(NOW + 200),
+                mono(NOW + 200),
+                "r1",
+                &full,
+                parts(b"{}", NOW + 200, "n3")
+            ),
+            Err(Refusal::StaleSignature)
+        );
+        assert_eq!(v.seen.len(), MAX_NONCES);
+    }
+
+    #[test]
+    fn non_canonical_base64_is_refused() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        let last = sig.chars().last().unwrap();
+        let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let other = alphabet
+            .chars()
+            .find(|c| {
+                *c != last
+                    && URL_SAFE_NO_PAD
+                        .decode(format!("{}{c}", &sig[..sig.len() - 1]))
+                        .is_err()
+            })
+            .expect("a differing tail with non-zero trailing bits");
+        let tampered = format!("{}{other}", &sig[..sig.len() - 1]);
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &tampered, parts(b"{}", NOW, "n1")),
+            Err(Refusal::WrongRunner)
+        );
+        assert!(URL_SAFE_NO_PAD.decode("QR").is_err());
+        assert!(URL_SAFE_NO_PAD.decode("QQ").is_ok());
+    }
+
+    #[test]
+    fn newline_in_method_or_path_and_long_nonce_are_refused() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        assert_eq!(
+            v.verify(
+                at(NOW),
+                mono(NOW),
+                "r1",
+                &sig,
+                ("POST\nX", "/p", b"{}", Some(7), NOW, "n1")
+            ),
+            Err(Refusal::WrongRunner)
+        );
+        assert_eq!(
+            v.verify(
+                at(NOW),
+                mono(NOW),
+                "r1",
+                &sig,
+                ("POST", "/p\nX", b"{}", Some(7), NOW, "n1")
+            ),
+            Err(Refusal::WrongRunner)
+        );
+        let long = "n".repeat(MAX_NONCE_LEN + 1);
+        let sig = signed(&k, b"{}", NOW, &long);
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, &long)),
+            Err(Refusal::WrongRunner)
+        );
+        let ok = "n".repeat(MAX_NONCE_LEN);
+        let sig = signed(&k, b"{}", NOW, &ok);
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, &ok)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn wall_clock_jump_does_not_evict_nonces() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, "n1")),
+            Ok(())
+        );
+        let sig2 = signed(&k, b"{}", NOW + 500, "n2");
+        assert_eq!(
+            v.verify(
+                at(NOW + 500),
+                mono(NOW + 1),
+                "r1",
+                &sig2,
+                parts(b"{}", NOW + 500, "n2")
+            ),
+            Ok(())
+        );
+        assert_eq!(v.seen.len(), 2, "wall clock jumped, monotonic did not");
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW + 2), "r1", &sig, parts(b"{}", NOW, "n1")),
+            Err(Refusal::StaleSignature)
+        );
+    }
+
+    #[test]
+    fn replay_at_window_edge_with_subsecond_clocks_is_refused() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let ms = |m: u64| Duration::from_millis(m);
+        let base = mono(NOW);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        let first_wall = UNIX_EPOCH + Duration::from_secs(NOW - 60);
+        assert_eq!(
+            v.verify(first_wall, base, "r1", &sig, parts(b"{}", NOW, "n1")),
+            Ok(())
+        );
+        let late_wall = UNIX_EPOCH + Duration::from_secs(NOW + 60) + ms(500);
+        assert_eq!(
+            v.verify(
+                late_wall,
+                base + ms(120_500),
+                "r1",
+                &sig,
+                parts(b"{}", NOW, "n1")
+            ),
+            Err(Refusal::StaleSignature)
+        );
+    }
+
+    #[test]
+    fn wall_clock_step_back_does_not_evict_nonces() {
+        let k = key();
+        let mut v = verifier(&[("r1", &k)]);
+        let sig = signed(&k, b"{}", NOW, "n1");
+        assert_eq!(
+            v.verify(at(NOW), mono(NOW), "r1", &sig, parts(b"{}", NOW, "n1")),
+            Ok(())
+        );
+        assert_eq!(
+            v.verify(
+                at(NOW - 30),
+                mono(NOW + 140),
+                "r1",
+                &sig,
+                parts(b"{}", NOW, "n1")
+            ),
+            Err(Refusal::StaleSignature)
+        );
+        assert_eq!(v.seen.len(), 1);
+    }
+}

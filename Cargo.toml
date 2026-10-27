@@ -23,6 +23,10 @@ path = "src/bin/shoephone.rs"
 name = "shoephoned"
 path = "src/bin/shoephoned.rs"
 
+[[bin]]
+name = "shoephone-runner"
+path = "src/bin/shoephone-runner.rs"
+
 [features]
 # Adds POST /api/test/approve, which opens a window with no security key.
 # For integration tests only; never enable it in a build that gets deployed.
@@ -30,6 +34,9 @@ test-hooks = []
 
 [dependencies]
 axum = "0.8.9"
+base64 = "0.23.1"
+# Already in Cargo.lock through tokio and friends; used for O_NOFOLLOW.
+libc = "0.2"
 jsonwebtoken = { version = "11.0.0", features = ["rust_crypto"] }
 qrcodegen = "1.8.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["http2", "rustls-no-provider", "json"] }
@@ -46,8 +53,15 @@ webauthn-rs = { version = "0.5.5", features = [
     # the daemon reads to refuse synced passkeys.
     "danger-credential-internals",
 ] }
+tar = { version = "0.4.46", default-features = false }
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+hcl-rs = { version = "0.19.9", default-features = false }
+# dep-quality DFS 5.9/10 (2026-10-26): adoption 10, bus-factor 8, responsiveness 2.
+regex = "1.13.1"
+# dep-quality DFS 8.6/10 (2026-10-26): adoption 7.8, bus-factor 8, responsiveness 10.
+similar = "3.2.1"
 
 [dev-dependencies]
-base64 = "0.23.1"
 ring = "0.17.14"
 shoephone = { path = ".", features = ["test-hooks"] }
+tempfile = "3.27.0"

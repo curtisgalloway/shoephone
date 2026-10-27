@@ -4,7 +4,7 @@
 //!
 //! Every ledger event reaches the phone as a push: a request arriving, a
 //! window opening, a certificate issued, a request declined or timed out,
-//! a window killed. That is the design's audit rule -- the daemon's own
+//! a window killed, and every step of a Terraform trust or apply job. That is the design's audit rule -- the daemon's own
 //! ledger is worthless once the daemon is compromised, but a push already
 //! delivered stays on the phone. The payload is one fixed sentence and
 //! never carries the host, the scope, or anything else from the request:
@@ -49,6 +49,30 @@ pub enum Push {
     RequestDeclined,
     /// A pending request expired with no answer.
     RequestTimedOut,
+    /// A code change to a Terraform project is waiting to be trusted.
+    TrustWaiting,
+    /// A Terraform plan is waiting to be applied.
+    ApplyWaiting,
+    /// A code change was trusted.
+    Trusted,
+    /// A runner began reviewing a trust or planning an apply.
+    PlanStarted,
+    /// A trust or apply ended without a scope for the approver.
+    PlanRefused,
+    /// A plan was applied.
+    Applied,
+    /// A claimed trust or apply failed part way.
+    ApplyFailed,
+    /// A claimed job may have run; the daemon cannot say how it ended.
+    OutcomeUnknown,
+    /// A trust or apply request was filed. Silent on purpose: nobody is
+    /// asked until the plan is ready, and `TrustWaiting` or `ApplyWaiting`
+    /// says so then.
+    JobRequested,
+    /// The approver approved a trust or apply.
+    JobApproved,
+    /// A trust or apply was cancelled from the page.
+    JobKilled,
 }
 
 impl Push {
@@ -62,16 +86,38 @@ impl Push {
             Push::CertificateIssued => "certificate_issued",
             Push::RequestDeclined => "request_declined",
             Push::RequestTimedOut => "request_timed_out",
+            Push::TrustWaiting => "trust_waiting",
+            Push::ApplyWaiting => "apply_waiting",
+            Push::Trusted => "trusted",
+            Push::PlanStarted => "plan_started",
+            Push::PlanRefused => "plan_refused",
+            Push::Applied => "applied",
+            Push::ApplyFailed => "apply_failed",
+            Push::OutcomeUnknown => "outcome_unknown",
+            Push::JobRequested => "job_requested",
+            Push::JobApproved => "job_approved",
+            Push::JobKilled => "job_killed",
         }
     }
 
-    pub const ALL: [Push; 6] = [
+    pub const ALL: [Push; 17] = [
         Push::RequestWaiting,
         Push::WindowOpened,
         Push::WindowKilled,
         Push::CertificateIssued,
         Push::RequestDeclined,
         Push::RequestTimedOut,
+        Push::TrustWaiting,
+        Push::ApplyWaiting,
+        Push::Trusted,
+        Push::PlanStarted,
+        Push::PlanRefused,
+        Push::Applied,
+        Push::ApplyFailed,
+        Push::OutcomeUnknown,
+        Push::JobRequested,
+        Push::JobApproved,
+        Push::JobKilled,
     ];
 
     fn body(self) -> &'static str {
@@ -82,13 +128,28 @@ impl Push {
             Push::CertificateIssued => "A certificate was issued.",
             Push::RequestDeclined => "A request was declined.",
             Push::RequestTimedOut => "A request expired without an answer.",
+            Push::TrustWaiting => "A code change is waiting for your approval.",
+            Push::ApplyWaiting => "A plan is waiting for your approval.",
+            Push::Trusted => "A code change was trusted.",
+            Push::PlanStarted => "Planning started.",
+            Push::PlanRefused => "A request was refused.",
+            Push::Applied => "A plan was applied.",
+            Push::ApplyFailed => "A change failed part way.",
+            Push::OutcomeUnknown => "A change ended with an unknown outcome.",
+            Push::JobRequested => "A request was filed.",
+            Push::JobApproved => "A request was approved.",
+            Push::JobKilled => "A request was cancelled.",
         }
     }
 
-    /// Only the request asks for the person. Everything else is the audit
-    /// record: it should land on the phone, not interrupt.
+    /// Only a request, a code change or a plan waiting on the person asks
+    /// for them. Everything else is the audit record: it should land on the
+    /// phone, not interrupt.
     fn is_record(self) -> bool {
-        !matches!(self, Push::RequestWaiting)
+        !matches!(
+            self,
+            Push::RequestWaiting | Push::TrustWaiting | Push::ApplyWaiting
+        )
     }
 
     fn priority(self) -> &'static str {
@@ -103,6 +164,17 @@ impl Push {
             Push::CertificateIssued => "key",
             Push::RequestDeclined => "x",
             Push::RequestTimedOut => "hourglass",
+            Push::TrustWaiting => "lock",
+            Push::ApplyWaiting => "construction",
+            Push::Trusted => "white_check_mark",
+            Push::PlanStarted => "gear",
+            Push::PlanRefused => "stop_sign",
+            Push::Applied => "tada",
+            Push::ApplyFailed => "warning",
+            Push::OutcomeUnknown => "question",
+            Push::JobRequested => "inbox_tray",
+            Push::JobApproved => "thumbsup",
+            Push::JobKilled => "no_entry_sign",
         }
     }
 }
@@ -276,9 +348,20 @@ impl Apns {
     /// no badge at all, which is most of the time and most of the point.
     pub fn payload(push: Push, badge: u64) -> serde_json::Value {
         let level = match push {
-            Push::RequestWaiting => "time-sensitive",
-            Push::WindowOpened | Push::WindowKilled => "active",
-            Push::CertificateIssued | Push::RequestDeclined | Push::RequestTimedOut => "passive",
+            Push::RequestWaiting | Push::TrustWaiting | Push::ApplyWaiting => "time-sensitive",
+            Push::WindowOpened | Push::WindowKilled | Push::JobApproved | Push::JobKilled => {
+                "active"
+            }
+            Push::CertificateIssued
+            | Push::RequestDeclined
+            | Push::RequestTimedOut
+            | Push::Trusted
+            | Push::PlanStarted
+            | Push::PlanRefused
+            | Push::Applied
+            | Push::ApplyFailed
+            | Push::OutcomeUnknown
+            | Push::JobRequested => "passive",
         };
         serde_json::json!({
             "aps": {
@@ -563,6 +646,70 @@ mod tests {
                     "payload for {push:?} leaked {forbidden}: {text}"
                 );
             }
+        }
+    }
+    #[test]
+    fn only_waiting_job_pushes_interrupt() {
+        let interrupting: Vec<Push> = Push::ALL.into_iter().filter(|p| !p.is_record()).collect();
+        assert_eq!(
+            interrupting,
+            [Push::RequestWaiting, Push::TrustWaiting, Push::ApplyWaiting]
+        );
+        for push in [Push::TrustWaiting, Push::ApplyWaiting] {
+            assert_eq!(
+                Apns::payload(push, 1)["aps"]["interruption-level"],
+                "time-sensitive",
+                "{push:?}"
+            );
+            assert_eq!(push.priority(), "high", "{push:?}");
+            assert!(Apns::collapse_id(push).is_some(), "{push:?}");
+        }
+        for push in [
+            Push::Trusted,
+            Push::PlanStarted,
+            Push::PlanRefused,
+            Push::Applied,
+            Push::ApplyFailed,
+            Push::OutcomeUnknown,
+            Push::JobRequested,
+        ] {
+            assert!(push.is_record(), "{push:?}");
+            assert_eq!(
+                Apns::payload(push, 0)["aps"]["interruption-level"],
+                "passive",
+                "{push:?}"
+            );
+        }
+        assert_eq!(Push::TrustWaiting.kind(), "trust_waiting");
+        assert_eq!(Push::ApplyWaiting.kind(), "apply_waiting");
+        assert_eq!(Push::Trusted.kind(), "trusted");
+        assert_eq!(Push::PlanStarted.kind(), "plan_started");
+        assert_eq!(Push::PlanRefused.kind(), "plan_refused");
+        assert_eq!(Push::Applied.kind(), "applied");
+        assert_eq!(Push::ApplyFailed.kind(), "apply_failed");
+        assert_eq!(Push::OutcomeUnknown.kind(), "outcome_unknown");
+        assert_eq!(Push::JobRequested.kind(), "job_requested");
+        assert_eq!(Push::JobApproved.kind(), "job_approved");
+        assert_eq!(Push::JobKilled.kind(), "job_killed");
+        // Trust and apply jobs share these, so none says "deploy".
+        for (push, body) in [
+            (Push::JobRequested, "A request was filed."),
+            (Push::PlanStarted, "Planning started."),
+            (Push::PlanRefused, "A request was refused."),
+            (Push::JobApproved, "A request was approved."),
+            (Push::JobKilled, "A request was cancelled."),
+            (Push::ApplyFailed, "A change failed part way."),
+            (
+                Push::OutcomeUnknown,
+                "A change ended with an unknown outcome.",
+            ),
+            (Push::ApplyWaiting, "A plan is waiting for your approval."),
+            (Push::Applied, "A plan was applied."),
+        ] {
+            assert_eq!(push.body(), body, "{push:?}");
+        }
+        for push in Push::ALL {
+            assert!(!push.body().contains("deploy"), "{push:?}");
         }
     }
 }

@@ -1,0 +1,7 @@
+{"@level":"info","type":"version"}
+not json at all
+{"@level":"error","type":"diagnostic","diagnostic":{"severity":"error","summary":"bad LEAKME","detail":"token LEAKME","address":"module.net.aws_x.b[\"k\"]","range":{"filename":"/home/LEAKME/main.tf"}}}
+{"@level":"error","type":"diagnostic","diagnostic":{"severity":"error","summary":"x","detail":"LEAKME","address":"null_resource.a"}}
+{"@level":"error","type":"diagnostic","diagnostic":{"severity":"error","summary":"x","address":"null_resource.a"}}
+{"@level":"error","type":"diagnostic","diagnostic":{"severity":"error","summary":"no address LEAKME"}}
+[1,2]

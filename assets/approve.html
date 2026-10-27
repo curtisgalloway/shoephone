@@ -21,13 +21,23 @@
   .kv dt { color: var(--muted); } .kv dd { margin: 0; overflow-wrap: anywhere; font-family: ui-monospace, Menlo, monospace; font-size: .85rem; }
   .row { display: flex; gap: .8rem; margin-top: 1rem; }
   button { flex: 1; font: inherit; font-weight: 650; padding: .9rem; border: 0; border-radius: 10px; color: white; }
-  button.ok { background: var(--ok); } button.no { background: var(--no); } button.plain { background: var(--muted); }
+  button.ok { background: var(--ok); } button.trust { background: #6d28d9; } button.no { background: var(--no); } button.plain { background: var(--muted); }
   button:disabled { opacity: .5; }
   .muted { color: var(--muted); font-size: .92rem; }
   .status { min-height: 1.4em; font-size: .95rem; }
   ul { list-style: none; padding: 0; margin: 0; } li { padding: .35rem 0; border-top: 1px solid rgba(127,127,127,.2); font-size: .9rem; display: flex; gap: .6rem; }
   li time { color: var(--muted); white-space: nowrap; }
   input { font: inherit; padding: .7rem; border-radius: 10px; border: 1px solid rgba(127,127,127,.4); width: 100%; box-sizing: border-box; text-transform: uppercase; letter-spacing: .1em; }
+  .band { border-radius: 8px; padding: .5rem .8rem; margin: 0 0 .8rem; font-weight: 650; color: white; }
+  .band.trust { background: #6d28d9; } .band.apply { background: #0b6bcb; }
+  .warn { border: 2px solid var(--no); color: var(--no); border-radius: 8px; padding: .5rem .8rem; margin: 0 0 .8rem; font-weight: 600; }
+  .obligation { border-left: 4px solid #6d28d9; padding: .2rem .8rem; margin: 0 0 .8rem; font-size: .95rem; }
+  pre.block .dfile { font-weight: 700; display: inline-block; border-top: 2px solid currentColor; margin-top: .4rem; padding-top: .2rem; }
+  pre.block { font: .8rem/1.35 ui-monospace, Menlo, monospace; background: rgba(127,127,127,.12); border-radius: 8px; padding: .6rem; margin: .4rem 0 .8rem; overflow: auto; max-height: 60vh; white-space: pre; }
+  .job h2 { font-size: 1.3rem; margin: 0 0 .5rem; }
+  .job h3 { font-size: .95rem; margin: .8rem 0 .2rem; color: var(--muted); }
+  .job li { display: block; font-family: ui-monospace, Menlo, monospace; font-size: .82rem; overflow-wrap: anywhere; }
+  .job li.del { color: var(--no); font-weight: 650; }
   .hidden { display: none; }
   summary { cursor: pointer; color: var(--muted); }
 </style>
@@ -52,6 +62,25 @@
     <button class="ok" id="approve">Approve</button>
   </div>
   <p class="status" id="status"></p>
+</div>
+
+<div id="job" class="card job hidden">
+  <div id="jobband" class="band"></div>
+  <h2 id="jobheading"></h2>
+  <p class="reason"><span class="muted">the agent says:</span> <span id="jobreason"></span></p>
+  <p class="muted"><a id="jobcontext" class="hidden" target="_blank" rel="noopener">Open the session</a></p>
+  <p class="muted">Compare this code with the terminal:</p>
+  <p class="code" id="jobmatch"></p>
+  <div id="jobbody"></div>
+  <dl class="kv">
+    <dt>from</dt><dd id="jobrequester"></dd>
+    <dt>expires</dt><dd id="jobexpires"></dd>
+  </dl>
+  <div class="row">
+    <button class="no" id="jobdecline">Decline</button>
+    <button class="ok" id="jobapprove">Approve</button>
+  </div>
+  <p class="status" id="jobstatus"></p>
 </div>
 
 <div id="idle" class="card">
@@ -92,22 +121,26 @@ async function api(path, body) {
 }
 
 let current = null;
+let currentJob = null;
 let busy = false;
 
 async function refresh() {
   if (busy) return;
   let s;
   try { s = await api('/api/pending'); } catch (e) { $('idletext').textContent = 'Daemon unreachable: ' + e.message; return; }
+  if (busy) return;
   current = s.pending;
+  currentJob = s.job || null;
   $('pending').classList.toggle('hidden', !s.pending);
-  $('idle').classList.toggle('hidden', !!s.pending);
+  $('idle').classList.toggle('hidden', !!s.pending || !!currentJob);
+  showJob(currentJob);
   if (s.pending) {
     const p = s.pending;
     $('scope').textContent = `admin on ${p.host} until ${when(p.ends_at)}`;
     $('match').textContent = p.match_code;
-    $('reason').textContent = p.reason;
-    $('context').classList.toggle('hidden', !p.context); if (p.context) $('context').href = p.context;
-    $('requester').textContent = p.requester || '(unnamed)';
+    $('reason').textContent = visible(p.reason);
+    setLink($('context'), p.context);
+    $('requester').textContent = visible(p.requester || '(unnamed)');
     $('fingerprint').textContent = p.fingerprint;
     $('principal').textContent = p.principal;
     $('expires').textContent = `request expires ${when(p.expires)}`;
@@ -130,7 +163,7 @@ async function refresh() {
       const li = document.createElement('li');
       const t = document.createElement('time'); t.textContent = when(e.at);
       const s = document.createElement('span');
-      s.textContent = `${e.kind.replace('_', ' ')} ${e.host}` + (e.until ? ` until ${when(e.until)}` : '') + (e.serial ? ` #${e.serial}` : '');
+      s.textContent = visible(`${String(e.kind).replace(/_/g, ' ')} ${e.host}`) + (e.until ? ` until ${when(e.until)}` : '') + (e.serial ? ` #${e.serial}` : '');
       li.append(t, s); return li;
     }));
   } catch (e) {}
@@ -174,6 +207,465 @@ $('decline').onclick = async () => {
   try { await api('/api/decline', {id: current.id}); $('status').textContent = 'Declined.'; }
   catch (e) { $('status').textContent = e.message; }
   finally { busy = false; setTimeout(refresh, 300); }
+};
+
+// ---- Terraform jobs: trust and apply ------------------------------------
+// Everything below renders untrusted text with textContent only, after
+// escaping bidirectional and control characters. Before the security key is
+// touched, verifyJob() rebuilds every digest in the scope from the text on
+// screen, rebuilds the bytes the key will sign, and compares their hash with
+// the daemon's challenge, exactly as the SSH path does. The job it checks is
+// the very object that was rendered (see jobToSign), never a newer poll.
+
+const MISMATCH = "the daemon's challenge does not match the request on screen";
+const OBLIGATION = 'For every manifest the schema accepts, protected credentials may reach only their provider authentication and the approved destinations, and nothing the agent can see (results, addresses, which actions run) may reveal them.';
+const ACTIONS = ['create', 'update', 'replace', 'delete'];
+const BAD_ADDRESS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+// The one list of characters the page shows as escapes (besides the
+// backslash, handled below): C0 and C1 controls, DEL, soft hyphen, Arabic
+// letter mark, zero-width space, LRM and RLM, line and paragraph separators,
+// bidi embeddings and isolates, word joiner, BOM and tag characters. Written
+// as escape text, so the source holds no invisible character. A multi-line
+// block keeps tab and newline, so its set is this one with those removed.
+const HIDDEN_CHARS = String.raw`\u{0}-\u{8}\u{9}\u{a}\u{b}-\u{1f}\u{7f}-\u{9f}\u{ad}\u{61c}\u{200b}\u{200e}-\u{200f}\u{2028}-\u{202e}\u{2060}\u{2066}-\u{2069}\u{feff}\u{e0000}-\u{e007f}`;
+const LINE_CHARS = String.raw`\u{9}\u{a}`;
+const ESCAPED_IN_BLOCK = HIDDEN_CHARS.replace(LINE_CHARS, '');
+const HIDDEN_ANY = new RegExp(String.raw`[\\` + HIDDEN_CHARS + ']', 'gu');
+const HIDDEN_KEEP_LINES = new RegExp(String.raw`[\\` + ESCAPED_IN_BLOCK + ']', 'gu');
+const BLOCK_BACKSLASHES = new RegExp(String.raw`\\+(?=[uU` + ESCAPED_IN_BLOCK + '])', 'gu');
+const SLUG = /^[A-Za-z0-9._-]{1,64}$/;
+const DIGEST = /^[0-9a-f]{64}$/;
+
+// Shows control, zero-width, line-separator, bidirectional and tag characters
+// as \uXXXX, and a literal backslash as two, so no text can pass for an
+// escape. keepLines leaves newline and tab alone, for a multi-line block.
+// keepBackslash is for JSON text, whose backslashes are already escapes.
+function visible(text, keepLines, keepBackslash) {
+  return String(text).replace(keepLines ? HIDDEN_KEEP_LINES : HIDDEN_ANY, c => {
+    if (c === '\\') return keepBackslash ? c : '\\\\';
+    const n = c.codePointAt(0).toString(16).padStart(4, '0');
+    return n.length > 4 ? '\\u{' + n + '}' : '\\u' + n;
+  });
+}
+
+// For a multi-line code block: backslashes are shown as written, so \n and
+// \" in source read as typed, except a run of them right before a u, a U, or
+// a character this page escapes. That run is doubled, so typed text can never
+// pass for one of the page's own \u escapes: before an escape the count of
+// backslashes is odd, before a typed u it is even.
+function visibleDiff(text) {
+  return visible(String(text).replace(BLOCK_BACKSLASHES, m => m + m), true, true);
+}
+
+async function sha256Hex(text) {
+  const d = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return Array.from(new Uint8Array(d), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+function trustBytes(s, nonce) {
+  return 'shoephone-trust-v1\nproject=' + s.project + '\nbaseline=' + (s.baseline ?? 'none') +
+    '\ncandidate=' + s.candidate + '\ndiff=' + s.diff + '\nschema=' + s.schema +
+    '\npolicy=' + s.policy_version + '\nfiles=' + s.files_changed + '\nadded=' + s.lines_added +
+    '\nremoved=' + s.lines_removed + '\nschema_changed=' + (s.schema_changed ? 1 : 0) +
+    '\nnonce=' + nonce + '\n';
+}
+
+function applyBytes(s, nonce) {
+  return 'shoephone-apply-v1\nproject=' + s.project + '\nrevision=' + s.revision +
+    '\nschema=' + s.schema + '\nmanifest=' + s.manifest +
+    '\nbaseline_manifest=' + (s.baseline_manifest ?? 'none') +
+    '\nbaseline_status=' + s.baseline_status + '\nplan=' + s.plan +
+    '\ndestructive=' + (s.destructive ? 1 : 0) + '\ncreate=' + s.counts.create +
+    '\nupdate=' + s.counts.update + '\nreplace=' + s.counts.replace +
+    '\ndelete=' + s.counts.delete + '\naddresses=' + s.addresses + '\nnonce=' + nonce + '\n';
+}
+
+// lines: the text's lines without their newlines, "{action} {address}".
+function addressText(lines) { return lines.map(l => l + '\n').join(''); }
+
+// The changes in an address text, or null if the text is not exactly one
+// well-formed "{action} {address}" line per change.
+function parseAddressText(text) {
+  if (typeof text !== 'string') return null;
+  if (text === '') return [];
+  if (!text.endsWith('\n')) return null;
+  const out = [];
+  for (const line of text.slice(0, -1).split('\n')) {
+    const i = line.indexOf(' ');
+    if (i < 0) return null;
+    const action = line.slice(0, i), address = line.slice(i + 1);
+    if (!ACTIONS.includes(action) || address === '' || BAD_ADDRESS.test(address)) return null;
+    out.push({action, address});
+  }
+  return out;
+}
+
+function countActions(changes) {
+  const c = {create: 0, update: 0, replace: 0, delete: 0};
+  for (const ch of changes) c[ch.action] += 1;
+  return c;
+}
+
+// The top-level entries of a canonical JSON object manifest, as a Map from
+// key to the exact text of its value. Throws unless the text is valid JSON
+// with an object at the top, no key repeated in any object, and no number
+// that a JSON parser would turn into an infinity. Values are compared and
+// shown as written, never reparsed, so two numbers a double cannot tell
+// apart still show as different.
+function manifestEntries(text) {
+  JSON.parse(text);
+  let i = 0;
+  const ws = () => { while (i < text.length && ' \t\n\r'.includes(text[i])) i += 1; };
+  const str = () => {
+    const start = i;
+    i += 1;
+    while (text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
+    i += 1;
+    return JSON.parse(text.slice(start, i));
+  };
+  const val = top => {
+    ws();
+    const c = text[i];
+    if (c === '{') {
+      i += 1; ws();
+      const seen = new Map();
+      if (text[i] === '}') { i += 1; return seen; }
+      for (;;) {
+        ws();
+        const k = str();
+        if (seen.has(k)) throw new Error('duplicate key');
+        ws(); i += 1; ws();
+        const from = i;
+        val(false);
+        seen.set(k, top ? text.slice(from, i) : true);
+        ws();
+        if (text[i] === ',') { i += 1; continue; }
+        i += 1; return seen;
+      }
+    }
+    if (top) throw new Error('manifest is not an object');
+    if (c === '[') {
+      i += 1; ws();
+      if (text[i] === ']') { i += 1; return; }
+      for (;;) {
+        val(false); ws();
+        if (text[i] === ',') { i += 1; continue; }
+        i += 1; return;
+      }
+    } else if (c === '"') {
+      str();
+    } else {
+      const from = i;
+      while (i < text.length && !',]} \t\n\r'.includes(text[i])) i += 1;
+      const tok = text.slice(from, i);
+      if (c !== 't' && c !== 'f' && c !== 'n' && !Number.isFinite(Number(tok))) throw new Error('number out of range: ' + tok);
+    }
+  };
+  return val(true);
+}
+
+// Added, removed and changed variables between two canonical manifests; the
+// baseline is null when there is none. Values are the manifests' own text,
+// and a value is changed exactly when its text differs.
+function variableDiff(baseline, manifest) {
+  const a = baseline === null || baseline === undefined ? new Map() : manifestEntries(baseline);
+  const b = manifestEntries(manifest);
+  const out = {added: [], removed: [], changed: []};
+  for (const key of [...b.keys()].sort()) {
+    if (!a.has(key)) out.added.push({key, new: b.get(key)});
+    else if (a.get(key) !== b.get(key)) out.changed.push({key, old: a.get(key), new: b.get(key)});
+  }
+  for (const key of [...a.keys()].sort()) {
+    if (!b.has(key)) out.removed.push({key, old: a.get(key)});
+  }
+  return out;
+}
+
+const isText = v => typeof v === 'string';
+const isDigest = v => isText(v) && DIGEST.test(v);
+const isCount = v => Number.isInteger(v) && v >= 0;
+
+// The command the operator runs in their own checkout, built here from
+// signed fields so a runner cannot put its own text in front of the key.
+function verifyCommand(s) {
+  const b = s.baseline ?? null;
+  return 'shoephone-runner diff-digest ' + (b ?? 'none') + ' ' + (b ? '<baseline-checkout>' : '-') +
+    ' <candidate-checkout> <project-path>';
+}
+
+// True when the scope is shaped the way the daemon's scope.rs requires.
+function scopeWellFormed(s) {
+  if (!s || !isText(s.project) || !SLUG.test(s.project)) return false;
+  if (s.kind === 'trust') {
+    return (s.baseline === null || s.baseline === undefined || isDigest(s.baseline)) &&
+      isDigest(s.candidate) && isDigest(s.diff) && isDigest(s.schema) &&
+      [s.policy_version, s.files_changed, s.lines_added, s.lines_removed].every(isCount) &&
+      typeof s.schema_changed === 'boolean';
+  }
+  if (s.kind === 'apply') {
+    return isDigest(s.revision) && isDigest(s.schema) && isDigest(s.manifest) &&
+      (s.baseline_manifest === null || s.baseline_manifest === undefined || isDigest(s.baseline_manifest)) &&
+      ['none', 'applied', 'uncertain'].includes(s.baseline_status) &&
+      isDigest(s.plan) && isDigest(s.addresses) && typeof s.destructive === 'boolean' &&
+      !!s.counts && ACTIONS.every(k => isCount(s.counts[k]));
+  }
+  return false;
+}
+
+// Checks everything the page can check offline and returns the bytes the key
+// will sign. Throws MISMATCH on any disagreement or missing display field.
+// job.challenge is the WebAuthn challenge the daemon issued.
+async function verifyJob(job) {
+  const s = job.scope, d = job.display;
+  if (!s || !d || !isText(job.nonce) || !isText(job.challenge)) throw new Error(MISMATCH);
+  if (job.kind !== s.kind || job.project !== s.project || !scopeWellFormed(s)) throw new Error(MISMATCH);
+  let bytes;
+  if (s.kind === 'trust') {
+    if (!d.external) {
+      if (!isText(d.diff) || d.diff === '') throw new Error(MISMATCH);
+      if (await sha256Hex(d.diff) !== s.diff) throw new Error(MISMATCH);
+    }
+    bytes = trustBytes(s, job.nonce);
+  } else {
+    if (!isText(d.manifest) || !isText(d.address_text)) throw new Error(MISMATCH);
+    if (await sha256Hex(d.manifest) !== s.manifest) throw new Error(MISMATCH);
+    if (s.baseline_manifest === null || s.baseline_manifest === undefined) {
+      if (d.baseline_manifest !== null && d.baseline_manifest !== undefined) throw new Error(MISMATCH);
+    } else if (!isText(d.baseline_manifest) || await sha256Hex(d.baseline_manifest) !== s.baseline_manifest) {
+      throw new Error(MISMATCH);
+    }
+    if (await sha256Hex(d.address_text) !== s.addresses) throw new Error(MISMATCH);
+    const changes = parseAddressText(d.address_text);
+    if (changes === null) throw new Error(MISMATCH);
+    const c = countActions(changes);
+    for (const k of ACTIONS) if (c[k] !== s.counts[k]) throw new Error(MISMATCH);
+    if (s.destructive !== (c.delete > 0 || c.replace > 0)) throw new Error(MISMATCH);
+    try { variableDiff(d.baseline_manifest ?? null, d.manifest); } catch (e) { throw new Error(MISMATCH); }
+    bytes = applyBytes(s, job.nonce);
+  }
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(bytes));
+  if (b64u.enc(digest) !== job.challenge) throw new Error(MISMATCH);
+  return bytes;
+}
+
+// Only https links are offered; anything else would be agent-chosen script
+// or a local scheme.
+function setLink(a, url) {
+  const ok = isText(url) && url.startsWith('https://');
+  a.classList.toggle('hidden', !ok);
+  if (ok) a.href = url;
+}
+
+function el(tag, text, cls, escaped) {
+  const e = document.createElement(tag);
+  if (text !== undefined) e.textContent = escaped ? text : visible(text);
+  if (cls) e.className = cls;
+  return e;
+}
+function section(title, ...nodes) {
+  const box = el('div');
+  box.append(el('h3', title), ...nodes);
+  return box;
+}
+function block(text) {
+  const e = el('pre', undefined, 'block');
+  e.textContent = visibleDiff(text);
+  return e;
+}
+// The diff, one element per line, so the line that starts each file stands
+// out. Content lines always start with a space, +, - or backslash, so only
+// the diff itself can produce a line starting 'diff --git '.
+function diffBlock(text) {
+  const e = el('pre', undefined, 'block');
+  const lines = visibleDiff(text).split('\n');
+  lines.forEach((line, i) => {
+    const row = document.createElement('span');
+    row.textContent = line + (i < lines.length - 1 ? '\n' : '');
+    if (line.startsWith('diff --git ')) row.className = 'dfile';
+    e.append(row);
+  });
+  return e;
+}
+function kv(pairs) {
+  const dl = el('dl', undefined, 'kv');
+  for (const [k, v] of pairs) dl.append(el('dt', k), el('dd', v));
+  return dl;
+}
+function lineList(items) {
+  const ul = el('ul');
+  for (const [text, cls, escaped] of items) ul.append(el('li', text, cls, escaped));
+  return ul;
+}
+
+// What each runner warning kind means, in plain words. An unknown kind is
+// shown as such, never dropped, and never refuses anything.
+const WARNING_LABELS = {
+  provisioner: 'provisioner block',
+  external_data: 'external data source',
+  http_data: 'HTTP data source',
+  import: 'import block',
+  nonsensitive: 'nonsensitive() call',
+  provider_function: 'provider-defined function',
+  local_file_read: 'local file read',
+};
+function warningLine(w) {
+  let label;
+  if (w.kind === 'schema_variable_steers') label = 'agent-settable variable ' + String(w.variable) + ' reaches ' + String(w.into);
+  else if (Object.prototype.hasOwnProperty.call(WARNING_LABELS, w.kind)) label = WARNING_LABELS[w.kind];
+  else label = 'unknown warning ' + String(w.kind);
+  return label + ' ' + String(w.file) + ':' + String(w.line);
+}
+// Advisory only: the runner's review warnings are not in the signed bytes.
+function warningsSection(list, omitted) {
+  const items = Array.isArray(list) ? list : [];
+  const nodes = [items.length ? lineList(items.map(w => [warningLine(w)])) : el('p', 'No warnings', 'muted')];
+  if (Number.isInteger(omitted) && omitted > 0) nodes.push(el('p', omitted + ' more warnings not shown', 'muted'));
+  return section('Runner warnings (not covered by your signature)', ...nodes);
+}
+
+function renderTrust(j) {
+  const s = j.scope, d = j.display;
+  const nodes = [el('p', OBLIGATION, 'obligation')];
+  nodes.push(kv([
+    ['files changed', String(s.files_changed)], ['lines added', String(s.lines_added)],
+    ['lines removed', String(s.lines_removed)], ['schema changed', s.schema_changed ? 'yes' : 'no'],
+  ]));
+  nodes.push(warningsSection(d.warnings, d.warnings_omitted));
+  if (d.external) {
+    nodes.push(el('p', 'This diff is too large to show here. Run this command against your own clean exports of both revisions (git worktree add, or git archive | tar x; no .terraform directory, no untracked files). It must print the candidate digest and the diff digest below, and both must match.', 'warn'));
+    nodes.push(section('verification command', block(verifyCommand(s))));
+    nodes.push(kv([['diff digest', s.diff], ['candidate digest', s.candidate], ['baseline', s.baseline ?? 'none'], ['schema', s.schema]]));
+  } else if (isText(d.diff) && d.diff !== '') {
+    nodes.push(section('diff', diffBlock(d.diff)));
+  } else {
+    nodes.push(el('p', 'The daemon sent no diff to show. Do not approve.', 'warn'));
+  }
+  return nodes;
+}
+
+// The variable diff as display lines, already escaped: keys escape every
+// backslash, while JSON values keep theirs (they are JSON escapes already).
+function variableRows(v) {
+  const k = x => visible(x.key);
+  const j = t => visible(t, false, true);
+  const rows = [];
+  for (const x of v.added) rows.push('+ ' + k(x) + ' = ' + j(x.new));
+  for (const x of v.removed) rows.push('- ' + k(x) + ' (was ' + j(x.old) + ')');
+  for (const x of v.changed) rows.push('~ ' + k(x) + ': ' + j(x.old) + ' -> ' + j(x.new));
+  return rows;
+}
+
+// The first 12 hex digits of a digest, enough to compare by eye with the
+// trust that was approved. Anything else is shown whole, through visible().
+function shortDigest(d) {
+  return isDigest(d) ? d.slice(0, 12) : String(d);
+}
+
+function renderApply(j) {
+  const s = j.scope, d = j.display;
+  const nodes = [];
+  const changes = parseAddressText(d.address_text);
+  if (s.baseline_status === 'uncertain') nodes.push(el('p', 'last apply did not finish cleanly; this diff may be incomplete', 'warn'));
+  try {
+    const v = variableDiff(d.baseline_manifest ?? null, d.manifest);
+    const rows = variableRows(v).map(t => [t, undefined, true]);
+    nodes.push(section('variables', rows.length ? lineList(rows) : el('p', 'no variable changes', 'muted')));
+  } catch (e) {
+    nodes.push(el('p', 'The manifest is missing or malformed. Do not approve.', 'warn'));
+  }
+  if (changes === null) {
+    nodes.push(el('p', 'The change list is missing or malformed. Do not approve.', 'warn'));
+  } else {
+    const risky = changes.filter(c => c.action === 'delete' || c.action === 'replace');
+    if (s.destructive || risky.length) {
+      const box = el('div', undefined, 'warn');
+      box.append(el('div', 'Deletes and replaces'), lineList(risky.map(c => [c.action + ' ' + c.address, 'del'])));
+      nodes.push(box);
+    }
+    const c = countActions(changes);
+    nodes.push(kv(ACTIONS.map(k => [k, String(c[k])])));
+    nodes.push(section('changes', lineList(changes.map(c => [c.action + ' ' + c.address, c.action === 'delete' || c.action === 'replace' ? 'del' : undefined]))));
+  }
+  nodes.push(kv([['baseline', s.baseline_status], ['revision', shortDigest(s.revision)], ['schema', shortDigest(s.schema)]]));
+  return nodes;
+}
+
+// The job last rendered, and a serialization of all of it. The key is
+// verified and signed over this object, not over whatever the latest poll
+// returned.
+let shownJob = null;
+// Counts renders, so a hold timer releases the buttons only for the render
+// that started it.
+let renderGen = 0;
+// The render whose hold has run out. The buttons work only while it is the
+// current render and no approval or decline is in flight.
+let releasedGen = -1;
+function releaseJobButtons() {
+  if (releasedGen === renderGen && !busy) $('jobapprove').disabled = $('jobdecline').disabled = false;
+}
+function jobToSign() { return shownJob ? shownJob.job : null; }
+
+function showJob(j) {
+  $('job').classList.toggle('hidden', !j);
+  if (!j) { shownJob = null; renderGen += 1; return; }
+  const key = JSON.stringify(j);
+  if (shownJob && shownJob.key === key) return;
+  shownJob = {key, job: j};
+  const gen = ++renderGen;
+  const s = j.scope || {};
+  const trust = s.kind === 'trust';
+  const band = $('jobband');
+  band.textContent = trust ? 'TRUST NEW CODE' : 'APPLY';
+  band.className = 'band ' + (trust ? 'trust' : 'apply');
+  $('jobheading').textContent = visible((trust ? 'Trust new code for ' : 'Apply to ') + s.project);
+  $('jobreason').textContent = visible(j.reason);
+  $('jobmatch').textContent = visible(j.match_code);
+  setLink($('jobcontext'), j.context);
+  $('jobrequester').textContent = visible(j.requester || '(unnamed)');
+  $('jobexpires').textContent = `request expires ${when(j.expires)}`;
+  $('jobstatus').textContent = '';
+  $('jobapprove').textContent = trust ? 'Trust this code' : 'Apply';
+  $('jobapprove').className = trust ? 'trust' : 'ok';
+  const body = [];
+  if (j.kind !== s.kind || j.project !== s.project) body.push(el('p', 'The request header disagrees with the signed scope. Do not approve.', 'warn'));
+  try { body.push(...(trust ? renderTrust(j) : renderApply(j))); }
+  catch (e) { body.push(el('p', 'This request cannot be displayed. Do not approve.', 'warn')); }
+  $('jobbody').replaceChildren(...body);
+  $('jobapprove').disabled = $('jobdecline').disabled = true;
+  setTimeout(() => {
+    if (gen === renderGen) releasedGen = gen;
+    releaseJobButtons();
+  }, 1500);
+  if (navigator.vibrate) navigator.vibrate(60);
+}
+
+$('jobapprove').onclick = async () => {
+  const j = jobToSign();
+  if (!j) return;
+  busy = true; $('jobapprove').disabled = $('jobdecline').disabled = true; $('jobstatus').textContent = 'Touch your security key…';
+  try {
+    const opts = await api('/api/approve/start', {id: j.id});
+    const pk = opts.publicKey;
+    await verifyJob({kind: j.kind, project: j.project, scope: j.scope, display: j.display, nonce: j.nonce, challenge: pk.challenge});
+    pk.challenge = b64u.dec(pk.challenge);
+    (pk.allowCredentials || []).forEach(c => c.id = b64u.dec(c.id));
+    const cred = await navigator.credentials.get({publicKey: pk});
+    await api('/api/approve/finish', {id: j.id, credential: toCredentialJSON(cred)});
+    $('jobstatus').textContent = 'Approved.';
+  } catch (e) {
+    $('jobstatus').textContent = 'Not approved: ' + e.message;
+  } finally {
+    busy = false; releaseJobButtons(); setTimeout(refresh, 800);
+  }
+};
+
+$('jobdecline').onclick = async () => {
+  const j = jobToSign();
+  if (!j) return;
+  busy = true; $('jobapprove').disabled = $('jobdecline').disabled = true;
+  try { await api('/api/decline', {id: j.id}); $('jobstatus').textContent = 'Declined.'; }
+  catch (e) { $('jobstatus').textContent = e.message; }
+  finally { busy = false; releaseJobButtons(); setTimeout(refresh, 300); }
 };
 
 $('enrollbtn').onclick = async () => {

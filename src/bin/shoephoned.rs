@@ -15,6 +15,10 @@
 //!   console-only for the same reason as `enroll`, and it refuses to run
 //!   while the daemon holds the device list in memory. Names are not
 //!   unique, so an ambiguous one is refused rather than resolved.
+//! - `untrust <project> [--json]`: drop the project's trusted candidate, so
+//!   the next trust job starts from no baseline. Console-only. Works while
+//!   the daemon runs; it notices on its next runner poll. Exits 0 when a
+//!   record was removed and 1 when there was nothing to remove.
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -29,7 +33,29 @@ use shoephone::grant::Entropy;
 use shoephone::server::Daemon;
 use shoephone::store::{self, EnrollCode, Store};
 
+/// Set only by this repository's tests.
+const ALLOW_TEST_HOOKS: &str = "SHOEPHONED_ALLOW_TEST_HOOKS";
+
+/// A build with `test-hooks` serves `POST /api/test/approve`, which opens
+/// a window with no security key, so it refuses to start unless a test
+/// says otherwise.
+fn test_hooks_refusal() -> Option<Status> {
+    let allowed = std::env::var_os(ALLOW_TEST_HOOKS).is_some_and(|v| v == "1");
+    if cfg!(feature = "test-hooks") && !allowed {
+        eprintln!(
+            "shoephoned: this build has the test-hooks feature, which serves an approval \
+             endpoint needing no security key; refusing to start. Build without --features \
+             test-hooks."
+        );
+        return Some(Status::Precondition);
+    }
+    None
+}
+
 fn main() -> ExitCode {
+    if let Some(status) = test_hooks_refusal() {
+        return status.into();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("shoephoned {VERSION}");
@@ -43,7 +69,7 @@ const DEFAULT_CONFIG: &str = "/etc/shoephone/shoephoned.toml";
 
 fn usage() -> Status {
     eprintln!(
-        "usage: shoephoned [--config <file>] (serve | init-ca | enroll --name <device>\n                                          | devices | forget (--name <device> | --id <handle>))\n       shoephoned --version\n\n--config defaults to /etc/shoephone/shoephoned.toml"
+        "usage: shoephoned [--config <file>] (serve | init-ca | enroll --name <device>\n                                          | devices | forget (--name <device> | --id <handle>)\n                                          | untrust <project> [--json])\n       shoephoned --version\n\n--config defaults to /etc/shoephone/shoephoned.toml"
     );
     Status::Usage
 }
@@ -57,6 +83,9 @@ struct Args {
     name: Option<String>,
     id: Option<String>,
     verb: Option<String>,
+    /// The verb's positional argument (`untrust <project>`).
+    arg: Option<String>,
+    json: bool,
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
@@ -79,8 +108,12 @@ fn parse(args: &[String]) -> Result<Args, String> {
                 }
                 *slot = Some(value.clone());
             }
+            "--json" => out.json = true,
             flag if flag.starts_with("--") => return Err(format!("unknown flag {flag}")),
             verb if out.verb.is_none() => out.verb = Some(verb.to_owned()),
+            arg if out.verb.as_deref() == Some("untrust") && out.arg.is_none() => {
+                out.arg = Some(arg.to_owned())
+            }
             extra => return Err(format!("unexpected argument {extra:?}")),
         }
     }
@@ -108,7 +141,14 @@ fn run(args: &[String]) -> Status {
             return Status::Precondition;
         }
     };
+    if parsed.json && parsed.verb.as_deref() != Some("untrust") {
+        return usage();
+    }
     match (parsed.verb.as_deref(), parsed.name, parsed.id) {
+        (Some("untrust"), None, None) => match parsed.arg {
+            Some(project) => untrust(&config, &project, parsed.json),
+            None => usage(),
+        },
         (Some("serve"), None, None) => serve(config),
         (Some("init-ca"), None, None) => init_ca(&config.ca_key),
         (Some("enroll"), Some(name), None) => enroll(&config, &name),
@@ -286,6 +326,53 @@ fn forget(config: &Config, target: &str) -> Status {
     }
     eprintln!("shoephoned: start the daemon again: systemctl start shoephoned");
     Status::Ok
+}
+
+/// Drop a project's trusted candidate.
+///
+/// Console-only, like `forget`, but safe with the daemon running: the write
+/// takes the same lock the daemon takes, and the daemon reads `trusted.json`
+/// again on its next runner poll and trust approval.
+///
+/// The removal is ledgered as an `untrusted` line ([`Store::untrust`]). The
+/// console has no push channel, so the phone learns of it from the ledger
+/// view, not from a notification.
+fn untrust(config: &Config, project: &str, json: bool) -> Status {
+    let store = Store::new(&config.state_dir);
+    match store.untrust(project) {
+        Ok(Some(record)) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "project": record.project,
+                        "removed": true,
+                        "digest": record.digest,
+                    })
+                );
+            } else {
+                println!("{}", record.digest);
+            }
+            eprintln!(
+                "shoephoned: {project:?} is no longer trusted; the next trust job starts from no baseline."
+            );
+            Status::Ok
+        }
+        Ok(None) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({ "project": project, "removed": false })
+                );
+            }
+            eprintln!("shoephoned: {project:?} has no trust record; nothing to remove");
+            Status::Empty
+        }
+        Err(e) => {
+            eprintln!("shoephoned: {e}");
+            Status::Precondition
+        }
+    }
 }
 
 fn enroll(config: &Config, name: &str) -> Status {
@@ -504,5 +591,14 @@ mod tests {
         assert!(parse(&argv("--config x serve extra")).is_err());
         assert!(parse(&argv("--config x --bogus serve")).is_err());
         assert!(parse(&argv("--config x --config y serve")).is_err());
+    }
+
+    #[test]
+    fn untrust_takes_a_project_and_json() {
+        let p = parse(&argv("--config x untrust web --json")).unwrap();
+        assert_eq!(p.verb.as_deref(), Some("untrust"));
+        assert_eq!(p.arg.as_deref(), Some("web"));
+        assert!(p.json);
+        assert!(parse(&argv("untrust web extra")).is_err());
     }
 }
