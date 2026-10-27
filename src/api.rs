@@ -312,6 +312,9 @@ pub struct FailureView {
     pub detail: Option<String>,
 }
 
+/// Most address lines a [`SummaryView`] carries.
+pub const MAX_SUMMARY_ADDRESSES: usize = 500;
+
 /// What a plan would do: counts, addresses and names, never values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryView {
@@ -319,8 +322,11 @@ pub struct SummaryView {
     pub update: u32,
     pub replace: u32,
     pub delete: u32,
-    /// Resource addresses, one line each.
+    /// Resource addresses, one line each; at most [`MAX_SUMMARY_ADDRESSES`].
     pub addresses: Vec<String>,
+    /// How many address lines were cut to stay within that limit.
+    #[serde(default)]
+    pub addresses_omitted: u32,
     /// Names of the variables whose values changed.
     pub variables: Vec<String>,
     /// `none`, `applied` or `uncertain`.

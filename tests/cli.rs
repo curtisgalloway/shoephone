@@ -359,3 +359,119 @@ fn apply_plan_failed_exits_100_and_json_has_the_shape() {
     assert!(r["counts"].is_null());
     assert!(r["changed_variables"].is_null());
 }
+
+#[test]
+fn apply_json_carries_counts_and_changed_variables() {
+    let dir = scratch("apply-summary");
+    std::fs::write(dir.join("m.json"), "{}").unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let out = rt.block_on(async {
+        let key = common::runner_key();
+        let (client, _d) = common::start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+        let base = client.base().to_owned();
+        let mut child = shoephone(
+            &[
+                "apply",
+                "net",
+                "--manifest",
+                "m.json",
+                "--reason",
+                "r",
+                "--daemon",
+                &base,
+                "--json",
+            ],
+            &dir,
+        )
+        .spawn()
+        .unwrap();
+        let client = std::sync::Arc::new(client);
+        let c = client.clone();
+        let (id, child) = common::blocking(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                if let Some(job) = c.status().unwrap().job {
+                    return (job.id, child);
+                }
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "the binary exited early"
+                );
+                assert!(std::time::Instant::now() < deadline, "no job filed");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        })
+        .await;
+        let hex = |c: char| c.to_string().repeat(64);
+        let sha = |t: &str| shoephone::store::sha256_hex(t);
+        let manifest = r#"{"region":"us-east-1"}"#;
+        let addresses = "create a.b\n";
+        let (b2, k2) = (base.clone(), key.clone());
+        let scope = json!({
+            "kind": "apply", "project": "net", "revision": hex('1'), "schema": hex('2'),
+            "manifest": sha(manifest), "baseline_manifest": null, "baseline_status": "none",
+            "plan": hex('3'), "destructive": false,
+            "counts": { "create": 1, "update": 0, "replace": 0, "delete": 0 },
+            "addresses": sha(addresses),
+        });
+        let display = json!({
+            "manifest": manifest, "baseline_manifest": null, "address_text": addresses,
+        });
+        let reply = common::blocking(move || {
+            common::runner_post(&b2, &k2, "r1", "/api/runner/poll", &json!({}), None);
+            common::runner_post(
+                &b2,
+                &k2,
+                "r1",
+                "/api/runner/submit",
+                &json!({ "id": id, "scope": scope, "display": display }),
+                Some(id),
+            )
+        })
+        .await;
+        assert_eq!(reply.http, 200, "{}", text(&reply.body));
+        let b3 = base.clone();
+        common::blocking(move || {
+            ureq::post(format!("{b3}/api/test/approve_job"))
+                .send_json(json!({ "id": id }))
+                .unwrap();
+        })
+        .await;
+        let (b4, k4) = (base.clone(), key.clone());
+        let reply = common::blocking(move || {
+            common::runner_post(
+                &b4,
+                &k4,
+                "r1",
+                "/api/runner/claim",
+                &json!({ "id": id }),
+                Some(id),
+            );
+            common::runner_post(
+                &b4,
+                &k4,
+                "r1",
+                "/api/runner/finish",
+                &json!({ "id": id, "result": "applied" }),
+                Some(id),
+            )
+        })
+        .await;
+        assert_eq!(reply.http, 200, "{}", text(&reply.body));
+        common::blocking(move || child.wait_with_output().unwrap()).await
+    });
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", text(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let r = &v["result"];
+    assert_eq!(r["outcome"], "applied");
+    assert_eq!(
+        r["counts"],
+        json!({"create": 1, "update": 0, "replace": 0, "delete": 0})
+    );
+    assert_eq!(r["changed_variables"], json!(["region"]));
+    assert!(!text(&out.stdout).contains("us-east-1"));
+}

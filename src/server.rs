@@ -93,6 +93,10 @@ struct Inner {
     /// The pending view is built from a `Waiting` job and reads this beside
     /// it, never from an entry here alone.
     displays: HashMap<u64, DisplayWire>,
+    /// What each submitted apply would do, by job id, for `GET /api/job`.
+    /// Names and counts only. Kept after the job is done; dropped when the
+    /// job itself is gone from `jobs`.
+    summaries: HashMap<u64, SummaryView>,
     /// The trust scope of each claimed trust job, so `finish` can record
     /// what was trusted. Dropped when the job finishes.
     claimed: HashMap<u64, TrustScope>,
@@ -295,6 +299,7 @@ impl Daemon {
                 jobs,
                 archives: HashMap::new(),
                 displays: HashMap::new(),
+                summaries: HashMap::new(),
                 claimed: HashMap::new(),
                 trusted,
                 verifier,
@@ -703,7 +708,10 @@ async fn status(State(d): App) -> Reply<StatusReply> {
         (
             inner.devices.iter().map(|x| x.name.clone()).collect(),
             window_views(inner, now),
-            inner.jobs.active(now).map(job_status),
+            inner
+                .jobs
+                .active(now)
+                .map(|j| job_status(j, inner.summaries.get(&j.id))),
         )
     });
     Ok(Json(StatusReply {
@@ -971,6 +979,7 @@ fn prune_jobs(inner: &mut Inner, now: SystemTime) {
         .keys()
         .chain(inner.job_meta.keys())
         .chain(inner.displays.keys())
+        .chain(inner.summaries.keys())
         .chain(inner.claimed.keys())
         .copied()
         .collect();
@@ -996,6 +1005,54 @@ fn prune_jobs(inner: &mut Inner, now: SystemTime) {
         if over {
             inner.job_meta.remove(&id);
         }
+        if inner.jobs.job(now, id).is_none() {
+            inner.summaries.remove(&id);
+        }
+    }
+}
+
+/// Names of the top-level manifest keys whose values differ between
+/// `manifest` and `baseline` (absent counts as an empty object), sorted.
+/// Names only: a value never leaves this function.
+fn changed_variables(manifest: &str, baseline: Option<&str>) -> Vec<String> {
+    let object = |text: &str| match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let (new, old) = (object(manifest), baseline.map(object).unwrap_or_default());
+    let names: std::collections::BTreeSet<&String> = new.keys().chain(old.keys()).collect();
+    names
+        .into_iter()
+        .filter(|k| new.get(*k) != old.get(*k))
+        .cloned()
+        .collect()
+}
+
+/// The agent's view of a submitted apply, from the scope and display the
+/// daemon has just checked against each other.
+fn apply_summary(scope: &ApplyScopeWire, display: &DisplayWire) -> SummaryView {
+    let lines: Vec<&str> = display
+        .address_text
+        .as_deref()
+        .unwrap_or("")
+        .lines()
+        .collect();
+    SummaryView {
+        create: scope.counts.create,
+        update: scope.counts.update,
+        replace: scope.counts.replace,
+        delete: scope.counts.delete,
+        addresses: lines
+            .iter()
+            .take(MAX_SUMMARY_ADDRESSES)
+            .map(|l| (*l).to_owned())
+            .collect(),
+        addresses_omitted: lines.len().saturating_sub(MAX_SUMMARY_ADDRESSES) as u32,
+        variables: changed_variables(
+            display.manifest.as_deref().unwrap_or("{}"),
+            display.baseline_manifest.as_deref(),
+        ),
+        baseline_status: scope.baseline_status.clone(),
     }
 }
 
@@ -1089,7 +1146,7 @@ fn result_name(r: &JobResult) -> &'static str {
 
 /// The agent's view of a job. It names the state and the result and nothing
 /// else about the contents: no manifest, no archive.
-fn job_status(job: &Job) -> JobStatus {
+fn job_status(job: &Job, summary: Option<&SummaryView>) -> JobStatus {
     let (kind, state, result) = (
         match job.kind {
             JobKind::Trust { .. } => "trust",
@@ -1120,8 +1177,7 @@ fn job_status(job: &Job) -> JobStatus {
             ) => Some(failure_view(f)),
             _ => None,
         },
-        // Task 8: the approver's view of the plan supplies this.
-        summary: None,
+        summary: summary.cloned(),
     }
 }
 
@@ -1130,7 +1186,10 @@ async fn job(State(d): App, Path(id): Path<u64>) -> Reply<JobStatus> {
     let policy = d.config.policy();
     let status = d.with(|inner| {
         inner.jobs.tick(now, inner.grants.gate_mut(), &policy);
-        inner.jobs.job(now, id).map(job_status)
+        inner
+            .jobs
+            .job(now, id)
+            .map(|j| job_status(j, inner.summaries.get(&j.id)))
     });
     status
         .map(Json)
@@ -2200,6 +2259,10 @@ async fn runner_submit(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<
     )?;
     let req: SubmitBody = parse_body(&body)?;
     check_consistency(&req.scope, &req.display)?;
+    let summary = match &req.scope {
+        JobScopeWire::Apply(a) => Some(apply_summary(a, &req.display)),
+        JobScopeWire::Trust(_) => None,
+    };
     let scope = scope_from_wire(req.scope)?;
     let now = now();
     d.audited(|inner| {
@@ -2213,6 +2276,9 @@ async fn runner_submit(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<
             &mut entropy,
         )?;
         inner.displays.insert(req.id, req.display);
+        if let Some(summary) = summary {
+            inner.summaries.insert(req.id, summary);
+        }
         prune_jobs(inner, now);
         Ok(Json(serde_json::json!({})))
     })
@@ -2534,6 +2600,26 @@ async fn test_approve_job(State(d): App, Json(body): Json<ById>) -> Reply<serde_
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn changed_variables_names_changed_added_and_removed_keys() {
+        let new = r#"{"same":1,"changed":"b","added":true,"nested":{"x":1}}"#;
+        let old = r#"{"same":1,"changed":"a","removed":2,"nested":{"x":2}}"#;
+        assert_eq!(
+            super::changed_variables(new, Some(old)),
+            ["added", "changed", "nested", "removed"]
+        );
+        assert!(super::changed_variables(new, Some(new)).is_empty());
+    }
+
+    #[test]
+    fn changed_variables_without_a_baseline_lists_every_key() {
+        assert_eq!(
+            super::changed_variables(r#"{"b":1,"a":"secret-value"}"#, None),
+            ["a", "b"]
+        );
+        assert!(super::changed_variables("{}", None).is_empty());
+    }
+
     use super::*;
 
     #[test]

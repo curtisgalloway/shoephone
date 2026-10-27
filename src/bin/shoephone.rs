@@ -674,9 +674,9 @@ fn need_reason(opts: &Opts) -> Result<String, Status> {
     }
 }
 
-/// Run git with a cleared environment (plus `PATH` and `HOME`), never
-/// through a shell. Returns its stdout, or the reason it failed.
-fn git(args: &[&str]) -> Result<Vec<u8>, String> {
+/// A git command with a cleared environment (plus `PATH` and `HOME`), run
+/// directly and never through a shell.
+fn git_command(args: &[&str]) -> std::process::Command {
     let mut cmd = std::process::Command::new("git");
     cmd.args(args)
         .env_clear()
@@ -686,7 +686,14 @@ fn git(args: &[&str]) -> Result<Vec<u8>, String> {
             cmd.env(var, v);
         }
     }
-    let out = cmd.output().map_err(|e| format!("cannot run git: {e}"))?;
+    cmd
+}
+
+/// Run git and return its stdout, or the reason it failed.
+fn git(args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = git_command(args)
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
     if out.status.success() {
         Ok(out.stdout)
     } else {
@@ -695,6 +702,8 @@ fn git(args: &[&str]) -> Result<Vec<u8>, String> {
 }
 
 /// The whole repository at `HEAD`, from the repo root, as a gzip tar.
+/// `git archive` is streamed through the encoder, and the run stops as soon
+/// as the compressed output passes the upload limit.
 fn repo_archive() -> Result<Vec<u8>, (Status, String)> {
     let top = git(&["rev-parse", "--show-toplevel"]).map_err(|e| {
         (
@@ -711,27 +720,56 @@ fn repo_archive() -> Result<Vec<u8>, (Status, String)> {
             "tracked files have uncommitted changes (see `git status`); commit or stash them, because only HEAD is trusted".to_owned(),
         ));
     }
-    let tar = git(&["-C", &top, "archive", "--format=tar", "HEAD"])
-        .map_err(|e| (Status::Precondition, format!("git archive failed: {e}")))?;
+    let broken =
+        |what: &str, e: &dyn std::fmt::Display| (Status::Precondition, format!("{what}: {e}"));
+    let mut child = git_command(&["-C", &top, "archive", "--format=tar", "HEAD"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| broken("cannot run git", &e))?;
+    let mut tar = child
+        .stdout
+        .take()
+        .ok_or_else(|| broken("git archive", &"no stdout"))?;
     let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    std::io::Write::write_all(&mut gz, &tar).map_err(|e| {
-        (
-            Status::Precondition,
-            format!("cannot compress the archive: {e}"),
-        )
-    })?;
-    let gz = gz.finish().map_err(|e| {
-        (
-            Status::Precondition,
-            format!("cannot compress the archive: {e}"),
-        )
-    })?;
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut tar, &mut buf)
+            .map_err(|e| broken("cannot read git archive", &e))?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut gz, &buf[..n])
+            .map_err(|e| broken("cannot compress the archive", &e))?;
+        if gz.get_ref().len() > MAX_ARCHIVE_BYTES {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err((
+                Status::Permanent,
+                format!(
+                    "archive_too_large: the compressed repository is over {} MiB, the limit",
+                    MAX_ARCHIVE_BYTES >> 20
+                ),
+            ));
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| broken("git archive", &e))?;
+    if !out.status.success() {
+        return Err(broken(
+            "git archive failed",
+            &String::from_utf8_lossy(&out.stderr).trim(),
+        ));
+    }
+    let gz = gz
+        .finish()
+        .map_err(|e| broken("cannot compress the archive", &e))?;
     if gz.len() > MAX_ARCHIVE_BYTES {
         return Err((
             Status::Permanent,
             format!(
-                "archive_too_large: the compressed repository is {} MiB; the limit is {} MiB",
-                gz.len() >> 20,
+                "archive_too_large: the compressed repository is over {} MiB, the limit",
                 MAX_ARCHIVE_BYTES >> 20
             ),
         ));

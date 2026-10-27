@@ -1421,3 +1421,45 @@ async fn an_undone_trust_sends_no_push() {
     assert!(late.is_err(), "the undone trust was pushed: {late:?}");
     assert!(!ledger_text(&client).await.contains("\"trusted\""));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_submitted_apply_shows_counts_addresses_and_variable_names_but_no_values() {
+    let dir = scratch("jobs-summary");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    let rig = Rig::new(&client, "r1", &key);
+    let base = client.base().to_owned();
+    let client = Arc::new(client);
+
+    let id = file_apply(&client, "net").await;
+    rig.poll().await;
+    let (scope, display) = apply_pair("net", &["create a.b", "delete c.d"], [1, 0, 0, 1], true);
+    assert_eq!(submit(&rig, id, scope, display).await.http, 200);
+
+    let status = status_of(&client, id).await;
+    let summary = status.summary.expect("a submitted apply has a summary");
+    assert_eq!(
+        (
+            summary.create,
+            summary.update,
+            summary.replace,
+            summary.delete
+        ),
+        (1, 0, 0, 1)
+    );
+    assert_eq!(summary.addresses, ["create a.b", "delete c.d"]);
+    assert_eq!(summary.addresses_omitted, 0);
+    assert_eq!(summary.variables, ["region"]);
+    assert_eq!(summary.baseline_status, "none");
+
+    let raw = blocking(move || {
+        ureq::get(format!("{base}/api/job/{id}"))
+            .call()
+            .unwrap()
+            .into_body()
+            .read_to_string()
+            .unwrap()
+    })
+    .await;
+    assert!(!raw.contains("us-east-1"), "a manifest value leaked: {raw}");
+}
