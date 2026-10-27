@@ -1010,7 +1010,7 @@ fn hex64(c: char) -> String {
 
 /// A well-formed apply scope for `project` and the display that backs it.
 fn apply_scope(project: &str) -> (serde_json::Value, serde_json::Value) {
-    let manifest = "canonical manifest text";
+    let manifest = r#"{"region":"us-east-1"}"#;
     let address_text = "create aws_s3_bucket.logs\n";
     let scope = json!({
         "kind": "apply",
@@ -1109,7 +1109,7 @@ async fn apply_approval_with_real_assertion_moves_job_to_approved() {
          create=1\nupdate=0\nreplace=0\ndelete=0\naddresses={}\nnonce={}\n",
         hex64('1'),
         hex64('2'),
-        sha256_hex("canonical manifest text"),
+        sha256_hex(r#"{"region":"us-east-1"}"#),
         hex64('3'),
         sha256_hex("create aws_s3_bucket.logs\n"),
         view.nonce
@@ -1132,6 +1132,94 @@ async fn apply_approval_with_real_assertion_moves_job_to_approved() {
     let status = blocking(move || c.job(id)).await.unwrap();
     assert_eq!(status.state, "approved");
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The page's own verification, run under node against the JSON a real
+/// daemon serves for a waiting apply and the challenge it issues for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_page_accepts_the_daemons_pending_job_and_refuses_a_tampered_one() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let dir = scratch("job-page");
+    let runner = common::runner_key();
+    let (client, _daemon) = common::start_runners(&dir, &[("net", "r1")], &[("r1", &runner)]).await;
+    let client = Arc::new(client);
+    let base = client.base().to_owned();
+    let agent = test_agent();
+    let (_key, _handle, _secret) = enroll(&dir, &base, &agent, "test-phone");
+    let (id, _) = waiting_apply(&client, &runner).await;
+
+    let pending = agent
+        .get(format!("{base}/api/pending"))
+        .call()
+        .unwrap()
+        .body_mut()
+        .read_to_string()
+        .unwrap();
+    let resp = agent
+        .post(format!("{base}/api/approve/start"))
+        .send_json(json!({ "id": id }))
+        .unwrap();
+    let rcr: RequestChallengeResponse = expect_ok(resp);
+    let challenge = b64url(rcr.public_key.challenge.as_slice());
+
+    let page = shoephone::server::PAGE;
+    let start = page.find("<script>").unwrap() + "<script>".len();
+    let script = &page[start..page.find("</script>").unwrap()];
+    let program = format!(
+        "{prelude}\n{script}\nconst STATE = {pending};\nconst CHALLENGE = {challenge:?};\n{harness}\n",
+        prelude = include_str!("fixtures/node-prelude.js"),
+        harness = r#"
+const assert = require('node:assert/strict');
+(async () => {
+  const j = STATE.job;
+  assert.equal(j.id, %ID%);
+  const job = () => structuredClone({kind: j.kind, scope: j.scope, display: j.display, nonce: j.nonce, challenge: CHALLENGE});
+  assert.ok(await verifyJob(job()));
+  for (const tamper of [
+    x => { x.display.manifest += ' '; },
+    x => { x.display.address_text = 'create other.thing\n'; },
+    x => { delete x.display.address_text; },
+    x => { x.scope.counts.create = 2; },
+    x => { x.scope.destructive = true; },
+    x => { x.nonce = 'x'; },
+  ]) {
+    const x = job(); tamper(x);
+    await assert.rejects(verifyJob(x), {message: "the daemon's challenge does not match the request on screen"});
+  }
+  console.log('real daemon json ok');
+})().catch(e => { console.error(e); process.exit(1); });
+"#.replace("%ID%", &id.to_string()),
+    );
+    let mut child = match Command::new("node")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!(
+                "skipping: node is not runnable ({e}); the page was not run against the daemon's JSON"
+            );
+            return;
+        }
+    };
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(program.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "the page rejected the daemon's own job:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
