@@ -220,12 +220,18 @@ const MISMATCH = "the daemon's challenge does not match the request on screen";
 const OBLIGATION = 'For every manifest the schema accepts, protected credentials may reach only their provider authentication and the approved destinations, and nothing the agent can see (results, addresses, which actions run) may reveal them.';
 const ACTIONS = ['create', 'update', 'replace', 'delete'];
 const BAD_ADDRESS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
-const HIDDEN_ANY = /[\\\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069\u061c\u200b\u2060\ufeff\u00ad\u{e0000}-\u{e007f}]/gu;
-// The characters visible() escapes in a multi-line block, other than the
-// backslash itself.
-const ESCAPED_IN_BLOCK = String.raw`\u0000-\u0008\u000b-\u001f\u007f-\u009f  ‎‏‪-‮⁦-⁩؜​⁠﻿­\u{e0000}-\u{e007f}`;
+// The one list of characters the page shows as escapes (besides the
+// backslash, handled below): C0 and C1 controls, DEL, soft hyphen, Arabic
+// letter mark, zero-width space, LRM and RLM, line and paragraph separators,
+// bidi embeddings and isolates, word joiner, BOM and tag characters. Written
+// as escape text, so the source holds no invisible character. A multi-line
+// block keeps tab and newline, so its set is this one with those removed.
+const HIDDEN_CHARS = String.raw`\u{0}-\u{8}\u{9}\u{a}\u{b}-\u{1f}\u{7f}-\u{9f}\u{ad}\u{61c}\u{200b}\u{200e}-\u{200f}\u{2028}-\u{202e}\u{2060}\u{2066}-\u{2069}\u{feff}\u{e0000}-\u{e007f}`;
+const LINE_CHARS = String.raw`\u{9}\u{a}`;
+const ESCAPED_IN_BLOCK = HIDDEN_CHARS.replace(LINE_CHARS, '');
+const HIDDEN_ANY = new RegExp(String.raw`[\\` + HIDDEN_CHARS + ']', 'gu');
+const HIDDEN_KEEP_LINES = new RegExp(String.raw`[\\` + ESCAPED_IN_BLOCK + ']', 'gu');
 const BLOCK_BACKSLASHES = new RegExp(String.raw`\\+(?=[uU` + ESCAPED_IN_BLOCK + '])', 'gu');
-const HIDDEN_KEEP_LINES = /[\\\u0000-\u0008\u000b-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069\u061c\u200b\u2060\ufeff\u00ad\u{e0000}-\u{e007f}]/gu;
 const SLUG = /^[A-Za-z0-9._-]{1,64}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
 
@@ -541,6 +547,12 @@ let shownJob = null;
 // Counts renders, so a hold timer releases the buttons only for the render
 // that started it.
 let renderGen = 0;
+// The render whose hold has run out. The buttons work only while it is the
+// current render and no approval or decline is in flight.
+let releasedGen = -1;
+function releaseJobButtons() {
+  if (releasedGen === renderGen && !busy) $('jobapprove').disabled = $('jobdecline').disabled = false;
+}
 function jobToSign() { return shownJob ? shownJob.job : null; }
 
 function showJob(j) {
@@ -571,7 +583,8 @@ function showJob(j) {
   $('jobbody').replaceChildren(...body);
   $('jobapprove').disabled = $('jobdecline').disabled = true;
   setTimeout(() => {
-    if (gen === renderGen && !busy) $('jobapprove').disabled = $('jobdecline').disabled = false;
+    if (gen === renderGen) releasedGen = gen;
+    releaseJobButtons();
   }, 1500);
   if (navigator.vibrate) navigator.vibrate(60);
 }
@@ -592,17 +605,17 @@ $('jobapprove').onclick = async () => {
   } catch (e) {
     $('jobstatus').textContent = 'Not approved: ' + e.message;
   } finally {
-    busy = false; $('jobapprove').disabled = $('jobdecline').disabled = false; setTimeout(refresh, 800);
+    busy = false; releaseJobButtons(); setTimeout(refresh, 800);
   }
 };
 
 $('jobdecline').onclick = async () => {
   const j = jobToSign();
   if (!j) return;
-  busy = true;
+  busy = true; $('jobapprove').disabled = $('jobdecline').disabled = true;
   try { await api('/api/decline', {id: j.id}); $('jobstatus').textContent = 'Declined.'; }
   catch (e) { $('jobstatus').textContent = e.message; }
-  finally { busy = false; setTimeout(refresh, 300); }
+  finally { busy = false; releaseJobButtons(); setTimeout(refresh, 300); }
 };
 
 $('enrollbtn').onclick = async () => {

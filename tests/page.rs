@@ -99,7 +99,7 @@ const withChallenge = async (job, bytes) => {
   }
   assert.equal(parseAddressText('create a\nbogus b\n'), null);
   assert.equal(parseAddressText('create a\nupdate x'), null);
-  assert.equal(parseAddressText('create a update x\n'), null);
+  assert.equal(parseAddressText('create a\u2028update x\n'), null);
   assert.equal(parseAddressText('create \n'), null);
   assert.deepEqual(parseAddressText(''), []);
 
@@ -230,6 +230,36 @@ const withChallenge = async (job, bytes) => {
   assert.equal(els.jobapprove.disabled, true, 'not released while an approval is in progress');
   busy = false;
   timers.length = 0;
+
+  const realFetch = globalThis.fetch;
+  let fail;
+  globalThis.fetch = () => new Promise((_, rej) => { fail = () => rej(new Error('offline')); });
+  const settle = async p => { await new Promise(r => setImmediate(r)); fail(); await p; };
+  showJob(first);
+  timers.shift()();
+  assert.equal(els.jobapprove.disabled, false);
+  let flight = els.jobdecline.onclick();
+  assert.equal(els.jobapprove.disabled, true, 'decline holds both buttons while its request is in flight');
+  assert.equal(els.jobdecline.disabled, true);
+  await settle(flight);
+  assert.equal(els.jobapprove.disabled, false, 'and releases them after, when the hold has run out');
+  timers.length = 0;
+  flight = els.jobapprove.onclick();
+  assert.equal(els.jobapprove.disabled, true);
+  showJob(changed);
+  await settle(flight);
+  assert.equal(els.jobapprove.disabled, true, 'approve does not release a new render still on hold');
+  assert.equal(els.jobdecline.disabled, true);
+  timers.shift()();
+  assert.equal(els.jobapprove.disabled, false, 'the new render releases them after its hold');
+  showJob(first);
+  timers.length = 0;
+  flight = els.jobdecline.onclick();
+  await settle(flight);
+  assert.equal(els.jobdecline.disabled, true, 'decline does not release a render still on hold');
+  timers.length = 0;
+  globalThis.fetch = realFetch;
+  showJob(null);
 
   const line = 'x = "a' + bs + 'nb" y = ' + bs + '"q' + bs + '" ' + bs + 'u202e ' + bs + 'U{1} p' + bs + bs + 'u';
   assert.equal(visibleDiff(line), 'x = "a' + bs + 'nb" y = ' + bs + '"q' + bs + '" ' + bs + bs + 'u202e ' + bs + bs + 'U{1} p' + bs + bs + bs + bs + 'u');
