@@ -4,5 +4,6 @@
 //! daemon. This module is the skeleton: config parsing and the state layout.
 
 pub mod config;
+pub mod schema;
 pub mod state;
 pub mod tree;

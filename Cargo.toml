@@ -56,6 +56,8 @@ webauthn-rs = { version = "0.5.5", features = [
 tar = { version = "0.4.46", default-features = false }
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 hcl-rs = { version = "0.19.9", default-features = false }
+# dep-quality DFS 5.9/10 (2026-10-26): adoption 10, bus-factor 8, responsiveness 2.
+regex = "1.13.1"
 
 [dev-dependencies]
 ring = "0.17.14"
