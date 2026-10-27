@@ -25,9 +25,6 @@
 # rules allowing udp 67/68 (client) in both directions, or lease renewal
 # will be dropped.
 
-# Start clean so a reload replaces these rules instead of appending.
-flush ruleset
-
 define daemon_host = 192.0.2.10
 define resolver = 192.0.2.53
 define operator_net = 203.0.113.0/24
@@ -36,12 +33,19 @@ define ssh_upload_endpoints = { 198.51.100.30 }
 define secrets_store = 192.0.2.20
 define time_server = 192.0.2.123
 
+# Only this table is replaced on a reload; the host's other tables and rules
+# are untouched. The empty declaration first makes the delete succeed even
+# when the table does not exist yet, so the file loads on a fresh host and
+# never appends duplicate rules.
+table inet shoephone_runner {}
+delete table inet shoephone_runner
+
 table inet shoephone_runner {
     chain input {
         type filter hook input priority 0; policy drop;
         ct state established,related accept
         iifname "lo" accept
-        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, packet-too-big, echo-request, echo-reply } accept
         ip saddr $operator_net tcp dport 22 ct state new accept
         limit rate 10/minute log prefix "runner-in-drop "
         counter drop
@@ -51,7 +55,7 @@ table inet shoephone_runner {
         type filter hook output priority 0; policy drop;
         ct state established,related accept
         oifname "lo" accept
-        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert } accept
+        icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-solicit, nd-router-advert, packet-too-big, echo-request, echo-reply } accept
 
         meta skuid "shoephone-review" counter reject with icmpx type admin-prohibited
 
