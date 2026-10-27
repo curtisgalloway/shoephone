@@ -6,7 +6,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -54,9 +54,17 @@ pub struct ProjectPaths {
 }
 
 impl ProjectPaths {
-    pub fn new(state_dir: &Path, project: &str) -> ProjectPaths {
-        ProjectPaths {
-            dir: state_dir.join("projects").join(project),
+    /// Refuses a name that is not exactly one normal path component, so a
+    /// name like `..` or `a/b` cannot move state outside the project dir.
+    pub fn new(state_dir: &Path, project: &str) -> Result<ProjectPaths, String> {
+        let mut comps = Path::new(project).components();
+        match (comps.next(), comps.next()) {
+            (Some(Component::Normal(c)), None) if c == std::ffi::OsStr::new(project) => {
+                Ok(ProjectPaths {
+                    dir: state_dir.join("projects").join(project),
+                })
+            }
+            _ => Err(format!("invalid project name {project:?}")),
         }
     }
 
@@ -85,6 +93,9 @@ impl ProjectPaths {
 /// Replace `path` with `bytes` so a reader sees the old file or the new one,
 /// never a mix: write a 0600 temp file beside it, fsync, rename, then fsync
 /// the directory so the rename survives a crash.
+///
+/// The temp name is fixed (`<name>.tmp`), so this assumes a single writer per
+/// target; a concurrent writer fails closed with `EEXIST`.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
@@ -152,7 +163,7 @@ mod tests {
 
     #[test]
     fn state_paths_are_under_project_dir() {
-        let p = ProjectPaths::new(Path::new("/var/lib/r"), "web");
+        let p = ProjectPaths::new(Path::new("/var/lib/r"), "web").unwrap();
         let base = Path::new("/var/lib/r/projects/web");
         assert_eq!(p.dir(), base);
         for path in [
@@ -164,6 +175,13 @@ mod tests {
             assert!(path.starts_with(base), "{}", path.display());
         }
         assert_eq!(p.trusted_json(), base.join("trusted.json"));
+    }
+
+    #[test]
+    fn project_paths_refuse_non_single_components() {
+        for bad in [".", "..", "", "a/b", "/abs", "../x"] {
+            assert!(ProjectPaths::new(Path::new("/s"), bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

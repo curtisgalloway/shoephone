@@ -16,7 +16,8 @@ fn default_schema_file() -> String {
 }
 
 /// Where a value comes from: written in the config, or resolved at run time
-/// by `secret_command`.
+/// by `secret_command`. This holds config values and secret *references*,
+/// never a resolved secret; resolved values live elsewhere (Task 15).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
@@ -67,6 +68,8 @@ pub struct RunnerConfig {
 /// True for `^[A-Za-z0-9._-]{1,64}$`.
 fn valid_project_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
+        && name != "."
+        && name != ".."
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
@@ -78,6 +81,16 @@ fn relative_and_contained(path: &str) -> bool {
         && Path::new(path)
             .components()
             .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+}
+
+/// Like `relative_and_contained`, and the last component names a file or
+/// directory, so `.` and `./` are refused.
+fn names_a_child(path: &str) -> bool {
+    relative_and_contained(path)
+        && matches!(
+            Path::new(path).components().next_back(),
+            Some(Component::Normal(_))
+        )
 }
 
 impl RunnerConfig {
@@ -109,7 +122,7 @@ impl RunnerConfig {
                     p.path
                 ));
             }
-            if !relative_and_contained(&p.schema_file) {
+            if !names_a_child(&p.schema_file) {
                 return Err(format!(
                     "project {name}: schema_file {:?} must be relative with no '..'",
                     p.schema_file
@@ -160,6 +173,16 @@ mod tests {
         let bad = EXAMPLE.replace("log_days = 30", "log_days = 30\nsurprise = 1");
         assert!(parse(&bad).unwrap_err().contains("surprise"));
         let bad = EXAMPLE.replace("terraform_version", "terraform_versio");
+        assert!(parse(&bad).is_err());
+    }
+
+    #[test]
+    fn config_refuses_dot_project_names_and_dot_schema_file() {
+        for name in [".", ".."] {
+            let bad = EXAMPLE.replace("[projects.example]", &format!("[projects.\"{name}\"]"));
+            assert!(parse(&bad).is_err(), "{name}");
+        }
+        let bad = EXAMPLE.replace("shoephone-schema.toml", ".");
         assert!(parse(&bad).is_err());
     }
 
