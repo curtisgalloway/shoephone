@@ -44,7 +44,9 @@ use crate::ca::{self, UserCa};
 use crate::config::Config;
 use crate::exit::VERSION;
 use crate::grant::{self, Approval, Entropy, Event, Grants, Pending, Policy, Refusal, Scope};
-use crate::job::{Failure, Job, JobEvent, JobKind, JobResult, JobScope, JobState, Jobs};
+use crate::job::{
+    Failure, Job, JobEvent, JobKind, JobResult, JobScope, JobState, Jobs, TrustedRevision,
+};
 use crate::notify::{Apns, Delivery, Notifier, Push};
 use crate::runner_auth::{self, Verifier};
 use crate::scope::{self, Action, ApplyScope, BaselineStatus, Counts, TrustScope};
@@ -200,6 +202,7 @@ impl From<Refusal> for Fail {
             Refusal::StaleSignature => (S::UNAUTHORIZED, "stale_signature", None),
             Refusal::StaleBaseline => (S::CONFLICT, "stale_baseline", None),
             Refusal::PlanTooOld => (S::CONFLICT, "plan_too_old", None),
+            Refusal::Untrusted => (S::CONFLICT, "untrusted", None),
             Refusal::MalformedScope => (S::BAD_REQUEST, "malformed_scope", None),
         };
         Fail(
@@ -264,7 +267,13 @@ impl Daemon {
             );
         }
         for record in store.load_trusted()? {
-            jobs.set_trusted(&record.project, Some(record.digest.clone()));
+            jobs.set_trusted(
+                &record.project,
+                Some(TrustedRevision {
+                    digest: record.digest.clone(),
+                    schema: record.schema.clone(),
+                }),
+            );
             trusted.insert(record.project.clone(), record);
         }
         let verifier = Verifier::new(config.runner_keys()?);
@@ -2160,8 +2169,11 @@ fn sync_trusted(d: &Daemon, inner: &mut Inner, records: Vec<TrustRecord>) {
         .map(|r| (r.project.clone(), r))
         .collect();
     for project in d.config.projects.keys() {
-        let digest = inner.trusted.get(project).map(|r| r.digest.clone());
-        inner.jobs.set_trusted(project, digest);
+        let trusted = inner.trusted.get(project).map(|r| TrustedRevision {
+            digest: r.digest.clone(),
+            schema: r.schema.clone(),
+        });
+        inner.jobs.set_trusted(project, trusted);
     }
 }
 
@@ -2266,6 +2278,9 @@ async fn runner_submit(State(d): App, headers: HeaderMap, body: Bytes) -> Reply<
     let scope = scope_from_wire(req.scope)?;
     let now = now();
     d.audited(|inner| {
+        // An apply is judged against the trust now on disk, so an
+        // `untrust` since the plan started counts.
+        refresh_trusted(&d, inner)?;
         let mut entropy = ca::OsEntropy;
         inner.jobs.submit(
             now,

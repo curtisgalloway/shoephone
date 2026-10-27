@@ -265,6 +265,8 @@ pub enum Refusal {
     StaleBaseline,
     /// The plan is older than the daemon allows for an apply.
     PlanTooOld,
+    /// An apply's revision or schema is not the project's current trust.
+    Untrusted,
     /// The scope carries a field that cannot be signed unambiguously.
     MalformedScope,
 }
@@ -297,6 +299,9 @@ impl fmt::Display for Refusal {
                 write!(f, "the trusted baseline moved since the scope was built")
             }
             Refusal::PlanTooOld => write!(f, "the plan is too old to approve"),
+            Refusal::Untrusted => {
+                write!(f, "the apply's revision is no longer the trusted one")
+            }
             Refusal::MalformedScope => write!(f, "the scope has a field that cannot be signed"),
         }
     }

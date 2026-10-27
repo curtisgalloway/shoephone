@@ -1305,7 +1305,8 @@ impl Runner {
         self.report(&p.project, p.id, result, f, install)
     }
 
-    /// Re-checks the pinned context, then applies under the journal.
+    /// Re-checks the local trust and the pinned context, then applies under
+    /// the journal.
     /// Returns the finish result and its failure.
     fn apply_claimed(
         &self,
@@ -1324,9 +1325,21 @@ impl Runner {
             dir: &p.job_dir,
             module: &pcfg.path,
         };
-        // Nothing has run yet: a changed context ends the job as
+        // Nothing has run yet: a changed context or trust ends the job as
         // `apply_failed` (the only failure `finish` takes from Claimed),
-        // with the baseline untouched.
+        // with the baseline untouched. The local trusted tree must still be
+        // the revision and schema the approver signed.
+        let JobScopeWire::Apply(approved) = &p.scope else {
+            exec::discard_plan(&self.cfg, &job);
+            return ("apply_failed", Some(failure("scope_mismatch")));
+        };
+        let still_trusted = self.local_trust(pcfg, &paths).is_some_and(|(local, _)| {
+            local.digest == approved.revision && local.schema == approved.schema
+        });
+        if !still_trusted {
+            exec::discard_plan(&self.cfg, &job);
+            return ("apply_failed", Some(failure("untrusted")));
+        }
         if let Err(f) = exec::check_context(&self.cfg, pcfg, context) {
             exec::discard_plan(&self.cfg, &job);
             return ("apply_failed", Some(f));

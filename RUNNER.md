@@ -97,9 +97,14 @@ so a crash before `finish` is sent is re-sent at the next start.
   refused `destroy_not_requested` with those addresses. Otherwise the
   scope (counts, destructive flag and address text from one plan summary)
   and the display (canonical manifest, the `applied.json` baseline, the
-  address text) are submitted. On approval the job is claimed and the
-  pinned context is recomputed; a change fails the job `apply_failed`
-  with category `context_changed` before anything runs. The scope the claim
+  address text) are submitted. The daemon refuses the job `untrusted` at
+  submit, approval or claim when the scope's revision and schema are not
+  what the project is trusted at then, so a `shoephoned untrust` stops an
+  apply that has not started. On approval the job is claimed, the local
+  trusted tree is checked again against the approved revision and schema
+  (`apply_failed` with category `untrusted` otherwise) and the pinned
+  context is recomputed; a change fails the job `apply_failed` with
+  category `context_changed` before anything runs. The scope the claim
   returns must equal the one submitted, field for field (`scope_mismatch`
   otherwise). `applied.json` is
   marked `uncertain` (keeping the last applied manifest) before Terraform

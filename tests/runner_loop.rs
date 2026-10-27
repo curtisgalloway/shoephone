@@ -753,3 +753,47 @@ async fn result_of_an_apply_cut_off_before_finish_is_resent_at_startup() {
     assert_eq!(count(&fx.record(), "arg:apply"), 1);
     assert_eq!(Journal::new(&paths).unfinished().unwrap(), None);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untrust_between_approve_and_claim_refuses_the_claim() {
+    let fx = Fx::new("untrustclaim", CREATE_ONLY).await;
+    let runner = fx.runner().await;
+    let runner = fx.trusted(runner).await;
+    let id = fx.apply(r#"{"region":"west"}"#).await;
+    let runner = step(runner).await;
+    fx.approve(id).await;
+    assert_eq!(fx.status(id).await.state, "approved");
+    // The operator untrusts the project while the approval waits.
+    let store = shoephone::store::Store::new(&fx.root.join("daemon"));
+    assert!(store.untrust("web").unwrap().is_some());
+    let _runner = step(runner).await;
+    let st = fx.status(id).await;
+    assert_eq!(st.result.as_deref(), Some("refused"), "{st:?}");
+    assert_eq!(st.failure.unwrap().category, "untrusted");
+    assert!(!fx.record().contains("arg:apply"), "nothing was applied");
+    assert!(fx.applied().is_none(), "the baseline is untouched");
+    fx.assert_no_job_leftovers();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_trust_changed_before_the_claim_fails_the_apply_untrusted() {
+    let fx = Fx::new("localuntrust", CREATE_ONLY).await;
+    let runner = fx.runner().await;
+    let runner = fx.trusted(runner).await;
+    let id = fx.apply(r#"{"region":"west"}"#).await;
+    let runner = step(runner).await;
+    fx.approve(id).await;
+    // The trusted tree on the runner no longer hashes to the approved revision.
+    std::fs::write(
+        fx.project_dir().join("trusted/infra/main.tf"),
+        "resource \"null_resource\" \"swapped\" {}\n",
+    )
+    .unwrap();
+    let _runner = step(runner).await;
+    let st = fx.status(id).await;
+    assert_eq!(st.result.as_deref(), Some("apply_failed"), "{st:?}");
+    assert_eq!(st.failure.unwrap().category, "untrusted");
+    assert!(!fx.record().contains("arg:apply"), "nothing was applied");
+    assert!(fx.applied().is_none(), "the baseline is untouched");
+    fx.assert_no_job_leftovers();
+}

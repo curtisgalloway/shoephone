@@ -304,6 +304,19 @@ fn apply_pair(
     (scope, display)
 }
 
+/// Trust `project` at the revision and schema [`apply_pair`] names, so the
+/// daemon accepts an apply planned from it.
+fn trust_for_apply(dir: &std::path::Path, project: &str) {
+    let record = shoephone::store::TrustRecord {
+        project: project.into(),
+        digest: hex('1'),
+        schema: hex('2'),
+        job: 1,
+        at: 1,
+    };
+    Store::new(dir).save_trusted(&[record]).unwrap();
+}
+
 fn trust_pair(project: &str) -> (Value, Value) {
     let diff = "+ resource added\n";
     let scope = json!({
@@ -424,6 +437,7 @@ async fn submit_with_digest_not_matching_display_is_400() {
     let dir = scratch("jobs-digest");
     let key = runner_key();
     let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    trust_for_apply(&dir, "net");
     let rig = Rig::new(&client, "r1", &key);
     let client = Arc::new(client);
 
@@ -488,6 +502,7 @@ async fn submit_with_counts_not_matching_addresses_is_400() {
     let dir = scratch("jobs-counts");
     let key = runner_key();
     let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    trust_for_apply(&dir, "net");
     let rig = Rig::new(&client, "r1", &key);
     let client = Arc::new(client);
 
@@ -515,6 +530,7 @@ async fn submit_with_destructive_flag_wrong_is_400() {
     let dir = scratch("jobs-destructive");
     let key = runner_key();
     let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    trust_for_apply(&dir, "net");
     let rig = Rig::new(&client, "r1", &key);
     let client = Arc::new(client);
 
@@ -540,6 +556,7 @@ async fn claim_is_single_use() {
     let dir = scratch("jobs-claim");
     let key = runner_key();
     let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    trust_for_apply(&dir, "net");
     let rig = Rig::new(&client, "r1", &key);
     let client = Arc::new(client);
 
@@ -878,6 +895,7 @@ async fn submit_with_unchecked_display_fields_is_400() {
         Some(id),
     )
     .await;
+    trust_for_apply(&dir, "net");
 
     let id = file_apply(&client, "net").await;
     rig.poll().await;
@@ -1013,6 +1031,7 @@ async fn baseline_status_must_match_baseline_manifest() {
     let dir = scratch("jobs-baseline");
     let key = runner_key();
     let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    trust_for_apply(&dir, "net");
     let rig = Rig::new(&client, "r1", &key);
     let client = Arc::new(client);
     let id = file_apply(&client, "net").await;
@@ -1427,6 +1446,7 @@ async fn a_submitted_apply_shows_counts_addresses_and_variable_names_but_no_valu
     let dir = scratch("jobs-summary");
     let key = runner_key();
     let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    trust_for_apply(&dir, "net");
     let rig = Rig::new(&client, "r1", &key);
     let base = client.base().to_owned();
     let client = Arc::new(client);
@@ -1462,4 +1482,27 @@ async fn a_submitted_apply_shows_counts_addresses_and_variable_names_but_no_valu
     })
     .await;
     assert!(!raw.contains("us-east-1"), "a manifest value leaked: {raw}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apply_submitted_after_an_untrust_is_refused_untrusted() {
+    let dir = scratch("jobs-untrust-submit");
+    let key = runner_key();
+    let (client, _d) = start_runners(&dir, &[("net", "r1")], &[("r1", &key)]).await;
+    trust_for_apply(&dir, "net");
+    let rig = Rig::new(&client, "r1", &key);
+    let client = Arc::new(client);
+
+    let id = file_apply(&client, "net").await;
+    let polled = rig.poll().await;
+    assert_eq!(polled["trusted"]["digest"], hex('1'));
+    // Untrusted while the runner plans.
+    assert!(Store::new(&dir).untrust("net").unwrap().is_some());
+    let (scope, display) = apply_pair("net", &["create a.b"], [1, 0, 0, 0], false);
+    let reply = submit(&rig, id, scope, display).await;
+    assert_eq!((reply.http, reply.code().as_str()), (409, "untrusted"));
+    let status = status_of(&client, id).await;
+    assert_eq!(status.result.as_deref(), Some("refused"));
+    assert_eq!(status.failure.unwrap().category, "untrusted");
+    assert!(ledger_text(&client).await.contains("\"untrusted\""));
 }

@@ -408,6 +408,16 @@ fn apply_json_carries_counts_and_changed_variables() {
         .await;
         let hex = |c: char| c.to_string().repeat(64);
         let sha = |t: &str| shoephone::store::sha256_hex(t);
+        let record = shoephone::store::TrustRecord {
+            project: "net".into(),
+            digest: hex('1'),
+            schema: hex('2'),
+            job: 1,
+            at: 1,
+        };
+        shoephone::store::Store::new(&dir)
+            .save_trusted(&[record])
+            .unwrap();
         let manifest = r#"{"region":"us-east-1"}"#;
         let addresses = "create a.b\n";
         let (b2, k2) = (base.clone(), key.clone());

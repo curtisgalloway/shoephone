@@ -1008,6 +1008,21 @@ fn hex64(c: char) -> String {
     c.to_string().repeat(64)
 }
 
+/// Trust `project` at the revision and schema [`apply_scope`] names, so
+/// the daemon accepts an apply planned from it.
+fn trust_for_apply(dir: &std::path::Path, project: &str) {
+    let record = shoephone::store::TrustRecord {
+        project: project.into(),
+        digest: hex64('1'),
+        schema: hex64('2'),
+        job: 1,
+        at: 1,
+    };
+    shoephone::store::Store::new(dir)
+        .save_trusted(&[record])
+        .unwrap();
+}
+
 /// A well-formed apply scope for `project` and the display that backs it.
 fn apply_scope(project: &str) -> (serde_json::Value, serde_json::Value) {
     let manifest = r#"{"region":"us-east-1"}"#;
@@ -1077,6 +1092,7 @@ async fn apply_approval_with_real_assertion_moves_job_to_approved() {
     let dir = scratch("job-approve");
     let runner = common::runner_key();
     let (client, _daemon) = common::start_runners(&dir, &[("net", "r1")], &[("r1", &runner)]).await;
+    trust_for_apply(&dir, "net");
     let client = Arc::new(client);
     let base = client.base().to_owned();
     let agent = test_agent();
@@ -1145,6 +1161,7 @@ async fn the_page_accepts_the_daemons_pending_job_and_refuses_a_tampered_one() {
     let dir = scratch("job-page");
     let runner = common::runner_key();
     let (client, _daemon) = common::start_runners(&dir, &[("net", "r1")], &[("r1", &runner)]).await;
+    trust_for_apply(&dir, "net");
     let client = Arc::new(client);
     let base = client.base().to_owned();
     let agent = test_agent();
@@ -1228,6 +1245,7 @@ async fn assertion_over_ssh_challenge_cannot_approve_job() {
     let dir = scratch("job-ssh-assertion");
     let runner = common::runner_key();
     let (client, _daemon) = common::start_runners(&dir, &[("net", "r1")], &[("r1", &runner)]).await;
+    trust_for_apply(&dir, "net");
     let client = Arc::new(client);
     let base = client.base().to_owned();
     let agent = test_agent();

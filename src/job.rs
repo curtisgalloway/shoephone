@@ -383,13 +383,37 @@ fn refuse_waiting(
     gate.release(Occupant::Job(entry.job.id));
 }
 
+/// What a project is trusted at: the candidate digest, and the schema
+/// digest it was trusted under. An apply must name both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedRevision {
+    pub digest: String,
+    pub schema: String,
+}
+
+/// Whether `scope` names what `project` is trusted at now.
+fn apply_trusted(trusted: &BTreeMap<String, Option<TrustedRevision>>, scope: &ApplyScope) -> bool {
+    matches!(
+        trusted.get(&scope.project),
+        Some(Some(t)) if t.digest == scope.revision && t.schema == scope.schema
+    )
+}
+
+/// The digest `project` is trusted at now, if any.
+fn trusted_digest(
+    trusted: &BTreeMap<String, Option<TrustedRevision>>,
+    project: &str,
+) -> Option<String> {
+    trusted.get(project).cloned().flatten().map(|t| t.digest)
+}
+
 /// Every job this instance has seen, and the rules for moving them along.
 #[derive(Debug)]
 pub struct Jobs {
     /// Project to the name of the runner that serves it.
     projects: BTreeMap<String, String>,
-    /// The currently trusted candidate digest, per project.
-    trusted: BTreeMap<String, Option<String>>,
+    /// The currently trusted revision, per project.
+    trusted: BTreeMap<String, Option<TrustedRevision>>,
     entries: Vec<Entry>,
     events: Vec<JobEvent>,
     /// The latest `now` any method has seen; every method clamps up to it,
@@ -409,10 +433,11 @@ impl Jobs {
         }
     }
 
-    /// Record which candidate is trusted for `project` now. A trust scope
-    /// whose baseline differs is refused at approval as stale.
-    pub fn set_trusted(&mut self, project: &str, digest: Option<String>) {
-        self.trusted.insert(project.to_owned(), digest);
+    /// Record what `project` is trusted at now. A trust scope whose
+    /// baseline differs is refused as stale, and an apply scope whose
+    /// revision or schema differs as untrusted.
+    pub fn set_trusted(&mut self, project: &str, trusted: Option<TrustedRevision>) {
+        self.trusted.insert(project.to_owned(), trusted);
     }
 
     /// Drain the ledger entries recorded since the last call.
@@ -566,7 +591,8 @@ impl Jobs {
 
     /// The runner hands in the scope it planned. Accepted once, from
     /// `Working`, from the assigned runner; the scope is frozen from then on
-    /// and the job waits on the approver under a fresh nonce.
+    /// and the job waits on the approver under a fresh nonce. An apply
+    /// planned from anything but the current trust ends `untrusted`.
     pub fn submit(
         &mut self,
         now: SystemTime,
@@ -595,6 +621,13 @@ impl Jobs {
         }
         if !scope.matches(&entry.job.kind) || scope.project() != entry.job.project {
             return Err(Refusal::ScopeMismatch);
+        }
+        // A plan made from anything but the current trust is never shown.
+        if let JobScope::Apply(a) = &scope
+            && !apply_trusted(&self.trusted, a)
+        {
+            refuse_waiting(entry, &mut self.events, gate, now, "untrusted");
+            return Err(Refusal::Untrusted);
         }
         entry.job.state = JobState::Waiting {
             scope,
@@ -661,7 +694,8 @@ impl Jobs {
     /// The approver signs. The nonce is compared in constant time and the
     /// scope by equality against the one frozen at submit. A trust scope
     /// must name the baseline currently trusted; an apply plan must be no
-    /// older than the policy's `max_plan_age`. On success the job is
+    /// older than the policy's `max_plan_age` and must name the revision and
+    /// schema the project is trusted at now. On success the job is
     /// `Approved`, the strikes are forgotten and the slot is free.
     ///
     /// Any refusal leaves the job `Waiting`; it will time out by itself.
@@ -695,15 +729,20 @@ impl Jobs {
             return Err(Refusal::ScopeMismatch);
         }
         match scope {
-            JobScope::Apply(_) => {
+            JobScope::Apply(a) => {
                 if *since + entry.max_plan_age <= now {
                     let entry = &mut self.entries[i];
                     refuse_waiting(entry, &mut self.events, gate, now, "plan_too_old");
                     return Err(Refusal::PlanTooOld);
                 }
+                if !apply_trusted(&self.trusted, a) {
+                    let entry = &mut self.entries[i];
+                    refuse_waiting(entry, &mut self.events, gate, now, "untrusted");
+                    return Err(Refusal::Untrusted);
+                }
             }
             JobScope::Trust(t) => {
-                let current = self.trusted.get(&t.project).cloned().flatten();
+                let current = trusted_digest(&self.trusted, &t.project);
                 if t.baseline != current {
                     let entry = &mut self.entries[i];
                     refuse_waiting(entry, &mut self.events, gate, now, "stale_baseline");
@@ -750,7 +789,8 @@ impl Jobs {
     }
 
     /// The runner takes the approval, once, and gets the scope that was
-    /// signed.
+    /// signed. A trust whose baseline moved, or an apply whose revision is no
+    /// longer trusted (a live `untrust`), is refused instead, with no strike.
     pub fn claim(&mut self, now: SystemTime, runner: &str, id: u64) -> Result<JobScope, Refusal> {
         let now = self.clamp(now);
         let i = self.index(id).ok_or(Refusal::NoSuchRequest)?;
@@ -765,11 +805,19 @@ impl Jobs {
         match &entry.job.state {
             JobState::Approved { scope } => {
                 let scope = scope.clone();
-                if let JobScope::Trust(t) = &scope {
-                    let current = self.trusted.get(&t.project).cloned().flatten();
-                    if t.baseline != current {
-                        refuse_unstruck(entry, &mut self.events, now, "stale_baseline");
-                        return Err(Refusal::StaleBaseline);
+                match &scope {
+                    JobScope::Trust(t) => {
+                        let current = trusted_digest(&self.trusted, &t.project);
+                        if t.baseline != current {
+                            refuse_unstruck(entry, &mut self.events, now, "stale_baseline");
+                            return Err(Refusal::StaleBaseline);
+                        }
+                    }
+                    JobScope::Apply(a) => {
+                        if !apply_trusted(&self.trusted, a) {
+                            refuse_unstruck(entry, &mut self.events, now, "untrusted");
+                            return Err(Refusal::Untrusted);
+                        }
                     }
                 }
                 entry.job.state = JobState::Claimed;
@@ -1054,6 +1102,13 @@ mod tests {
         })
     }
 
+    fn revision(digest: char, schema: char) -> TrustedRevision {
+        TrustedRevision {
+            digest: digest.to_string().repeat(64),
+            schema: schema.to_string().repeat(64),
+        }
+    }
+
     struct Rig {
         jobs: Jobs,
         gate: Gate,
@@ -1084,7 +1139,20 @@ mod tests {
             )
         }
 
+        /// Submits `scope`. An apply's project is first trusted at the
+        /// scope's revision, unless the test already set its trust.
         fn submit(&mut self, now: SystemTime, id: u64, scope: JobScope) -> Result<(), Refusal> {
+            if let JobScope::Apply(a) = &scope
+                && !self.jobs.trusted.contains_key(&a.project)
+            {
+                self.jobs.set_trusted(
+                    &a.project,
+                    Some(TrustedRevision {
+                        digest: a.revision.clone(),
+                        schema: a.schema.clone(),
+                    }),
+                );
+            }
             self.jobs.submit(
                 now,
                 &mut self.gate,
@@ -1677,7 +1745,7 @@ mod tests {
     #[test]
     fn trust_with_stale_baseline_is_refused() {
         let mut r = Rig::new();
-        r.jobs.set_trusted("web", Some("9".repeat(64)));
+        r.jobs.set_trusted("web", Some(revision('9', '8')));
         let nonce = r.waiting(1, trust_kind(), trust_scope());
         r.jobs.take_events();
         assert_eq!(
@@ -1709,7 +1777,7 @@ mod tests {
         let mut r = Rig::new();
         let nonce = r.waiting(1, trust_kind(), trust_scope());
         r.approve(t(3), 1, &nonce, &trust_scope()).unwrap();
-        r.jobs.set_trusted("web", Some("9".repeat(64)));
+        r.jobs.set_trusted("web", Some(revision('9', '8')));
         r.jobs.take_events();
         assert_eq!(
             r.jobs.claim(t(4), "runner-a", 1),
@@ -1720,6 +1788,75 @@ mod tests {
             JobState::Done(JobResult::Refused(failure("stale_baseline")))
         );
         assert_eq!(r.gate.strikes, 0);
+        assert_eq!(
+            r.jobs.claim(t(5), "runner-a", 1),
+            Err(Refusal::NoSuchRequest)
+        );
+        assert_eq!(r.jobs.take_events().len(), 1);
+    }
+
+    #[test]
+    fn apply_submit_against_another_revision_is_refused_untrusted() {
+        for trusted in [None, Some(revision('9', 'b')), Some(revision('a', '9'))] {
+            let mut r = Rig::new();
+            r.jobs.set_trusted("web", trusted.clone());
+            r.request(t(0), 1, apply_kind()).unwrap();
+            r.jobs.poll(t(1), &mut r.gate, "runner-a").unwrap();
+            r.jobs.take_events();
+            assert_eq!(
+                r.submit(t(2), 1, apply_scope()),
+                Err(Refusal::Untrusted),
+                "{trusted:?}"
+            );
+            assert_eq!(
+                r.state(1),
+                JobState::Done(JobResult::Refused(failure("untrusted")))
+            );
+            assert_eq!(r.gate.busy(), None, "the slot is given back");
+            assert_eq!(r.gate.strikes, 0);
+            assert_eq!(
+                r.jobs.take_events(),
+                vec![JobEvent::Refused {
+                    id: 1,
+                    project: "web".into(),
+                    category: "untrusted".into(),
+                    at: t(2),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn apply_approve_after_untrust_is_refused_untrusted() {
+        let mut r = Rig::new();
+        let nonce = r.waiting(1, apply_kind(), apply_scope());
+        r.jobs.set_trusted("web", None);
+        r.jobs.take_events();
+        assert_eq!(
+            r.approve(t(3), 1, &nonce, &apply_scope()),
+            Err(Refusal::Untrusted)
+        );
+        assert_eq!(
+            r.state(1),
+            JobState::Done(JobResult::Refused(failure("untrusted")))
+        );
+        assert_eq!(r.gate.busy(), None);
+        assert_eq!(r.gate.strikes, 0);
+        assert_eq!(r.jobs.take_events().len(), 1);
+    }
+
+    #[test]
+    fn apply_claim_after_untrust_is_refused_untrusted() {
+        let mut r = Rig::new();
+        let nonce = r.waiting(1, apply_kind(), apply_scope());
+        r.approve(t(3), 1, &nonce, &apply_scope()).unwrap();
+        r.jobs.set_trusted("web", Some(revision('9', 'b')));
+        r.jobs.take_events();
+        assert_eq!(r.jobs.claim(t(4), "runner-a", 1), Err(Refusal::Untrusted));
+        assert_eq!(
+            r.state(1),
+            JobState::Done(JobResult::Refused(failure("untrusted")))
+        );
         assert_eq!(
             r.jobs.claim(t(5), "runner-a", 1),
             Err(Refusal::NoSuchRequest)
