@@ -81,7 +81,7 @@ fn is_hostile_char(c: char) -> bool {
 
 /// A path made safe to show: hostile characters become `?` and the text is
 /// cut to 256 characters.
-fn shown(path: &str) -> String {
+pub(crate) fn shown(path: &str) -> String {
     const MAX: usize = 256;
     let mut out: String = path
         .chars()
@@ -334,7 +334,7 @@ fn refused_input(name: &str) -> Option<&'static str> {
 
 /// Lexically joins `rel` onto `base` (both relative to the checkout) and
 /// returns None when the result leaves the checkout.
-fn join_within(base: &[String], rel: &str) -> Option<Vec<String>> {
+pub(crate) fn join_within(base: &[String], rel: &str) -> Option<Vec<String>> {
     let mut out = base.to_vec();
     for c in Path::new(rel).components() {
         match c {
@@ -500,6 +500,56 @@ pub fn execution_input(
         root: checkout.to_path_buf(),
         files,
     })
+}
+
+/// Modes for the operator's own checkout, which is not an unpacked archive:
+/// the file's permission bits, normalized the way [`unpack`] does it (0o755
+/// when owner-execute is set, else 0o644). `paths` are `/`-separated
+/// relative paths; a path that cannot be stat'ed is left out, so
+/// [`execution_input`] reports it.
+pub fn modes_from_disk(checkout: &Path, paths: &[String]) -> BTreeMap<String, u32> {
+    let mut out = BTreeMap::new();
+    for rel in paths {
+        let abs = rel
+            .split('/')
+            .fold(checkout.to_path_buf(), |p, c| p.join(c));
+        if let Ok(meta) = fs::symlink_metadata(&abs) {
+            let exec = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o100 != 0;
+            out.insert(rel.clone(), if exec { 0o755 } else { 0o644 });
+        }
+    }
+    out
+}
+
+fn list_files(root: &Path, dir: &[String], out: &mut Vec<String>) {
+    let abs = dir.iter().fold(root.to_path_buf(), |p, c| p.join(c));
+    let Ok(read) = fs::read_dir(&abs) else {
+        return;
+    };
+    for e in read.filter_map(|e| e.ok()) {
+        let Ok(name) = e.file_name().into_string() else {
+            continue;
+        };
+        if dir.is_empty() && name == ".git" {
+            continue;
+        }
+        let mut path = dir.to_vec();
+        path.push(name);
+        match e.file_type() {
+            Ok(t) if t.is_dir() => list_files(root, &path, out),
+            Ok(t) if t.is_file() => out.push(path.join("/")),
+            _ => {}
+        }
+    }
+}
+
+/// [`execution_input`] for a checkout on disk whose modes come from its own
+/// permission bits (see [`modes_from_disk`]), not from an archive header.
+pub fn execution_input_from_disk(checkout: &Path, project_path: &str) -> Result<Tree, Failure> {
+    let mut paths = Vec::new();
+    list_files(checkout, &[], &mut paths);
+    let modes = modes_from_disk(checkout, &paths);
+    execution_input(checkout, project_path, &modes)
 }
 
 /// Copies exactly the files of `tree` from the checkout at `from` into the

@@ -387,7 +387,9 @@ const isCount = v => Number.isInteger(v) && v >= 0;
 // The command the operator runs in their own checkout, built here from
 // signed fields so a runner cannot put its own text in front of the key.
 function verifyCommand(s) {
-  return 'shoephone-runner diff-digest ' + (s.baseline ?? 'none') + ' <candidate-dir>';
+  const b = s.baseline ?? null;
+  return 'shoephone-runner diff-digest ' + (b ?? 'none') + ' ' + (b ? '<baseline-checkout>' : '-') +
+    ' <candidate-checkout> <project-path>';
 }
 
 // True when the scope is shaped the way the daemon's scope.rs requires.

@@ -309,8 +309,8 @@ const withChallenge = async (job, bytes) => {
   await refused(await mkTrust({}), 'trust with no diff');
   await refused(await mkTrust({external: false}), 'trust with no diff, not external');
   assert.ok(await verifyJob(await mkTrust({external: true})));
-  assert.equal(verifyCommand({baseline: null}), 'shoephone-runner diff-digest none <candidate-dir>');
-  assert.equal(verifyCommand({baseline: 'a'.repeat(64)}), 'shoephone-runner diff-digest ' + 'a'.repeat(64) + ' <candidate-dir>');
+  assert.equal(verifyCommand({baseline: null}), 'shoephone-runner diff-digest none - <candidate-checkout> <project-path>');
+  assert.equal(verifyCommand({baseline: 'a'.repeat(64)}), 'shoephone-runner diff-digest ' + 'a'.repeat(64) + ' <baseline-checkout> <candidate-checkout> <project-path>');
   console.log('harness ok');
 })().catch(e => { console.error(e); process.exit(1); });
 "#;
