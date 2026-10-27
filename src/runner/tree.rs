@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -69,11 +69,29 @@ fn fail(category: &str, detail: impl Into<String>) -> Failure {
     }
 }
 
-/// A path made safe to show: control characters become `?`.
+/// Characters that never belong in a path the agent controls: controls
+/// (C0 and C1) and the bidi and invisible formatting set, which can make one
+/// path read as another.
+fn is_hostile_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{61c}' | '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+            | '\u{2060}' | '\u{2066}'..='\u{2069}' | '\u{feff}' | '\u{e0000}'..='\u{e007f}')
+}
+
+/// A path made safe to show: hostile characters become `?` and the text is
+/// cut to 256 characters.
 fn shown(path: &str) -> String {
-    path.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
+    const MAX: usize = 256;
+    let mut out: String = path
+        .chars()
+        .take(MAX)
+        .map(|c| if is_hostile_char(c) { '?' } else { c })
+        .collect();
+    if path.chars().nth(MAX).is_some() {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -94,7 +112,7 @@ struct Guarded<R> {
 
 impl<R: Read> Read for Guarded<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if Instant::now() > self.deadline {
+        if Instant::now() >= self.deadline {
             self.stop.set(Some(Stop::Timeout));
             return Err(io::Error::other("deadline"));
         }
@@ -130,10 +148,10 @@ impl Refusal {
 
 /// Validates an entry path and returns its normal components.
 fn clean_path(raw: &[u8]) -> Result<Vec<String>, String> {
-    if raw.iter().any(|&b| b < 0x20 || b == 0x7f) {
-        return Err("path contains a control character".into());
-    }
     let s = std::str::from_utf8(raw).map_err(|_| "path is not UTF-8".to_string())?;
+    if s.chars().any(is_hostile_char) {
+        return Err("path contains a control or invisible character".into());
+    }
     let mut parts = Vec::new();
     for c in Path::new(s).components() {
         match c {
@@ -150,17 +168,26 @@ fn clean_path(raw: &[u8]) -> Result<Vec<String>, String> {
     Ok(parts)
 }
 
-/// Unpacks a gzip tar into `into`, which must exist and be empty.
+/// Unpacks a gzip tar into `into` and returns each file's mode.
 ///
-/// Refuses anything but regular files and directories. Directories are made
-/// 0700 and files 0600, or 0700 when the archive set an execute bit.
-pub fn unpack(archive: &[u8], into: &Path, limits: &Limits) -> Result<(), Failure> {
+/// The caller passes a fresh, private, empty directory and discards it on any
+/// error: a refused archive can leave earlier entries behind. Refuses
+/// anything but regular files and directories. Every file is written 0600 and
+/// every directory 0700, whatever the umask. The returned map holds the mode
+/// the archive asked for, normalized to 0o755 (owner-execute set) or 0o644,
+/// keyed by `/`-separated path; that, not the disk, is what the digest sees.
+pub fn unpack(
+    archive: &[u8],
+    into: &Path,
+    limits: &Limits,
+) -> Result<BTreeMap<String, u32>, Failure> {
+    require_empty(into)?;
     if archive.len() as u64 > limits.compressed_bytes {
         return Err(fail("archive_too_large", "compressed bound exceeded"));
     }
     let start = Instant::now();
     let stop = Rc::new(Cell::new(None));
-    let slack = (limits.files as u64).saturating_mul(1024) + 1024 * 1024;
+    let slack = (limits.files as u64).saturating_mul(3 * 1024) + 1024 * 1024;
     let guarded = Guarded {
         inner: flate2::read::GzDecoder::new(archive),
         seen: 0,
@@ -171,26 +198,67 @@ pub fn unpack(archive: &[u8], into: &Path, limits: &Limits) -> Result<(), Failur
     run_unpack(guarded, into, limits, start, &stop).map_err(|r| r.into_failure(limits))
 }
 
+fn require_empty(dir: &Path) -> Result<(), Failure> {
+    let mut entries = fs::read_dir(dir)
+        .map_err(|_| fail("archive_write_failed", "the target directory is unreadable"))?;
+    if entries.next().is_some() {
+        return Err(fail(
+            "archive_write_failed",
+            "the target directory is not empty",
+        ));
+    }
+    Ok(())
+}
+
+/// Creates `parts` under `root` one directory at a time, each 0700 whatever
+/// the umask. Fails if a component exists and is not a directory.
+fn make_dirs(root: &Path, parts: &[String]) -> io::Result<PathBuf> {
+    let mut p = root.to_path_buf();
+    for c in parts {
+        p.push(c);
+        match DirBuilder::new().mode(0o700).create(&p) {
+            Ok(()) => fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                if !fs::symlink_metadata(&p)?.is_dir() {
+                    return Err(e);
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(p)
+}
+
+/// Creates a new file, 0600 whatever the umask, never following a link.
+fn create_private(path: &Path) -> io::Result<fs::File> {
+    let f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(f)
+}
+
 fn run_unpack<R: Read>(
     reader: R,
     into: &Path,
     limits: &Limits,
     start: Instant,
     stop: &Rc<Cell<Option<Stop>>>,
-) -> Result<(), Refusal> {
-    let malformed = |e: io::Error| match stop.get() {
+) -> Result<BTreeMap<String, u32>, Refusal> {
+    let malformed = |_: io::Error| match stop.get() {
         Some(s) => Refusal::Stop(s),
-        None => Refusal::Other(fail(
-            "archive_malformed",
-            format!("unreadable archive: {e}"),
-        )),
+        None => Refusal::Other(fail("archive_malformed", "the archive could not be read")),
     };
+    let mut modes = BTreeMap::new();
     let mut tar = tar::Archive::new(reader);
     let mut count = 0usize;
     let mut written = 0u64;
     let mut seen_files: BTreeSet<Vec<String>> = BTreeSet::new();
     for entry in tar.entries().map_err(malformed)? {
-        if start.elapsed() > limits.timeout {
+        if start.elapsed() >= limits.timeout {
             return Err(Refusal::Stop(Stop::Timeout));
         }
         let mut entry = entry.map_err(malformed)?;
@@ -213,14 +281,10 @@ fn run_unpack<R: Read>(
         if parts.is_empty() {
             continue;
         }
-        let dest = parts.iter().fold(into.to_path_buf(), |p, c| p.join(c));
         let shown_path = shown(&parts.join("/"));
+        let cannot = |e: io::Error| Refusal::Entry(format!("cannot create {shown_path}: {e}"));
         if kind.is_dir() {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&dest)
-                .map_err(|e| Refusal::Entry(format!("cannot create {shown_path}: {e}")))?;
+            make_dirs(into, &parts).map_err(cannot)?;
             continue;
         }
         if !seen_files.insert(parts.clone()) {
@@ -229,25 +293,15 @@ fn run_unpack<R: Read>(
         let executable = entry
             .header()
             .mode()
-            .map(|m| m & 0o111 != 0)
+            .map(|m| m & 0o100 != 0)
             .unwrap_or(false);
-        if let Some(parent) = dest.parent() {
-            DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(parent)
-                .map_err(|e| Refusal::Entry(format!("cannot create {shown_path}: {e}")))?;
-        }
-        let mut out = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(if executable { 0o700 } else { 0o600 })
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&dest)
-            .map_err(|e| Refusal::Entry(format!("cannot create {shown_path}: {e}")))?;
+        let (name, parent) = parts.split_last().expect("a file has a name");
+        let dir = make_dirs(into, parent).map_err(cannot)?;
+        let mut out = create_private(&dir.join(name)).map_err(cannot)?;
+        modes.insert(parts.join("/"), if executable { 0o755 } else { 0o644 });
         let mut chunk = [0u8; 64 * 1024];
         loop {
-            if start.elapsed() > limits.timeout {
+            if start.elapsed() >= limits.timeout {
                 return Err(Refusal::Stop(Stop::Timeout));
             }
             let n = entry.read(&mut chunk).map_err(malformed)?;
@@ -262,7 +316,7 @@ fn run_unpack<R: Read>(
                 .map_err(|e| Refusal::Other(fail("archive_write_failed", e.to_string())))?;
         }
     }
-    Ok(())
+    Ok(modes)
 }
 
 /// Names Terraform would read as state, plans or implicit variable values.
@@ -349,6 +403,7 @@ fn module_dirs(checkout: &Path, dir: &[String]) -> Result<Vec<Vec<String>>, Fail
 fn walk(
     checkout: &Path,
     dir: &[String],
+    modes: &BTreeMap<String, u32>,
     files: &mut BTreeMap<String, FileEntry>,
 ) -> Result<(), Failure> {
     let abs = dir.iter().fold(checkout.to_path_buf(), |p, c| p.join(c));
@@ -373,7 +428,7 @@ fn walk(
                     format!("{} is refused", shown(&rel)),
                 ));
             }
-            walk(checkout, &path, files)?;
+            walk(checkout, &path, modes, files)?;
             continue;
         }
         if !meta.is_file() {
@@ -388,6 +443,12 @@ fn walk(
         if files.contains_key(&rel) {
             continue;
         }
+        let Some(&mode) = modes.get(&rel) else {
+            return Err(fail(
+                "input_file_refused",
+                format!("{} has no recorded mode", shown(&rel)),
+            ));
+        };
         let mut hasher = Sha256::new();
         let mut f = fs::File::open(e.path())
             .map_err(|err| fail("input_file_refused", format!("{}: {err}", shown(&rel))))?;
@@ -396,7 +457,7 @@ fn walk(
         files.insert(
             rel,
             FileEntry {
-                mode: meta.mode() & 0o777,
+                mode,
                 sha256: hasher
                     .finalize()
                     .iter()
@@ -411,7 +472,14 @@ fn walk(
 
 /// Collects every file Terraform will read for `project_path`: the project
 /// directory plus every local module directory it reaches, transitively.
-pub fn execution_input(checkout: &Path, project_path: &str) -> Result<Tree, Failure> {
+///
+/// `modes` is what [`unpack`] returned: the disk holds every file 0600, so
+/// the mode in each [`FileEntry`] (and so in the digest) comes from there.
+pub fn execution_input(
+    checkout: &Path,
+    project_path: &str,
+    modes: &BTreeMap<String, u32>,
+) -> Result<Tree, Failure> {
     let project = join_within(&[], project_path).ok_or_else(|| {
         fail(
             "module_outside_checkout",
@@ -426,12 +494,41 @@ pub fn execution_input(checkout: &Path, project_path: &str) -> Result<Tree, Fail
             continue;
         }
         queue.extend(module_dirs(checkout, &dir)?);
-        walk(checkout, &dir, &mut files)?;
+        walk(checkout, &dir, modes, &mut files)?;
     }
     Ok(Tree {
         root: checkout.to_path_buf(),
         files,
     })
+}
+
+/// Copies exactly the files of `tree` from the checkout at `from` into the
+/// fresh, empty directory `into`, at the same relative paths, files 0600 and
+/// directories 0700. A run directory built this way holds nothing outside the
+/// execution input, so a read outside it finds nothing.
+pub fn copy_execution_input(tree: &Tree, from: &Path, into: &Path) -> Result<(), Failure> {
+    require_empty(into)?;
+    for rel in tree.files.keys() {
+        let parts: Vec<String> = rel.split('/').map(str::to_string).collect();
+        let shown_path = shown(rel);
+        let failed = |e: io::Error| {
+            fail(
+                "input_copy_failed",
+                format!("cannot copy {shown_path}: {e}"),
+            )
+        };
+        let (name, parent) = parts.split_last().expect("a file has a name");
+        let src = parts.iter().fold(from.to_path_buf(), |p, c| p.join(c));
+        let mut input = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&src)
+            .map_err(failed)?;
+        let dir = make_dirs(into, parent).map_err(failed)?;
+        let mut out = create_private(&dir.join(name)).map_err(failed)?;
+        io::copy(&mut input, &mut out).map_err(failed)?;
+    }
+    Ok(())
 }
 
 /// SHA-256 over the sorted `"{path}\0{mode:o}\0{sha256}\n"` lines.
@@ -456,7 +553,8 @@ mod tests {
     /// A tar entry written by hand, so a hostile name or type can be built.
     fn raw_entry(out: &mut Vec<u8>, name: &str, kind: u8, mode: u32, data: &[u8]) {
         let mut h = [0u8; 512];
-        h[..name.len()].copy_from_slice(name.as_bytes());
+        let n = name.len().min(100);
+        h[..n].copy_from_slice(&name.as_bytes()[..n]);
         h[100..107].copy_from_slice(format!("{mode:07o}").as_bytes());
         h[108..115].copy_from_slice(b"0000000");
         h[116..123].copy_from_slice(b"0000000");
@@ -471,6 +569,34 @@ mod tests {
         out.extend_from_slice(&h);
         out.extend_from_slice(data);
         out.extend(std::iter::repeat_n(0u8, (512 - data.len() % 512) % 512));
+    }
+
+    /// A pax record `"<len> key=value\n"`, where len counts itself.
+    fn pax_record(key: &str, value: &str) -> Vec<u8> {
+        let body = format!(" {key}={value}\n");
+        let mut len = body.len();
+        loop {
+            let total = body.len() + len.to_string().len();
+            if total == len {
+                break;
+            }
+            len = total;
+        }
+        format!("{len}{body}").into_bytes()
+    }
+
+    /// A file entry whose real name is carried by a pax `path` record.
+    fn pax_path_file(out: &mut Vec<u8>, real: &str, data: &[u8]) {
+        raw_entry(out, "pax-header", b'x', 0o644, &pax_record("path", real));
+        raw_entry(out, "innocent", b'0', 0o644, data);
+    }
+
+    /// A file entry whose real name is carried by a GNU `L` longname entry.
+    fn gnu_long_file(out: &mut Vec<u8>, real: &str, data: &[u8]) {
+        let mut name = real.as_bytes().to_vec();
+        name.push(0);
+        raw_entry(out, "././@LongLink", b'L', 0o644, &name);
+        raw_entry(out, "innocent", b'0', 0o644, data);
     }
 
     fn gz(mut tar: Vec<u8>) -> Vec<u8> {
@@ -488,10 +614,21 @@ mod tests {
         gz(t)
     }
 
-    fn unpacked(entries: &[(&str, &str)]) -> tempfile::TempDir {
+    type Fixture = (tempfile::TempDir, BTreeMap<String, u32>);
+
+    fn unpacked(entries: &[(&str, &str)]) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
-        unpack(&archive(entries), dir.path(), &Limits::default()).unwrap();
-        dir
+        let modes = unpack(&archive(entries), dir.path(), &Limits::default()).unwrap();
+        (dir, modes)
+    }
+
+    fn input(fx: &Fixture, project: &str) -> Result<Tree, Failure> {
+        execution_input(fx.0.path(), project, &fx.1)
+    }
+
+    fn refused(tar: Vec<u8>) -> Failure {
+        let dir = tempfile::tempdir().unwrap();
+        unpack(&gz(tar), dir.path(), &Limits::default()).unwrap_err()
     }
 
     #[test]
@@ -505,16 +642,52 @@ mod tests {
     }
 
     #[test]
+    fn hard_link_device_and_fifo_entries_are_refused() {
+        for kind in [b'1', b'3', b'4', b'6'] {
+            let mut t = Vec::new();
+            raw_entry(&mut t, "odd", kind, 0o644, b"");
+            assert_eq!(refused(t).category, "archive_entry_refused", "{kind}");
+        }
+    }
+
+    #[test]
     fn dotdot_entry_is_refused() {
         let mut t = Vec::new();
         raw_entry(&mut t, "a/../../evil", b'0', 0o644, b"x");
-        let dir = tempfile::tempdir().unwrap();
-        let err = unpack(&gz(t), dir.path(), &Limits::default()).unwrap_err();
-        assert_eq!(err.category, "archive_entry_refused");
+        assert_eq!(refused(t).category, "archive_entry_refused");
         let mut t = Vec::new();
         raw_entry(&mut t, "/etc/evil", b'0', 0o644, b"x");
-        let err = unpack(&gz(t), dir.path(), &Limits::default()).unwrap_err();
-        assert_eq!(err.category, "archive_entry_refused");
+        assert_eq!(refused(t).category, "archive_entry_refused");
+    }
+
+    #[test]
+    fn traversal_hidden_in_pax_path_and_gnu_longname_is_refused() {
+        let mut t = Vec::new();
+        pax_path_file(&mut t, "../evil", b"x");
+        assert_eq!(refused(t).category, "archive_entry_refused");
+        let mut t = Vec::new();
+        gnu_long_file(&mut t, "../evil", b"x");
+        assert_eq!(refused(t).category, "archive_entry_refused");
+        let mut t = Vec::new();
+        gnu_long_file(&mut t, "/abs/evil", b"x");
+        assert_eq!(refused(t).category, "archive_entry_refused");
+    }
+
+    #[test]
+    fn pax_global_header_is_skipped_without_affecting_later_entries() {
+        let mut t = Vec::new();
+        raw_entry(
+            &mut t,
+            "pax_global_header",
+            b'g',
+            0o666,
+            &pax_record("comment", "abc"),
+        );
+        raw_entry(&mut t, "p/main.tf", b'0', 0o644, b"# x\n");
+        let dir = tempfile::tempdir().unwrap();
+        let modes = unpack(&gz(t), dir.path(), &Limits::default()).unwrap();
+        assert_eq!(modes.keys().collect::<Vec<_>>(), ["p/main.tf"]);
+        assert!(dir.path().join("p/main.tf").is_file());
     }
 
     #[test]
@@ -535,6 +708,67 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.category, "archive_entry_refused");
+    }
+
+    #[test]
+    fn file_and_directory_at_the_same_path_are_refused() {
+        let mut t = Vec::new();
+        raw_entry(&mut t, "x", b'0', 0o644, b"1");
+        raw_entry(&mut t, "x", b'5', 0o755, b"");
+        assert_eq!(refused(t).category, "archive_entry_refused");
+        let mut t = Vec::new();
+        raw_entry(&mut t, "x", b'5', 0o755, b"");
+        raw_entry(&mut t, "x", b'0', 0o644, b"1");
+        assert_eq!(refused(t).category, "archive_entry_refused");
+    }
+
+    #[test]
+    fn file_under_a_path_that_was_a_file_is_refused() {
+        let mut t = Vec::new();
+        raw_entry(&mut t, "x", b'0', 0o644, b"1");
+        raw_entry(&mut t, "x/y", b'0', 0o644, b"2");
+        assert_eq!(refused(t).category, "archive_entry_refused");
+    }
+
+    #[test]
+    fn bidi_and_c1_paths_are_refused_and_not_echoed() {
+        for name in ["a\u{202e}fdp.tf", "a\u{85}b", "a\u{200b}b", "a\u{feff}b"] {
+            let mut t = Vec::new();
+            raw_entry(&mut t, name, b'0', 0o644, b"x");
+            let err = refused(t);
+            assert_eq!(err.category, "archive_entry_refused");
+            let detail = err.detail.unwrap();
+            assert!(!detail.chars().any(is_hostile_char), "{detail:?}");
+        }
+    }
+
+    #[test]
+    fn very_long_path_is_refused_with_a_bounded_detail() {
+        let long = "a".repeat(10_000);
+        let mut t = Vec::new();
+        gnu_long_file(&mut t, &long, b"x");
+        let err = refused(t);
+        assert_eq!(err.category, "archive_entry_refused");
+        let detail = err.detail.unwrap();
+        assert!(detail.chars().count() < 400, "{}", detail.len());
+        assert!(detail.contains('\u{2026}'));
+        let shown_long = shown(&"b".repeat(10_000));
+        assert_eq!(shown_long.chars().count(), 257);
+    }
+
+    #[test]
+    fn malformed_archive_detail_does_not_echo_tar_error_text() {
+        let err = refused(vec![0xffu8; 512]);
+        assert_eq!(err.category, "archive_malformed");
+        assert_eq!(err.detail.as_deref(), Some("the archive could not be read"));
+    }
+
+    #[test]
+    fn non_empty_target_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("old"), "x").unwrap();
+        let err = unpack(&archive(&[("a", "x")]), dir.path(), &Limits::default()).unwrap_err();
+        assert_eq!(err.category, "archive_write_failed");
     }
 
     #[test]
@@ -583,22 +817,72 @@ mod tests {
             timeout: Duration::ZERO,
             ..Limits::default()
         };
-        std::thread::sleep(Duration::from_millis(5));
         let err = unpack(&archive(&[("a", "x")]), dir.path(), &limits).unwrap_err();
         assert_eq!(err.category, "archive_timeout");
     }
 
     #[test]
-    fn modes_are_normalized_on_disk() {
+    fn files_are_0600_on_disk_and_the_digest_sees_the_header_mode() {
         let mut t = Vec::new();
         raw_entry(&mut t, "d/run.sh", b'0', 0o755, b"x");
         raw_entry(&mut t, "d/plain", b'0', 0o666, b"x");
+        raw_entry(&mut t, "d/main.tf", b'0', 0o600, b"# x\n");
         let dir = tempfile::tempdir().unwrap();
-        unpack(&gz(t), dir.path(), &Limits::default()).unwrap();
-        let mode = |p: &str| fs::metadata(dir.path().join(p)).unwrap().mode() & 0o777;
+        let modes = unpack(&gz(t), dir.path(), &Limits::default()).unwrap();
+        let mode = |p: &str| {
+            fs::metadata(dir.path().join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
         assert_eq!(mode("d"), 0o700);
-        assert_eq!(mode("d/run.sh"), 0o700);
+        assert_eq!(mode("d/run.sh"), 0o600);
         assert_eq!(mode("d/plain"), 0o600);
+        let tree = execution_input(dir.path(), "d", &modes).unwrap();
+        assert_eq!(tree.files["d/run.sh"].mode, 0o755);
+        assert_eq!(tree.files["d/plain"].mode, 0o644);
+        assert_eq!(tree.files["d/main.tf"].mode, 0o644);
+    }
+
+    const UMASK_CHILD: &str = "SHOEPHONE_TREE_UMASK_CHILD";
+
+    fn digest_of_exec_and_plain(dir: &Path) -> String {
+        let mut t = Vec::new();
+        raw_entry(&mut t, "d/run.sh", b'0', 0o755, b"x");
+        raw_entry(&mut t, "d/main.tf", b'0', 0o644, b"# x\n");
+        let modes = unpack(&gz(t), dir, &Limits::default()).unwrap();
+        digest(&execution_input(dir, "d", &modes).unwrap())
+    }
+
+    #[test]
+    fn umask_child() {
+        if std::env::var_os(UMASK_CHILD).is_none() {
+            return;
+        }
+        let want = std::env::var(UMASK_CHILD).unwrap();
+        // SAFETY: the child process runs only this test.
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { libc::umask(0o177) };
+        assert_eq!(digest_of_exec_and_plain(dir.path()), want);
+    }
+
+    #[test]
+    fn umask_does_not_change_the_digest() {
+        if std::env::var_os(UMASK_CHILD).is_some() {
+            return;
+        }
+        let want = digest_of_exec_and_plain(tempfile::tempdir().unwrap().path());
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runner::tree::tests::umask_child",
+                "--test-threads=1",
+            ])
+            .env(UMASK_CHILD, &want)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     const LOCAL: &str = "module \"m\" {\n  source = \"./sub\"\n}\n";
@@ -611,27 +895,46 @@ mod tests {
             "${var.x}/sub",
         ] {
             let tf = format!("module \"m\" {{\n  source = \"{src}\"\n}}\n");
-            let dir = unpacked(&[("p/main.tf", &tf)]);
-            let err = execution_input(dir.path(), "p").unwrap_err();
+            let fx = unpacked(&[("p/main.tf", &tf)]);
+            let err = input(&fx, "p").unwrap_err();
             assert_eq!(err.category, "module_not_local", "{src}");
         }
-        let dir = unpacked(&[("p/main.tf", "module \"m\" {\n  source = var.s\n}\n")]);
-        let err = execution_input(dir.path(), "p").unwrap_err();
+        let fx = unpacked(&[("p/main.tf", "module \"m\" {\n  source = var.s\n}\n")]);
+        let err = input(&fx, "p").unwrap_err();
         assert_eq!(err.category, "module_not_local");
     }
 
     #[test]
     fn module_leaving_the_checkout_is_refused() {
-        let tf = "module \"m\" {\n  source = \"../../x\"\n}\n";
-        let dir = unpacked(&[("p/main.tf", tf)]);
-        let err = execution_input(dir.path(), "p").unwrap_err();
-        assert_eq!(err.category, "module_outside_checkout");
+        for src in ["../../x", "./x/../../../y"] {
+            let tf = format!("module \"m\" {{\n  source = \"{src}\"\n}}\n");
+            let fx = unpacked(&[("p/main.tf", &tf)]);
+            let err = input(&fx, "p").unwrap_err();
+            assert_eq!(err.category, "module_outside_checkout", "{src}");
+        }
+    }
+
+    #[test]
+    fn dot_segments_that_stay_inside_resolve_lexically() {
+        let tf = "module \"m\" {\n  source = \"./x/../../y\"\n}\n";
+        let fx = unpacked(&[("p/main.tf", tf), ("y/main.tf", "# y\n")]);
+        let tree = input(&fx, "p").unwrap();
+        assert!(tree.files.contains_key("y/main.tf"));
+    }
+
+    #[test]
+    fn module_cycle_terminates() {
+        let a = "module \"b\" {\n  source = \"../b\"\n}\n";
+        let b = "module \"a\" {\n  source = \"../a\"\n}\n";
+        let fx = unpacked(&[("a/main.tf", a), ("b/main.tf", b)]);
+        let tree = input(&fx, "a").unwrap();
+        assert_eq!(tree.files.len(), 2);
     }
 
     #[test]
     fn local_module_outside_project_dir_is_included() {
         let tf = "module \"net\" {\n  source = \"../../modules/net\"\n}\n";
-        let dir = unpacked(&[
+        let fx = unpacked(&[
             ("env/prod/main.tf", tf),
             (
                 "modules/net/main.tf",
@@ -640,7 +943,7 @@ mod tests {
             ("modules/leaf/main.tf", "# leaf\n"),
             ("modules/unused/main.tf", "# unused\n"),
         ]);
-        let tree = execution_input(dir.path(), "env/prod").unwrap();
+        let tree = input(&fx, "env/prod").unwrap();
         let keys: Vec<&str> = tree.files.keys().map(String::as_str).collect();
         assert_eq!(
             keys,
@@ -663,31 +966,30 @@ mod tests {
             "terraform.tfstate.backup",
             "out.tfplan",
         ] {
-            let dir = unpacked(&[("p/main.tf", "# x\n"), (&format!("p/{name}"), "{}")]);
-            let err = execution_input(dir.path(), "p").unwrap_err();
+            let fx = unpacked(&[("p/main.tf", "# x\n"), (&format!("p/{name}"), "{}")]);
+            let err = input(&fx, "p").unwrap_err();
             assert_eq!(err.category, "input_file_refused", "{name}");
         }
-        let dir = unpacked(&[("p/main.tf", "# x\n"), ("p/.terraform/x", "x")]);
-        let err = execution_input(dir.path(), "p").unwrap_err();
-        assert_eq!(err.category, "input_file_refused");
-        let dir = unpacked(&[("p/main.tf", "# x\n"), ("p/a.tf.json", "{}")]);
-        let err = execution_input(dir.path(), "p").unwrap_err();
-        assert_eq!(err.category, "tf_json_refused");
+        let fx = unpacked(&[("p/main.tf", "# x\n"), ("p/.terraform/x", "x")]);
+        assert_eq!(input(&fx, "p").unwrap_err().category, "input_file_refused");
+        let fx = unpacked(&[("p/main.tf", "# x\n"), ("p/a.tf.json", "{}")]);
+        assert_eq!(input(&fx, "p").unwrap_err().category, "tf_json_refused");
     }
 
     #[test]
     fn digest_changes_with_mode_and_content() {
         let a = unpacked(&[("p/main.tf", "# one\n")]);
-        let base = digest(&execution_input(a.path(), "p").unwrap());
+        let base = digest(&input(&a, "p").unwrap());
         let b = unpacked(&[("p/main.tf", "# two\n")]);
-        assert_ne!(base, digest(&execution_input(b.path(), "p").unwrap()));
+        assert_ne!(base, digest(&input(&b, "p").unwrap()));
         let mut t = Vec::new();
         raw_entry(&mut t, "p/main.tf", b'0', 0o755, b"# one\n");
         let c = tempfile::tempdir().unwrap();
-        unpack(&gz(t), c.path(), &Limits::default()).unwrap();
-        assert_ne!(base, digest(&execution_input(c.path(), "p").unwrap()));
+        let modes = unpack(&gz(t), c.path(), &Limits::default()).unwrap();
+        let exec = digest(&execution_input(c.path(), "p", &modes).unwrap());
+        assert_ne!(base, exec);
         let again = unpacked(&[("p/main.tf", "# one\n")]);
-        assert_eq!(base, digest(&execution_input(again.path(), "p").unwrap()));
+        assert_eq!(base, digest(&input(&again, "p").unwrap()));
     }
 
     #[test]
@@ -699,9 +1001,41 @@ mod tests {
             ("README.md", "c"),
         ]);
         assert_eq!(
-            digest(&execution_input(a.path(), "p").unwrap()),
-            digest(&execution_input(b.path(), "p").unwrap())
+            digest(&input(&a, "p").unwrap()),
+            digest(&input(&b, "p").unwrap())
         );
+    }
+
+    #[test]
+    fn copy_holds_only_the_execution_input_and_keeps_the_digest() {
+        let tf = "module \"net\" {\n  source = \"../m\"\n}\n";
+        let fx = unpacked(&[
+            ("p/main.tf", tf),
+            ("m/main.tf", "# m\n"),
+            ("secret/notes", "outside"),
+        ]);
+        let tree = input(&fx, "p").unwrap();
+        let into = tempfile::tempdir().unwrap();
+        copy_execution_input(&tree, fx.0.path(), into.path()).unwrap();
+        assert!(!into.path().join("secret").exists());
+        let modes: BTreeMap<String, u32> = tree
+            .files
+            .iter()
+            .map(|(k, v)| (k.clone(), v.mode))
+            .collect();
+        let copied = execution_input(into.path(), "p", &modes).unwrap();
+        assert_eq!(digest(&copied), digest(&tree));
+        let mode = |p: &str| {
+            fs::metadata(into.path().join(p))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("p"), 0o700);
+        assert_eq!(mode("p/main.tf"), 0o600);
+        let err = copy_execution_input(&tree, fx.0.path(), into.path()).unwrap_err();
+        assert_eq!(err.category, "archive_write_failed");
     }
 
     #[test]
