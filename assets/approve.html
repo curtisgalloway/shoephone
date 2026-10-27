@@ -555,6 +555,12 @@ function variableRows(v) {
   return rows;
 }
 
+// The first 12 hex digits of a digest, enough to compare by eye with the
+// trust that was approved. Anything else is shown whole, through visible().
+function shortDigest(d) {
+  return isDigest(d) ? d.slice(0, 12) : String(d);
+}
+
 function renderApply(j) {
   const s = j.scope, d = j.display;
   const nodes = [];
@@ -580,7 +586,7 @@ function renderApply(j) {
     nodes.push(kv(ACTIONS.map(k => [k, String(c[k])])));
     nodes.push(section('changes', lineList(changes.map(c => [c.action + ' ' + c.address, c.action === 'delete' || c.action === 'replace' ? 'del' : undefined]))));
   }
-  nodes.push(kv([['baseline', s.baseline_status]]));
+  nodes.push(kv([['baseline', s.baseline_status], ['revision', shortDigest(s.revision)], ['schema', shortDigest(s.schema)]]));
   return nodes;
 }
 

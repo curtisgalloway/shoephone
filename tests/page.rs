@@ -355,6 +355,11 @@ const withChallenge = async (job, bytes) => {
   assert.ok(await verifyJob(await mkTrust({diff, warnings: [w('provisioner')]})));
   assert.ok(await verifyJob(await mkTrust({external: true, warnings: [w('import')]})));
   await refused(await mkTrust({diff: diff + 'x', warnings: [w('provisioner')]}), 'warnings do not rescue a bad diff');
+  // The apply details name the signed revision and schema, shortened.
+  document.createElement = rec;
+  let applyOut;
+  try { applyOut = renderApply(await mkApply()).map(texts); } finally { document.createElement = realCreate; }
+  assert.equal(applyOut.find(t => t.startsWith('baseline')), 'baseline|uncertain|revision|' + 'a'.repeat(12) + '|schema|' + 'b'.repeat(12));
   console.log('harness ok');
 })().catch(e => { console.error(e); process.exit(1); });
 "#;

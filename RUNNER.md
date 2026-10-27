@@ -76,8 +76,10 @@ so a crash before `finish` is sent is re-sent at the next start.
   repeats the review against `trusted/`; unless the candidate, diff and
   schema digests, the three counts and `schema_changed` all equal the
   worker's, and the worker's diff text hashes to that digest, the job is
-  refused `review_inconsistent`. The worker's diff text and warnings are
-  what the approver is shown. On approval root unpacks and reviews the
+  refused `review_inconsistent`. The worker's diff text (which must hash to
+  root's own diff digest) is what the approver is shown, with root's own
+  review warnings beside it, labeled unsigned (Ruling 33); the worker's
+  warnings are only counted in the log. On approval root unpacks and reviews the
   archive once more, against the trusted tree as it is then, installs only
   the execution input as `trusted/` (leaving `install.json` and the previous
   tree as `trusted.prev/` until the daemon has the result), writes

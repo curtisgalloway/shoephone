@@ -88,7 +88,8 @@ runner holding the credentials does the work. You never hold a credential.
   at most 64 KiB) as is. The manifest holds variable values and nothing else:
   no code, no secrets. The runner validates it and may refuse it (exit 30,
   with the category and addresses on stderr). `--allow-destroy` says the plan
-  may delete resources; without it, a plan that deletes is refused.
+  may delete or replace resources or remove an output; without it, a plan
+  that does any of those is refused.
 
 Both print a match code and then wait, polling every 2 seconds, until the job
 is done. The person compares the code with their phone. The runner plans
