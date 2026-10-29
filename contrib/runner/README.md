@@ -193,9 +193,11 @@ config or another job. Then, as root on the host:
    --property=NoNewPrivileges=no --property=ProtectSystem=strict ...`
    mirroring every setting of the unit (or run the unit itself with a test
    config), as the test binary. Note any capability bwrap reports missing
-   and add it to the unit with a comment. If you switch to unprivileged user
-   namespaces, repeat this with `ProtectKernelTunables`, `ProtectKernelLogs`
-   and `ProtectControlGroups` relaxed, since they overmount `/proc`.
+   and add it to the unit with a comment. The unit leaves out
+   `ProtectKernelTunables`, `ProtectKernelLogs` and `ProtectHostname`: they
+   overmount parts of `/proc`, which stops bwrap mounting a fresh `/proc` in
+   an unprivileged user namespace (the unit's comment has the measurement).
+   Turn them back on only with a setuid bwrap, and repeat this check.
 3. Check that a job directory under `state_dir/jobs` is owned by the worker
    user, mode 0700, that `state_dir/jobs` itself is 0711, and that the other
    worker user cannot list it.

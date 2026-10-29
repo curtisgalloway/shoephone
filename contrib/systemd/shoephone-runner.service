@@ -54,11 +54,9 @@ CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRID
 # bubblewrap is installed setuid root on some distributions and gets its
 # privilege from that bit. NoNewPrivileges=yes would turn the bit off, and
 # RestrictSUIDSGID=yes would forbid it. Both must stay "no" for that setup.
-# If bwrap on this host uses unprivileged user namespaces instead, set both
-# to yes, and also relax ProtectKernelTunables, ProtectKernelLogs and
-# ProtectControlGroups: they overmount /proc, which breaks a fresh
-# `--proc /proc` inside an unprivileged user namespace. Rerun the ignored
-# sandbox test after any of these changes.
+# If bwrap on this host uses unprivileged user namespaces instead (Debian,
+# Ubuntu, Fedora and Arch ship it that way), both may be set to yes. Rerun
+# the ignored sandbox test after either change.
 NoNewPrivileges=no
 RestrictSUIDSGID=no
 
@@ -66,12 +64,19 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
-ProtectHostname=yes
+# Not set: ProtectKernelTunables, ProtectKernelLogs and ProtectHostname.
+# Each overmounts part of /proc, and while any part of /proc is overmounted
+# the kernel refuses the fresh procfs that bwrap mounts (`--proc /proc`)
+# inside an unprivileged user namespace: every job fails at init with
+# "bwrap: Can't mount proc on /proc: Operation not permitted". Measured on
+# Debian 13 (kernel 6.12, systemd 257) with systemd-run as an unprivileged
+# user: each of the three fails alone, and the rest of this unit passes. A
+# setuid bwrap mounts /proc as real root and is not affected, so a host
+# with one may turn them back on. Terraform runs inside bwrap's own
+# namespaces either way, which these settings never reached.
 # AF_NETLINK: resolvers and the Go-based Terraform providers query routes
 # and interfaces. Terraform inherits this restriction.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
