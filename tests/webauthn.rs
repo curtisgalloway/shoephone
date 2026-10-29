@@ -556,6 +556,40 @@ async fn enroll_approve_issue_with_a_real_assertion() {
         .unwrap();
     expect_error(resp, 403, "bad_secret");
 
+    let activity = |body: serde_json::Value| {
+        agent
+            .post(format!("{base}/api/push/activity"))
+            .send_json(body)
+            .unwrap()
+    };
+    let good = json!({
+        "credential_id": b64url(&key.cred_id),
+        "secret": push_secret,
+        "window_id": reply.id,
+        "token": "AB12",
+    });
+    let with = |field: &str, value: serde_json::Value| {
+        let mut b = good.clone();
+        b[field] = value;
+        b
+    };
+    expect_error(activity(with("secret", json!("0000"))), 403, "bad_secret");
+    expect_error(
+        activity(with("credential_id", json!(b64url(b"not-enrolled")))),
+        403,
+        "unknown_device",
+    );
+    expect_error(
+        activity(with("window_id", json!(reply.id + 1000))),
+        404,
+        "unknown_window",
+    );
+    expect_error(activity(with("token", json!("not hex"))), 400, "bad_token");
+    let body: serde_json::Value = expect_ok(activity(good.clone()));
+    assert_eq!(body["registered"], reply.id);
+    let body: serde_json::Value = expect_ok(activity(with("token", json!("cd34"))));
+    assert_eq!(body["registered"], reply.id, "a rotated token re-registers");
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

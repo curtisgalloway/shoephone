@@ -209,7 +209,7 @@ principal.
 
 Routes: `/api/{status,request,request/{id},issue,kill,pending,decline,ledger}`,
 `/api/approve/{start,finish}`, `/api/enroll/{start,finish}`,
-`/api/push/register`. The agent-side endpoints take no credential on purpose;
+`/api/push/{register,activity}`. The agent-side endpoints take no credential on purpose;
 everything that *opens* a window needs the approver's key.
 
 ```bash

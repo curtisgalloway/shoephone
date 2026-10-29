@@ -231,6 +231,22 @@ pub struct PushRegister {
     pub kinds: Option<Vec<String>>,
 }
 
+/// `POST /api/push/activity`: the app hands over the push token of the Live
+/// Activity it started for one open window, so the daemon can end it when the
+/// window closes while the app is not running. Authenticated like
+/// [`PushRegister`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityRegister {
+    /// Credential id, base64url on the wire, as in [`PushRegister`].
+    pub credential_id: webauthn_rs::prelude::Base64UrlSafeData,
+    /// The per-device secret minted at enrollment, hex.
+    pub secret: String,
+    /// The window's id: `windows[].id` in `/api/pending`.
+    pub window_id: u64,
+    /// The activity's push token as hex. It rotates; the latest wins.
+    pub token: String,
+}
+
 /// Largest archive, after base64 decoding, that `POST /api/trust` accepts.
 pub const MAX_ARCHIVE_BYTES: usize = 16 * 1024 * 1024;
 
