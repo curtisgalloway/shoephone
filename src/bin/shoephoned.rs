@@ -506,6 +506,7 @@ fn serve(config: Config) -> Status {
                 return Status::Precondition;
             }
         };
+        daemon.spawn_reaper();
         let app = daemon.router();
         let shutdown = async {
             let ctrl_c = tokio::signal::ctrl_c();

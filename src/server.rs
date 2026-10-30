@@ -85,6 +85,9 @@ struct Inner {
     /// window's silent re-request that `Grants::issue` says to reuse gets
     /// back the identical certificate string. See the `issue` handler.
     issued: HashMap<u64, CachedCertificate>,
+    /// The push token of each open window's Live Activity, by window id.
+    /// In memory only: windows are, and a restart drops both together.
+    activities: HashMap<u64, ActivityToken>,
     /// Terraform trust and apply jobs.
     jobs: Jobs,
     /// The decoded archive of each trust job, by job id, for the runner to
@@ -110,6 +113,31 @@ struct Inner {
     job_meta: HashMap<u64, JobMeta>,
 }
 
+#[cfg(test)]
+impl Inner {
+    /// An `Inner` around `grants` with everything else empty.
+    fn for_test(grants: Grants) -> Self {
+        Self {
+            grants,
+            devices: Vec::new(),
+            approve: None,
+            enroll: None,
+            ledger_failed: None,
+            persisted_next_id: 0,
+            issued: HashMap::new(),
+            activities: HashMap::new(),
+            jobs: Jobs::new(BTreeMap::new()),
+            archives: HashMap::new(),
+            displays: HashMap::new(),
+            summaries: HashMap::new(),
+            claimed: HashMap::new(),
+            trusted: BTreeMap::new(),
+            verifier: Verifier::new(BTreeMap::new()),
+            job_meta: HashMap::new(),
+        }
+    }
+}
+
 /// The display-only fields of a job request, already sanitized.
 #[derive(Debug, Clone)]
 struct JobMeta {
@@ -129,6 +157,14 @@ struct CachedCertificate {
     serial: u64,
     valid_before: SystemTime,
     window_ends_at: SystemTime,
+}
+
+/// One window's Live Activity push token, with the window's end kept from
+/// registration: the window is gone by the time the token is used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActivityToken {
+    token: String,
+    ends_at: SystemTime,
 }
 
 /// What an approval ceremony is over: the SSH request or the Terraform job
@@ -305,6 +341,7 @@ impl Daemon {
                 ledger_failed: None,
                 persisted_next_id: next_id,
                 issued: HashMap::new(),
+                activities: HashMap::new(),
                 jobs,
                 archives: HashMap::new(),
                 displays: HashMap::new(),
@@ -344,9 +381,35 @@ impl Daemon {
         let pushes = self.drain_and_append(&mut inner);
         let targets = push_targets(&inner);
         let badge = badge_count(&mut inner, SystemTime::now());
+        let reaped = reap_activities(&mut inner, SystemTime::now());
         drop(inner);
         self.dispatch_pushes(pushes, targets, badge);
+        self.dispatch_activity_ends(reaped);
         out
+    }
+
+    /// End the Live Activities of windows that have expired. A kill is
+    /// caught by [`Daemon::with`]; expiry sends no request, so the server
+    /// calls this on a timer.
+    pub fn reap_expired(&self) {
+        let reaped = {
+            let mut inner = self.inner.lock().expect("daemon lock");
+            reap_activities(&mut inner, SystemTime::now())
+        };
+        self.dispatch_activity_ends(reaped);
+    }
+
+    /// Check for expired windows every [`REAP_INTERVAL`] for as long as the
+    /// runtime lives. Needs a tokio runtime.
+    pub fn spawn_reaper(self: &Arc<Self>) {
+        let d = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(REAP_INTERVAL);
+            loop {
+                tick.tick().await;
+                d.reap_expired();
+            }
+        });
     }
 
     /// Like [`Daemon::with`], but for calls that must refuse rather than
@@ -396,8 +459,10 @@ impl Daemon {
         };
         let targets = push_targets(&inner);
         let badge = badge_count(&mut inner, SystemTime::now());
+        let reaped = reap_activities(&mut inner, SystemTime::now());
         drop(inner);
         self.dispatch_pushes(pushes, targets, badge);
+        self.dispatch_activity_ends(reaped);
         if append_failed {
             return Err(Self::ledger_unavailable());
         }
@@ -513,6 +578,30 @@ impl Daemon {
         }
     }
 
+    /// Send one Live Activity `end` push per reaped token. Called after the
+    /// lock is released, for the same reason as [`Daemon::dispatch_pushes`].
+    fn dispatch_activity_ends(&self, reaped: Vec<ActivityToken>) {
+        if reaped.is_empty() {
+            return;
+        }
+        if let Some(a) = &self.apns
+            && let Ok(h) = tokio::runtime::Handle::try_current()
+        {
+            let a = a.clone();
+            h.spawn(async move {
+                for r in &reaped {
+                    match a.end_activity(&r.token, r.ends_at).await {
+                        Delivery::Sent => {}
+                        Delivery::Unregistered => eprintln!(
+                            "shoephoned: apns rejected a Live Activity token as unregistered; dropped"
+                        ),
+                        Delivery::Failed(e) => eprintln!("shoephoned: {e}"),
+                    }
+                }
+            });
+        }
+    }
+
     pub fn router(self: Arc<Self>) -> Router {
         let router = Router::new()
             .route("/", get(page))
@@ -546,6 +635,7 @@ impl Daemon {
             .route("/api/enroll/start", post(enroll_start))
             .route("/api/enroll/finish", post(enroll_finish))
             .route("/api/push/register", post(push_register))
+            .route("/api/push/activity", post(push_activity))
             .route("/api/ledger", get(ledger));
         #[cfg(feature = "test-hooks")]
         let router = router
@@ -568,15 +658,38 @@ fn now() -> SystemTime {
     SystemTime::now()
 }
 
-/// Each device's push token with the kinds it asked for; `None` means all.
-/// What the app icon should read: live authorizations, plus a request if one
-/// is waiting. Computed under the lock beside the targets, because by the
-/// time the push is sent the lock is gone and the state may have moved.
+/// How often the server looks for windows that expired on their own.
+const REAP_INTERVAL: Duration = Duration::from_secs(15);
+
+/// What the app icon should read: the things waiting on the person, a
+/// pending request plus a waiting job. Open windows do not count; the Live
+/// Activity shows those. Computed under the lock beside the targets, because
+/// by the time the push is sent the lock is gone and the state may have
+/// moved.
 ///
 /// The daemon holds at most one pending request or waiting job, so this is
-/// windows + 0 or 1.
+/// 0, 1 or 2.
 fn badge_count(inner: &mut Inner, now: SystemTime) -> u64 {
-    inner.grants.outstanding(now) + u64::from(inner.jobs.waiting(now).is_some())
+    inner.grants.pending_count(now) + u64::from(inner.jobs.waiting(now).is_some())
+}
+
+/// Remove and return the Live Activity tokens whose window is no longer
+/// open (killed, or expired as `Grants::tick` just dropped it). The caller
+/// sends the `end` pushes after releasing the lock.
+fn reap_activities(inner: &mut Inner, now: SystemTime) -> Vec<ActivityToken> {
+    if inner.activities.is_empty() {
+        return Vec::new();
+    }
+    let open: HashSet<u64> = inner.grants.windows(now).iter().map(|w| w.id).collect();
+    let gone: Vec<u64> = inner
+        .activities
+        .keys()
+        .filter(|id| !open.contains(id))
+        .copied()
+        .collect();
+    gone.iter()
+        .filter_map(|id| inner.activities.remove(id))
+        .collect()
 }
 
 /// Every ledger event becomes a push; the device, not the daemon, keeps the
@@ -624,6 +737,7 @@ fn push_for_job(event: &JobEvent) -> Push {
     }
 }
 
+/// Each device's push token with the kinds it asked for; `None` means all.
 fn push_targets(inner: &Inner) -> Vec<(String, Option<Vec<String>>)> {
     inner
         .devices
@@ -1612,14 +1726,7 @@ fn refuse_synced(backup_eligible: bool, backup_state: bool, allow: bool) -> Resu
 /// notifications, including the request-waiting push that starts the
 /// approval ceremony, at a token of their own choosing.
 async fn push_register(State(d): App, Json(body): Json<PushRegister>) -> Reply<serde_json::Value> {
-    let token = body.token.to_ascii_lowercase();
-    if token.is_empty() || token.len() > 200 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(Fail::new(
-            StatusCode::BAD_REQUEST,
-            "bad_token",
-            "token must be the device token as hex",
-        ));
-    }
+    let token = normalize_push_token(&body.token)?;
     let kinds = match body.kinds {
         None => None,
         Some(list) => {
@@ -1655,6 +1762,62 @@ async fn push_register(State(d): App, Json(body): Json<PushRegister>) -> Reply<s
             .map_err(Fail::internal)?;
         eprintln!("shoephoned: push token registered for device {name:?}");
         Ok(Json(serde_json::json!({ "registered": name })))
+    })
+}
+
+/// A push token as lowercase hex, or `bad_token`.
+fn normalize_push_token(raw: &str) -> Result<String, Fail> {
+    let token = raw.to_ascii_lowercase();
+    if token.is_empty() || token.len() > 200 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Fail::new(
+            StatusCode::BAD_REQUEST,
+            "bad_token",
+            "token must be the device token as hex",
+        ));
+    }
+    Ok(token)
+}
+
+/// The app hands over the push token of the Live Activity it started for an
+/// open window, so the daemon can end it if the window closes while the app
+/// is not running. Authenticated exactly like [`push_register`]. Not
+/// persisted and not ledgered: windows live in memory, and the token is only
+/// a way to take a card off the lock screen.
+async fn push_activity(
+    State(d): App,
+    Json(body): Json<ActivityRegister>,
+) -> Reply<serde_json::Value> {
+    let token = normalize_push_token(&body.token)?;
+    d.with(|inner| {
+        let device = inner
+            .devices
+            .iter()
+            .find(|x| x.key.cred_id()[..] == body.credential_id[..])
+            .ok_or_else(|| {
+                Fail::new(
+                    StatusCode::FORBIDDEN,
+                    "unknown_device",
+                    "credential is not enrolled",
+                )
+            })?;
+        check_push_secret(device.push_secret_sha256.as_deref(), &body.secret)?;
+        let ends_at = inner
+            .grants
+            .windows(now())
+            .iter()
+            .find(|w| w.id == body.window_id)
+            .map(|w| w.scope.ends_at)
+            .ok_or_else(|| {
+                Fail::new(
+                    StatusCode::NOT_FOUND,
+                    "unknown_window",
+                    "no open window has that id",
+                )
+            })?;
+        inner
+            .activities
+            .insert(body.window_id, ActivityToken { token, ends_at });
+        Ok(Json(serde_json::json!({ "registered": body.window_id })))
     })
 }
 
@@ -2713,6 +2876,104 @@ mod tests {
 
         let missing = check_push_secret(None, "anything").unwrap_err();
         assert_eq!(missing.1.code, "reenroll_required");
+    }
+
+    fn test_grants() -> Grants {
+        let mut principals = BTreeMap::new();
+        principals.insert("web01".to_owned(), "agent-admin:web01".to_owned());
+        Grants::new(Policy::default(), principals, 1)
+    }
+
+    struct Zeros;
+
+    impl Entropy for Zeros {
+        fn fill(&mut self, buf: &mut [u8]) {
+            buf.fill(0);
+        }
+    }
+
+    fn t(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 + secs)
+    }
+
+    const TEST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleExampleExampleExampleExampleExampl session";
+
+    fn file_request(g: &mut Grants, now: SystemTime) -> Pending {
+        g.request(
+            now, &mut Zeros, "web01", TEST_KEY, "laptop", "deploy", None, None,
+        )
+        .unwrap()
+    }
+
+    fn open_window(g: &mut Grants, now: SystemTime) -> grant::Window {
+        let p = file_request(g, now);
+        g.approve(
+            now,
+            &Approval {
+                id: p.id,
+                nonce: p.nonce.clone(),
+                scope: p.scope.clone(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn inner_with(grants: Grants) -> Inner {
+        Inner::for_test(grants)
+    }
+
+    fn register(inner: &mut Inner, w: &grant::Window, token: &str) {
+        inner.activities.insert(
+            w.id,
+            ActivityToken {
+                token: token.to_owned(),
+                ends_at: w.scope.ends_at,
+            },
+        );
+    }
+
+    #[test]
+    fn reap_returns_a_killed_windows_token_once() {
+        let mut inner = inner_with(test_grants());
+        let w = open_window(&mut inner.grants, t(0));
+        register(&mut inner, &w, "aa");
+        assert!(reap_activities(&mut inner, t(1)).is_empty(), "still open");
+        inner.grants.kill(t(2), "web01").unwrap();
+        let reaped = reap_activities(&mut inner, t(3));
+        assert_eq!(
+            reaped,
+            [ActivityToken {
+                token: "aa".into(),
+                ends_at: w.scope.ends_at
+            }]
+        );
+        assert!(inner.activities.is_empty());
+        assert!(reap_activities(&mut inner, t(4)).is_empty(), "only once");
+    }
+
+    #[test]
+    fn reap_returns_an_expired_windows_token_and_spares_an_open_ones() {
+        let mut inner = inner_with(test_grants());
+        let w = open_window(&mut inner.grants, t(0));
+        register(&mut inner, &w, "aa");
+        let late = w.scope.ends_at + Duration::from_secs(1);
+        let w2 = open_window(&mut inner.grants, late);
+        register(&mut inner, &w2, "bb");
+        let reaped = reap_activities(&mut inner, late);
+        assert_eq!(reaped.len(), 1, "{reaped:?}");
+        assert_eq!(reaped[0].token, "aa");
+        assert_eq!(reaped[0].ends_at, w.scope.ends_at);
+        assert!(inner.activities.contains_key(&w2.id), "the open one stays");
+    }
+
+    #[test]
+    fn badge_ignores_open_windows_and_counts_a_pending_request() {
+        let mut inner = inner_with(test_grants());
+        open_window(&mut inner.grants, t(0));
+        assert_eq!(badge_count(&mut inner, t(1)), 0, "a window alone is 0");
+        file_request(&mut inner.grants, t(2));
+        assert_eq!(badge_count(&mut inner, t(3)), 1, "a pending request is 1");
     }
 
     #[test]

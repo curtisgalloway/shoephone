@@ -274,6 +274,9 @@ struct Claims {
 
 const BEARER_LIFETIME: Duration = Duration::from_secs(50 * 60);
 
+/// Seconds from the Unix epoch to 2001-01-01, Apple's reference date.
+const APPLE_REFERENCE_DATE: i64 = 978_307_200;
+
 impl Apns {
     pub fn new(config: ApnsConfig) -> Result<Self, String> {
         let pem = std::fs::read(&config.key_file)
@@ -335,8 +338,10 @@ impl Apns {
     /// The notification body: a title, one sentence, a sound, and the badge
     /// count. Nothing about the request itself -- no host, no reason, no
     /// requester -- which is the property worth keeping; the count says only
-    /// how many things are outstanding, and the body already announces that
-    /// there is one. A waiting request is time-sensitive so it breaks
+    /// how many things are waiting on the person (a pending request, a
+    /// waiting job), and the body already announces that there is one. Open
+    /// windows do not count: the Live Activity shows those, and the badge is
+    /// for what waits on the person. A waiting request is time-sensitive so it breaks
     /// through a Focus. A window opening or closing is ordinary. The rest --
     /// issued, declined, timed out -- are passive: they go into the
     /// notification list, where the record is kept, without lighting the
@@ -378,6 +383,79 @@ impl Apns {
         (!push.is_record()).then(|| push.tags())
     }
 
+    /// The body of the push that ends a Live Activity. It names no host and
+    /// no principal, like every other push here; the activity's own
+    /// attributes already live on the phone.
+    ///
+    /// `endsAt` is the window's end as seconds since 2001-01-01, not the Unix
+    /// epoch: ActivityKit decodes `content-state` with `JSONDecoder`'s default
+    /// date strategy, which reads a number as that reference date. `timestamp`
+    /// and `dismissal-date` are Unix seconds, as APNs wants them.
+    pub fn activity_end_payload(now: SystemTime, ends_at: SystemTime) -> serde_json::Value {
+        let unix = |t: SystemTime| {
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64)
+        };
+        let now = unix(now);
+        serde_json::json!({
+            "aps": {
+                "timestamp": now,
+                "event": "end",
+                "dismissal-date": now,
+                "content-state": { "endsAt": unix(ends_at) - APPLE_REFERENCE_DATE },
+            }
+        })
+    }
+
+    /// End the Live Activity behind `token`, whose window ended at `ends_at`.
+    pub async fn end_activity(&self, token: &str, ends_at: SystemTime) -> Delivery {
+        self.end_activity_at(self.gateway(), token, ends_at, SystemTime::now())
+            .await
+    }
+
+    async fn end_activity_at(
+        &self,
+        gateway: &str,
+        token: &str,
+        ends_at: SystemTime,
+        now: SystemTime,
+    ) -> Delivery {
+        let bearer = match self.bearer(now) {
+            Ok(b) => b,
+            Err(e) => return Delivery::Failed(e),
+        };
+        let sent = self
+            .client
+            .post(format!("{gateway}/3/device/{token}"))
+            .bearer_auth(bearer)
+            .header(
+                "apns-topic",
+                format!("{}.push-type.liveactivity", self.config.topic),
+            )
+            .header("apns-push-type", "liveactivity")
+            .header("apns-priority", "10")
+            .json(&Self::activity_end_payload(now, ends_at))
+            .send()
+            .await;
+        Self::delivery(sent).await
+    }
+
+    async fn delivery(sent: Result<reqwest::Response, reqwest::Error>) -> Delivery {
+        match sent {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                match status {
+                    200 => Delivery::Sent,
+                    410 => Delivery::Unregistered,
+                    400 if body.contains("BadDeviceToken") => Delivery::Unregistered,
+                    _ => Delivery::Failed(format!("apns HTTP {status}: {body}")),
+                }
+            }
+            Err(e) => Delivery::Failed(format!("apns: {e}")),
+        }
+    }
+
     pub async fn send(&self, push: Push, token: &str, badge: u64) -> Delivery {
         let bearer = match self.bearer(SystemTime::now()) {
             Ok(b) => b,
@@ -401,19 +479,7 @@ impl Apns {
             req = req.header("apns-collapse-id", id);
         }
         let sent = req.json(&Self::payload(push, badge)).send().await;
-        match sent {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let body = resp.text().await.unwrap_or_default();
-                match status {
-                    200 => Delivery::Sent,
-                    410 => Delivery::Unregistered,
-                    400 if body.contains("BadDeviceToken") => Delivery::Unregistered,
-                    _ => Delivery::Failed(format!("apns HTTP {status}: {body}")),
-                }
-            }
-            Err(e) => Delivery::Failed(format!("apns: {e}")),
-        }
+        Self::delivery(sent).await
     }
 }
 
@@ -648,6 +714,63 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn the_activity_end_push_has_its_headers_and_a_2001_epoch_end_date() {
+        let dir = std::env::temp_dir().join(format!("shoephone-apns-end-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = apns(&dir);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let receiver = receive_one(listener);
+        let unix = |s| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let delivery = rt.block_on(a.end_activity_at(
+            &format!("http://127.0.0.1:{port}"),
+            "00ff",
+            unix(1_800_003_600),
+            unix(1_800_000_000),
+        ));
+        assert_eq!(delivery, Delivery::Sent);
+        let raw = receiver.join().unwrap();
+        assert!(raw.starts_with("POST /3/device/00ff HTTP/1.1\r\n"), "{raw}");
+        let lower = raw.to_ascii_lowercase();
+        for header in [
+            "apns-topic: example.app.push-type.liveactivity",
+            "apns-push-type: liveactivity",
+            "apns-priority: 10",
+        ] {
+            assert!(
+                lower.contains(&format!("\r\n{header}\r\n")),
+                "{header}: {raw}"
+            );
+        }
+        assert!(lower.contains("\r\nauthorization: bearer "), "{raw}");
+        let body: serde_json::Value =
+            serde_json::from_str(&raw[raw.find("\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "aps": {
+                    "timestamp": 1_800_000_000,
+                    "event": "end",
+                    "dismissal-date": 1_800_000_000,
+                    "content-state": { "endsAt": 821_696_400 },
+                }
+            }),
+            "1_800_003_600 - 978_307_200 = 821_696_400"
+        );
+        for leak in ["web01", "agent-admin", "principal", "host"] {
+            assert!(
+                !raw[raw.find("\r\n\r\n").unwrap()..].contains(leak),
+                "{leak}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn only_waiting_job_pushes_interrupt() {
         let interrupting: Vec<Push> = Push::ALL.into_iter().filter(|p| !p.is_record()).collect();

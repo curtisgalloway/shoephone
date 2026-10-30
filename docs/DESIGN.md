@@ -245,6 +245,13 @@ on the failsafe host, requested per session and approved on the phone:
   agent cannot influence from the inside.
 - **Pushes carry no content and no authority.** The device fetches pending
   requests from the daemon. A forged push at worst opens an empty list.
+  The app badge counts only what waits on the person (a pending request, a
+  waiting job), never open windows. The app shows each open window as a Live
+  Activity and registers its activity token (`POST /api/push/activity`,
+  authenticated like `push/register`, held in memory with the window). When
+  the window ends, by kill or by expiry, the daemon sends one APNs `end`
+  push to that token, so the card leaves the lock screen even though the app
+  is closed. That push names no host and no principal.
 - **Limits live on the server.** The daemon enforces the maximum window, the
   per-host principals and a rate cap whatever the request says. The cap is
   per CA and per approver, never keyed on anything the requester picks (a

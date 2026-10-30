@@ -672,6 +672,14 @@ impl Grants {
         self.windows.len() as u64 + u64::from(self.pending.is_some())
     }
 
+    /// How many requests are waiting for a verdict (zero or one). The app
+    /// icon badges this and not the windows: a Live Activity shows those, and
+    /// the badge is for what waits on the person.
+    pub fn pending_count(&mut self, now: SystemTime) -> u64 {
+        self.tick(now);
+        u64::from(self.pending.is_some())
+    }
+
     /// Drain the ledger entries recorded since the last drain.
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
@@ -1238,6 +1246,29 @@ mod tests {
         assert_eq!(g.outstanding(t(11)), 1);
         let far = t(10) + Policy::default().max_window + Duration::from_secs(1);
         assert_eq!(g.outstanding(far), 0, "an expired window stops counting");
+    }
+
+    #[test]
+    fn pending_count_ignores_open_windows() {
+        let mut g = grants();
+        approved(&mut g, t(0));
+        assert_eq!(
+            g.pending_count(t(1)),
+            0,
+            "an open window alone is not waiting"
+        );
+        g.request(
+            t(2),
+            &mut Counter(0),
+            "db01",
+            KEY,
+            "laptop",
+            "deploy",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(g.pending_count(t(3)), 1, "a waiting request counts");
     }
 
     #[test]
